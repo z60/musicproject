@@ -1,0 +1,73 @@
+{
+  "$comment": "模型登记表（docs/03 §2 与 docs/21 §16）。启动时按此校验 SHA-256；发布前必须填实，否则不得打包（docs/21 §16 的发布门禁）。",
+  "version": 1,
+  "models": {
+    "whisper": [
+      {
+        "id": "whisper-base",
+        "file": "whisper/ggml-base.bin",
+        "label": "whisper.cpp base（默认）",
+        "kind": "whisper",
+        "language": "multilingual",
+        "sizeBytes": null,
+        "sha256": null,
+        "license": "TODO：见模型卡，发布前确认再分发条款",
+        "source": "TODO",
+        "note": "中文可用的最小实用模型；用于 ASR 与后续的 AI 强制对齐"
+      },
+      {
+        "id": "whisper-small",
+        "file": "whisper/ggml-small.bin",
+        "label": "whisper.cpp small（可选，精度更高）",
+        "kind": "whisper",
+        "language": "multilingual",
+        "sizeBytes": null,
+        "sha256": null,
+        "license": "TODO",
+        "source": "TODO",
+        "note": "体积约 466 MB，安装包显著增大"
+      }
+    ],
+    "embedding": [
+      {
+        "id": "bge-small-zh-v1.5",
+        "file": "embedding/bge-small-zh-v1.5/model.onnx",
+        "label": "bge-small-zh-v1.5（ONNX 量化版）",
+        "kind": "embedding",
+        "dim": 512,
+        "pooling": "cls",
+        "maxLength": 512,
+        "sizeBytes": null,
+        "sha256": null,
+        "license": "TODO：见模型卡",
+        "source": "TODO",
+        "tokenizer": "embedding/bge-small-zh-v1.5/tokenizer.json",
+        "note": "用于说话人向量判定；dim 与 pooling 必须以运行时读取的 config 为准，此处仅为登记"
+      }
+    ]
+  },
+  "binaries": [
+    {
+      "id": "ffmpeg",
+      "label": "ffmpeg",
+      "file": "bin/{platform}/{arch}/ffmpeg{ext}",
+      "sha256": null,
+      "license": "TODO：优先选择 LGPL 构建，避免 GPL 传染（docs/21 §16）",
+      "source": "TODO",
+      "requiredFilters": [
+        "loudnorm",
+        "afftdn",
+        "deesser",
+        "equalizer",
+        "acompressor",
+        "alimiter",
+        "sidechaincompress",
+        "amix",
+        "concat",
+        "atempo",
+        "highpass",
+        "lowpass"
+      ]
+    }
+  ]
+}

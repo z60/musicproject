@@ -1,0 +1,159 @@
+{
+  "name": "novel-studio",
+  "version": "0.1.0",
+  "private": true,
+  "description": "有声画本工作站：小说 -> 画本 -> 录音 -> 对轨 -> 混音 -> 有声成品",
+  "author": "Novel Studio",
+  "license": "UNLICENSED",
+  "main": "./out/main/index.js",
+  "type": "module",
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "comments": {
+    "node22": "Node 22.6+ 原生支持 TypeScript 类型剥离（--experimental-strip-types），因此 scripts/ 与 tests/ 不需要 tsx / ts-node / vitest。",
+    "test-isolation": "test:all 使用 --test-isolation=none 让测试在当前进程内运行：node --test 默认会用 child_process.spawn + 管道收集子进程输出，在受限/沙箱环境下可能触发 EPERM；同进程运行可绕开，也更快。",
+    "error-docs": "错误码文档（docs/23-错误码一览.md）的唯一来源是 src/shared/messages.ts。改动 messages.ts 或 errors.ts 后必须跑 errors:docs 重新生成；CI 用 errors:docs:check 拦截不同步。",
+    "import-ext": "src/shared/*.ts 之间以及 scripts/ 的 import 显式带 .ts 扩展名，以便被 Node 直接以 ESM 执行（文档生成脚本要连运行时导入这些模块）。tsconfig 需开启 allowImportingTsExtensions，electron-vite 侧正常解析。",
+    "template-types": "Vue 模板表达式是按 JavaScript 解析的，不是 TypeScript：模板里写 `(v: number) => f(v)` 会让 vue-tsc 报 TS1109/TS1005 并**跳过整个文件的类型检查**（真正的类型错误全被掩盖）。check:template-types 拦截这类写法，fix:template-types 自动去掉参数类型标注（类型仍由子组件的 defineEmits/props 推断）。"
+  },
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "npm run typecheck && electron-vite build",
+    "preview": "electron-vite preview",
+    "typecheck": "vue-tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p tsconfig.node.json",
+    "lint": "eslint . --ext .ts,.vue",
+    "format": "prettier --write \"src/**/*.{ts,vue,css}\" \"docs/**/*.md\" \"scripts/**/*.ts\" \"tests/**/*.ts\"",
+    "postinstall": "electron-rebuild -f -w better-sqlite3,onnxruntime-node",
+    "rebuild": "electron-rebuild -f -w better-sqlite3,onnxruntime-node",
+    "test": "node --experimental-strip-types scripts/run-tests.ts",
+    "test:all": "node --experimental-strip-types scripts/run-tests.ts",
+    "test:filter": "node --experimental-strip-types scripts/run-tests.ts --filter",
+    "errors:docs": "node --experimental-strip-types scripts/gen-error-docs.ts",
+    "errors:docs:check": "node --experimental-strip-types scripts/gen-error-docs.ts --check",
+    "errors:docs:table": "node --experimental-strip-types scripts/gen-error-docs.ts --table",
+    "errors:docs:json": "node --experimental-strip-types scripts/gen-error-docs.ts --json",
+    "check:renderer": "node --experimental-strip-types scripts/check-renderer.ts",
+    "check:structure": "node --experimental-strip-types scripts/check-structure.ts",
+    "check:syntax": "node --experimental-strip-types scripts/check-syntax.ts",
+    "check:template-types": "node --experimental-strip-types scripts/strip-template-types.ts --check",
+    "fix:template-types": "node --experimental-strip-types scripts/strip-template-types.ts --write",
+    "check:coverage": "node --experimental-strip-types scripts/check-coverage.ts",
+    "check:coverage:strict": "node --experimental-strip-types scripts/check-coverage.ts --strict",
+    "fix:imports": "node --experimental-strip-types scripts/fix-relative-imports.ts --write",
+    "fix:imports:check": "node --experimental-strip-types scripts/fix-relative-imports.ts --check",
+    "verify": "npm run check:syntax && npm run check:template-types && npm run test && npm run errors:docs:check && npm run check:structure && npm run fix:imports:check",
+    "dist:win": "npm run build && electron-builder --win --x64",
+    "dist:mac": "npm run build && electron-builder --mac",
+    "dist:linux": "npm run build && electron-builder --linux"
+  },
+  "dependencies": {
+    "electron-log": "^5.1.7",
+    "better-sqlite3": "11.3.0",
+    "fluent-ffmpeg": "^2.1.3",
+    "onnxruntime-node": "1.19.2",
+    "@xenova/transformers": "^2.17.2",
+    "iconv-lite": "^0.6.3",
+    "chardet": "^2.1.0",
+    "mammoth": "^1.8.0",
+    "pdfjs-dist": "^4.6.82",
+    "cheerio": "^1.0.0",
+    "undici": "^6.19.8",
+    "zod": "^3.23.8",
+    "archiver": "^7.0.1",
+    "yauzl": "^3.1.3",
+    "fast-json-stable-stringify": "^2.1.0",
+    "nanoid": "^5.0.7",
+    "dayjs": "^1.11.13",
+    "p-limit": "^6.1.0",
+    "vue": "^3.5.12",
+    "vue-router": "^4.4.5",
+    "pinia": "^2.2.6",
+    "element-plus": "^2.8.8",
+    "@element-plus/icons-vue": "^2.3.1",
+    "@vueuse/core": "^11.1.0",
+    "wavesurfer.js": "^7.8.6"
+  },
+  "devDependencies": {
+    "electron": "31.7.0",
+    "electron-vite": "^2.3.0",
+    "electron-builder": "^25.1.8",
+    "@electron/rebuild": "^3.7.1",
+    "vite": "^5.4.11",
+    "@vitejs/plugin-vue": "^5.2.0",
+    "typescript": "^5.6.3",
+    "vue-tsc": "^2.1.10",
+    "eslint": "^9.14.0",
+    "@typescript-eslint/eslint-plugin": "^8.13.0",
+    "@typescript-eslint/parser": "^8.13.0",
+    "eslint-plugin-vue": "^9.31.0",
+    "prettier": "^3.3.3",
+    "sass": "^1.80.6",
+    "unplugin-auto-import": "^0.18.4",
+    "unplugin-vue-components": "^0.27.4",
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/fluent-ffmpeg": "^2.1.27",
+    "@types/archiver": "^6.0.3",
+    "@types/yauzl": "^2.10.3",
+    "@types/node": "^22.9.0"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "onnxruntime-node",
+      "electron",
+      "esbuild"
+    ]
+  },
+  "build": {
+    "appId": "com.novelstudio.app",
+    "productName": "Novel Studio",
+    "directories": {
+      "output": "release",
+      "buildResources": "resources"
+    },
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/bin",
+        "to": "bin"
+      },
+      {
+        "from": "resources/models",
+        "to": "models"
+      }
+    ],
+    "asarUnpack": [
+      "**/node_modules/better-sqlite3/**",
+      "**/node_modules/onnxruntime-node/**",
+      "**/*.node",
+      "resources/bin/**",
+      "resources/models/**"
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "artifactName": "${productName}-${version}-setup.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "category": "public.app-category.music"
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Audio"
+    }
+  }
+}

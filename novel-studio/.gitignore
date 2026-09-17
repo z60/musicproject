@@ -1,0 +1,57 @@
+# 依赖与产物
+node_modules/
+out/
+release/
+dist/
+
+# 运行时数据（不应提交）
+*.db
+*.db-wal
+*.db-shm
+backups/
+logs/
+cache/
+projects/
+
+# 模型与二进制（体积大，走发布渠道而非仓库）
+# 参见 docs/03 §2 与 docs/21 §16
+resources/bin/*
+!resources/bin/.gitkeep
+resources/models/*
+!resources/models/.gitkeep
+!resources/models/models.json
+
+# 用户与产物文件
+*.nsp
+*.nst
+*.m4b
+*.mp3
+*.wav
+
+# 编辑器 / 系统
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json.example
+.idea/
+.DS_Store
+Thumbs.db
+
+# 日志与临时
+*.log
+.tmp/
+*.tsbuildinfo
+
+# 本仓库专用的 npm 缓存
+# 为什么要有这一条：本环境的沙箱不允许 npm 写工作区外的默认缓存目录
+# （[sandbox: file access denied] / EPERM: open 'npm-cache\_cacache\tmp\...'），
+# 因此约定用 `npm_config_cache=<repo>/.npm-cache` 跑安装。
+# 这个目录可能上 GB，绝不能提交。
+.npm-cache/
+
+# 生成的类型声明（由 unplugin 生成，不手工维护）
+src/renderer/src/types/auto-imports.d.ts
+src/renderer/src/types/components.d.ts
+
+# 测试与覆盖率
+coverage/
+.nyc_output/

@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Novel Studio</title>
+    <!--
+      CSP 严格模式（见 docs/02 §3）：
+        · script-src 不允许 unsafe-inline/unsafe-eval
+        · style-src 需要 unsafe-inline：Element Plus 与 Vue SFC 的 <style> 会注入内联样式
+        · media-src/img-src 允许 blob: 与 ns-media:（录音试听与波形读取走自定义协议）
+        · connect-src 'self'：渲染进程不直接访问外网，全部经主进程
+      开发模式下 Vite 需要注入 HMR 客户端，因此 devServer 会放宽 script-src；
+      生产构建严格按下列策略执行。
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="
+        default-src 'self';
+        script-src 'self';
+        style-src 'self' 'unsafe-inline';
+        img-src 'self' data: blob: ns-media:;
+        media-src 'self' blob: ns-media:;
+        font-src 'self' data:;
+        connect-src 'self';
+        object-src 'none';
+        base-uri 'none';
+        form-action 'none';
+        frame-ancestors 'none'
+      "
+    />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/app/main.ts"></script>
+  </body>
+</html>
