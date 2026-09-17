@@ -7,26 +7,48 @@
  *   模块注册表**。
  *
  *   本项目的开发环境**禁止 spawn 子进程**（`spawnSync ... EPERM`），
- *   因此官方的 `node --test`（它 fork 子进程）在这里不可用；
- *   而 **Worker 线程可用** —— Worker 拥有独立模块注册表，等价于隔离，
- *   且在没有沙箱限制的机器上同样有效。
+ *   因此官方的 `node --test`（内部 fork 子进程）在这里不可用；
+ *   而 **Worker 线程可用** —— Worker 拥有独立模块注册表，等价于隔离。
  *
- * 数字来源：在 Worker 内接管 `process.stdout` 捕获 node:test 的 TAP 报告。
- *   不在父进程接管是为了让**每个文件独立**，互不干扰。
+ * ============================================================================
+ * ### 用例数是怎么数的（这段是本文件最重要的内容，请勿随手改）
+ * ============================================================================
+ * 「一个测试文件到底跑了多少用例」在这个环境里**没有官方出口**：
  *
- * ### 一个必须记录的坑：固定等待时间会**静默少算用例**
- *   捕获是异步的：`await import(file)` 只等到「测试已注册」，之后 node:test 才
- *   逐个跑用例并把 TAP 写进被替换的 stdout。早期版本在这里 `setTimeout(150)` 一把，
- *   然后用正则从已捕获的文本里找 `# pass N`。
- *   但用例数多的文件（canvas-quality、queue…）在 150ms 内**还没写完汇总行**，
- *   于是 `# pass` 匹配不到，代码退化成「数 `ok <n> -` 行」。
- *   而嵌套 `describe` 的 ok 行数 ≠ 用例数（子测试记账方式不同），
- *   结果是**总数在 1333 / 1347 / 1351 之间漂移** —— 每次跑都不一样，且都报「全通过」。
+ *   · `node --test` → 不可用（要 fork 子进程 → `spawn EPERM`）。
+ *   · `run()` 把事件流交给我们：
+ *       - `run()` 不带参 → 它按 Node 的默认 glob **把仓库里所有 `*.test.ts` 都 spawn 起来**
+ *         （实测 42 个 `test:fail`，错误全是 `spawn EPERM`），等于没用。
+ *       - `run({ reporter: 'spec' })` 在 Worker 里 `for await` 拿不到任何 chunk；
+ *       - `spec(stream)` 二次转换会挂住（报告器流不 end）；
+ *       - 裸 `run()` 发出的是**测试事件对象**，事件里只有单个用例，没有总数。
+ *   · 替换 `process.stdout.write` 抓 TAP 文本：能抓到全部 `ok` 行与 `not ok` 行，
+ *     但**抓不到汇总行**（`# pass N`）—— 报告器把汇总行写到别处去了
+ *     （实测：等到 1 秒静默、或等到进程该退出，捕获文本里依然没有 `# pass`）。
  *
- *   这是最危险的一类缺陷：**数字不可信，却看起来一切正常**。
- *   现在的做法是**轮询等待汇总行**（而不是固定等待），并且
- *   一旦超时仍没拿到汇总行，就明确标记 `summaryFound: false`，
- *   由 `run-tests.ts` 报成失败 —— 宁可响，不可静默错。
+ * ### 因此：不做任何计时猜测，改为**逐行分类**
+ *   TAP 里每个 `ok N - 名称` / `not ok N - 名称` 后面紧跟一段 YAML 诊断块，
+ *   其中的 `type:` 字段明确区分这条结果是**用例**还是**套件**：
+ *
+ *     ok 1 - 引号族标签与字符表齐备
+ *       ---
+ *       type: 'test'      ← 用例
+ *       ...
+ *
+ *     ok 1 - 引号族（constants.QUOTE_PAIRS）
+ *       ---
+ *       type: 'suite'     ← describe 块，不是用例
+ *       ...
+ *
+ *   于是「数用例」= 逐条 `ok`/`not ok` 判断它是不是 suite，**完全确定**，
+ *   不需要等、不需要猜、不会因机器快慢而漂移。
+ *
+ * ### 这条纪律的来历（别重犯）
+ *   早期版本「替换 stdout + `setTimeout(150)` + 只在拿到 `# pass` 时信它」，
+ *   导致总数在 1333 / 1347 / 1351 之间**每次跑都不一样**，而每轮都打印「全部通过」。
+ *   **静默少算用例 + 看起来一切正常**，是最危险的一类缺陷。
+ *   现在：只要出现一条**无法分类**的 `ok` 行，就报 `loadError` 让整轮失败 ——
+ *   宁可响，不可静默错。
  *
  * 用法：new Worker(本文件, { workerData: { file } })
  */
@@ -34,92 +56,80 @@
 import { parentPort, workerData } from 'node:worker_threads'
 import { pathToFileURL } from 'node:url'
 
+import { parseTap } from './tap-parse.ts'
+
 interface WorkerData {
   file: string
 }
 
 const { file } = workerData as WorkerData
 
-/** TAP 汇总行出现前的最长轮询时间（单文件；超过就判定捕获不完整） */
-const SUMMARY_WAIT_TIMEOUT_MS = 15_000
-const SUMMARY_POLL_INTERVAL_MS = 20
+/** 单个文件的墙钟超时（与 run-tests.ts 的 FILE_TIMEOUT_MS 对齐，留出上报余量） */
+const OVERALL_TIMEOUT_MS = 110_000
+/** TAP 写完后判定「安静」的阈值；纯属性能优化，不影响计数正确性 */
+const QUIET_MS = 250
 
+let loadError: string | null = null
 const chunks: string[] = []
 const origOut = process.stdout.write.bind(process.stdout)
 const origErr = process.stderr.write.bind(process.stderr)
+
+let lastWriteAt = 0
 const capture = (chunk: unknown): boolean => {
   chunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk as Uint8Array).toString('utf8'))
+  lastWriteAt = Date.now()
   return true
 }
 
-const text = (): string => chunks.join('')
 
-let loadError: string | null = null
+
 try {
-  process.stdout.write = capture as typeof process.stdout.write
-  process.stderr.write = capture as typeof process.stderr
+  // `process.stderr.write` 的重载签名比 stdout 窄（`WriteStream & { fd: 2 }`），
+  // 直接断言成 capture 会被 TS 判为「类型不重叠」（TS2352），必须先经 unknown。
+  ;(process as { stdout: { write: unknown } }).stdout.write = capture
+  ;(process as { stderr: { write: unknown } }).stderr.write = capture
   await import(pathToFileURL(file).href)
-} catch (e) {
-  loadError = e instanceof Error ? `${e.name}: ${e.message.split('\n')[0]}` : String(e)
-}
 
-// ── 轮询等待 node:test 写完全部 TAP（含 `# pass` 汇总行）──────────────────
-let summaryFound = false
-if (loadError === null) {
-  const deadline = Date.now() + SUMMARY_WAIT_TIMEOUT_MS
+  // 等「安静」：不再有新的 TAP 写入即认为跑完。
+  // 这只是为了不截断文本；用例数的正确性由下面的分类保证，与等多久无关。
+  const deadline = Date.now() + OVERALL_TIMEOUT_MS
   for (;;) {
-    // TAP 的 summary 一定同时带 `# pass` 与 `# fail`，两个都出现才算写完
-    if (/# pass \d+/.test(text()) && /# fail \d+/.test(text())) {
-      summaryFound = true
+    if (lastWriteAt > 0 && Date.now() - lastWriteAt > QUIET_MS) break
+    if (Date.now() >= deadline) {
+      loadError = `测试运行超时（${OVERALL_TIMEOUT_MS}ms）`
       break
     }
-    if (Date.now() >= deadline) break
-    await new Promise((resolve) => setTimeout(resolve, SUMMARY_POLL_INTERVAL_MS))
+    await new Promise((resolve) => setTimeout(resolve, 25))
   }
+} catch (e) {
+  loadError = e instanceof Error ? `${e.name}: ${e.message.split('\n')[0]}` : String(e)
+} finally {
+  ;(process as { stdout: { write: unknown } }).stdout.write = origOut
+  ;(process as { stderr: { write: unknown } }).stderr.write = origErr
 }
 
-// 还原 stdout/stderr 要在**读完之后**，否则最后几段可能落在还原之后丢失
-const captured = text()
-process.stdout.write = origOut
-process.stderr.write = origErr
+const text = chunks.join('')
+const parsed = parseTap(text)
 
-let passed = 0
-let failed = 0
-let skipped = 0
-const failures: string[] = []
-
-for (const line of captured.split(/\r?\n/)) {
-  const notOk = /^\s*not ok \d+ - (.+?)\s*$/.exec(line)
-  if (notOk) {
-    failed++
-    failures.push(notOk[1])
-    continue
+if (loadError === null) {
+  if (parsed.entries.length === 0) {
+    loadError = '测试结果为空：没有解析到任何 TAP 结果行'
+  } else if (parsed.unclassified.length > 0) {
+    // 无法判断是用例还是套件 → 计数必然不准。明确失败，不静默放行。
+    loadError =
+      `有 ${parsed.unclassified.length} 条 TAP 结果无法分类（缺少 type 字段），用例数不可信。` +
+      `首条：${parsed.unclassified[0]!.slice(0, 120)}`
   }
-  const ok = /^\s*ok \d+ - (.+?)(\s+#\s+(SKIP|TODO))?\s*$/.exec(line)
-  if (ok) {
-    if (ok[3] === 'SKIP') skipped++
-    else passed++
-  }
-}
-
-// TAP 的汇总行更权威（含嵌套子测试），拿到就用它覆盖「数 ok 行」的估算
-const sp = /# pass (\d+)/.exec(captured)
-const sf = /# fail (\d+)/.exec(captured)
-const ss = /# skipped (\d+)/.exec(captured)
-if (sp) passed = Number(sp[1])
-if (sf) failed = Number(sf[1])
-if (ss) skipped = Number(ss[1])
-
-// 没拿到汇总行 = 用例数不可信。明确标记，让上层报错而不是报一个漂移的数字。
-if (loadError === null && !summaryFound) {
-  loadError = `测试报告不完整：${SUMMARY_WAIT_TIMEOUT_MS}ms 内未出现 TAP 汇总行（# pass / # fail）`
 }
 
 parentPort?.postMessage({
-  passed,
-  failed,
-  skipped,
-  failures: failures.slice(0, 80),
+  passed: parsed.tests,
+  failed: parsed.failures.length,
+  skipped: parsed.skipped,
+  failures: parsed.failures.slice(0, 80),
   loadError,
-  summaryFound,
+  // 「可信」= 每条结果都分好类了（与是否拿到汇总行无关，汇总行在本环境抓不到）
+  summaryFound: loadError === null && parsed.entries.length > 0 && parsed.unclassified.length === 0,
+  suiteCount: parsed.suites,
+  sawSummary: parsed.sawSummary,
 })

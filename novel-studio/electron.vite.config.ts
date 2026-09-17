@@ -1,9 +1,65 @@
+import { cpSync, existsSync, mkdirSync, readdirSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { defineConfig } from 'electron-vite'
 import vue from '@vitejs/plugin-vue'
 import AutoImport from 'unplugin-auto-import/vite'
 import Components from 'unplugin-vue-components/vite'
 import { ElementPlusResolver } from 'unplugin-vue-components/resolvers'
+
+// ============================================================================
+// 运行时资源复制插件
+// ============================================================================
+// ### 为什么必须存在（真实踩过的坑）
+//   迁移 SQL（`src/main/infra/db/migrations/*.sql`）是**运行时用
+//   `readFileSync(join(dirname(import.meta.url), file))` 读取**的 ——
+//   打包器不认识 `.sql`，不会把它带进 bundle。
+//
+//   真机上第一次 `npm run dev` 的现象：
+//     db.opened                    schemaVersion: 0     ← 库开了，但没有表
+//     db.migrate.failed.readOnly   reason: DB_MIGRATION_FAILED
+//     [FAIL] register-media-protocol
+//   而 `out/main/infra/db/migrations/` 目录**根本不存在**。
+//   结果：应用能起窗口，但没有任何表可用。
+//
+// ### 为什么内联在配置文件里（不 import 自定义模块）
+//   electron-vite 启动时**先用 esbuild 把本文件打成一个临时 bundle**。
+//   跨文件 import 会多一个解析环节，而本仓库的验证环境禁止 spawn（跑不了 esbuild），
+//   **无法预先验证那个 import 能否被解析** —— 不引入无法验证的风险，故内联。
+//
+// ### 为什么挂 writeBundle 而不是 postbuild 脚本
+//   dev 与 build 两条路都会走 vite 插件；postbuild 脚本只覆盖 build，
+//   `npm run dev` 依然会踩同一个坑。且全程只用 node:fs，不 spawn 任何进程。
+const RUNTIME_ASSET_DIRS = [
+  { from: 'src/main/infra/db/migrations', to: 'main/infra/db/migrations' },
+]
+
+function copyRuntimeAssetsPlugin() {
+  return {
+    name: 'novel-studio:copy-runtime-assets',
+    apply: () => true,
+    /**
+     * `this` 是 Rollup 的插件上下文（`PluginContext`），带 `info/warn` 等方法。
+     * 必须显式标注：不标注时 TS 会把对象字面量的 `this` 推成上面那个结构，
+     * 报 `Property 'info' does not exist on type ...`。
+     */
+    writeBundle(this: { info(msg: string): void }, options: { dir?: string }) {
+      const outDir = options.dir ?? resolve('out')
+      let copied = 0
+      for (const asset of RUNTIME_ASSET_DIRS) {
+        const src = resolve(asset.from)
+        if (!existsSync(src)) continue
+        const dest = resolve(outDir, asset.to)
+        mkdirSync(dest, { recursive: true })
+        for (const name of readdirSync(src)) {
+          if (!name.endsWith('.sql')) continue
+          cpSync(resolve(src, name), resolve(dest, name))
+          copied++
+        }
+      }
+      this.info(`[runtime-assets] 已复制 ${copied} 个文件到 ${outDir}`)
+    },
+  }
+}
 
 // ============================================================================
 // Novel Studio · electron-vite 配置
@@ -39,6 +95,11 @@ export default defineConfig({
         output: { format: 'es' }
       }
     },
+    // ⚠️ 必须有这个插件：迁移 SQL 是**运行时读文件**的（打包器不认识 .sql，不会带进 bundle）。
+    //    少了它，真机上 `out/main/infra/db/migrations/` 不存在 →
+    //    loadMigrations() 读不到 SQL → DB_MIGRATION_FAILED → 应用起得来但没有任何表。
+    //    做成插件（而不是 postbuild 脚本）是因为 dev 与 build 两条路都会走 vite。
+    plugins: [copyRuntimeAssetsPlugin()],
     resolve: {
       alias: {
         '@shared': resolve('src/shared'),

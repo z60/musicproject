@@ -4,7 +4,7 @@
  * 渲染进程环境声明
  * ============================================================================
  * 说明：
- *   · `window.api` 的形状由 preload 决定（实现见 src/main/preload.ts，
+ *   · `window.api` 的形状由 preload 决定（实现见 src/preload/index.ts，
  *     契约见 src/shared/ipc.ts）。这里只声明渲染进程能看到的最小面。
  *   · 组件**禁止**直接使用 window.api，一律经 src/renderer/src/shared/lib/ipc.ts
  *     的 call()/on()/send()，以便统一解包 IpcResult 并兑现错误（docs/22 §6.2）。

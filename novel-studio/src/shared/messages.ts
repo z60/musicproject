@@ -855,6 +855,27 @@ export const MESSAGES = {
     severity: 'error', action: 'dismiss',
     dev: '启动抽样校验命中。标记 file_missing，不要静默跳过。',
   },
+  // ── 以下两条**追加在 7 段末尾**（编号纪律：只追加，绝不中间插入）──
+  // 为什么必须存在：这两个键曾被使用却没登记，`getMessage` 会静默回退到 INTERNAL，
+  // 于是「数据库为什么打不开」这个关键信息在日志里彻底消失，只剩一句
+  // 「发生了未预期的错误」—— 排查成本极高（见 docs/91 §5.4）。
+  DB_OPEN_FAILED: {
+    title: '无法打开数据库',
+    detail: '数据文件打不开，应用可能无法保存任何改动。',
+    hint: '请导出诊断包反馈。若刚安装过依赖，请先运行 npm run rebuild 重建数据库驱动。',
+    severity: 'fatal', action: 'contact_support',
+    dev:
+      '两类原因：(1) better-sqlite3 原生模块缺失或 ABI 不匹配 —— 未跑 electron-rebuild 时，' +
+      'Node 版 .node 无法被 Electron 加载（报 NODE_MODULE_VERSION 不一致）；' +
+      '(2) 数据库文件不可访问/损坏（权限、路径、磁盘）。details.reason 区分二者。',
+  },
+  DB_NOT_OPEN: {
+    title: '数据库尚未打开',
+    detail: '启动时数据库没有打开成功，因此这项操作暂时不可用。',
+    hint: '重启应用；若仍失败，请从备份恢复或导出诊断包。',
+    severity: 'error', action: 'dismiss',
+    dev: '启动流程在 open-database 步骤失败（或进了只读模式）后，DbPort 的写类操作会走到这里。',
+  },
 
   // --- 8xxx 任务队列 ------------------------------------------------------
   TASK_FAILED: {
@@ -1030,7 +1051,8 @@ const SEGMENTS: ReadonlyArray<{ segment: number; label: string; keys: readonly M
   {
     segment: 7, label: 'DATA',
     keys: ['DB_BUSY', 'DB_CORRUPT', 'DB_MIGRATION_FAILED', 'DB_BACKUP_FAILED', 'DB_RESTORE_FAILED',
-           'PROJECT_ID_CONFLICT', 'PATH_ESCAPE_BLOCKED', 'TEMP_CLEANUP_PARTIAL', 'AUDIO_FILE_MISSING'],
+           'PROJECT_ID_CONFLICT', 'PATH_ESCAPE_BLOCKED', 'TEMP_CLEANUP_PARTIAL', 'AUDIO_FILE_MISSING',
+           'DB_OPEN_FAILED', 'DB_NOT_OPEN'],
   },
   {
     segment: 8, label: 'TASK',

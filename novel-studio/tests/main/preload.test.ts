@@ -12,7 +12,7 @@
 import { strict as assert } from 'node:assert'
 import { describe, it } from 'node:test'
 
-import { createPreloadApi, preloadWhitelistSizes } from '../../src/main/preload.ts'
+import { createPreloadApi, preloadWhitelistSizes } from '../../src/preload/index.ts'
 import type { IpcRendererLike } from '../../src/main/infra/electron/types.ts'
 
 // ---------------------------------------------------------------------------

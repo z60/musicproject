@@ -5,7 +5,7 @@
  *
  * ```ts
  * webPreferences: {
- *   preload: join(__dirname, '../preload/index.js'),
+ *   preload: join(__dirname, '../preload/index.cjs'),   // 必须 .cjs，见 WindowManagerOptions.preloadPath
  *   contextIsolation: true,      // 必须
  *   nodeIntegration: false,      // 必须
  *   sandbox: true,               // 必须；若某能力必须关闭，单独论证并记录 ADR
@@ -67,7 +67,17 @@ export function createMemoryWindowStateStore(initial?: WindowState): WindowState
 
 export interface WindowManagerOptions {
   electron: ElectronLike
-  /** preload 绝对路径（`join(__dirname, '../preload/index.js')`） */
+  /**
+   * preload 绝对路径。
+   *
+   * ⚠️ 必须是 **`out/preload/index.cjs`**，不是 `index.js` —— 原因：
+   *   `package.json` 是 `"type": "module"`，因此 `.js` 会被按 ESM 解析；
+   *   而 `sandbox: true` 的 preload 只有受限的 CJS `require`，**没有 ESM 能力**。
+   *   所以 `electron.vite.config.ts` 把 preload 产物定为 `[name].cjs`
+   *   （见该文件 `preload.build.rollupOptions.output`）。
+   *   写成 `.js` 的症状是「窗口能开、但渲染进程没有 window.api」，
+   *   而且主进程日志里没有明显报错 —— 很难查。
+   */
   preloadPath: string
   /** 允许导航到的基础 URL（dev server 地址或 file:// 产物路径） */
   appUrl: string

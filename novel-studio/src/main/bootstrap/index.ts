@@ -300,6 +300,20 @@ export interface BootStepResult {
   elapsedMs: number
   /** 失败原因（已转成可读文本；错误码由调用方记入日志） */
   error?: string
+  /**
+   * 原始异常对象（失败时才有）。
+   *
+   * **为什么必须带上它**：`error` 是拼好的字符串（`name: message`），
+   * 而 `AppError.message` 是给用户看的一句话标题 —— 真正的诊断信息
+   * （`causeChain` / `details` / `numericCode`）都不在里面。
+   *
+   * 早期版本只留字符串，结果是真机上数据库迁移失败时日志只能看到
+   * 「发生了未预期的错误」，完全无法定位（见 docs/91 §5.4）。
+   * 带上原始对象，调用方才能用 `toLogFields` 把 cause 链完整记下来。
+   *
+   * 它不进 IPC、不进 UI，只用于主进程日志。
+   */
+  cause?: unknown
   /** 该步骤产出的、后续步骤需要的值 */
   produced?: Record<string, unknown>
 }
@@ -420,6 +434,8 @@ export async function runBootSequence(options: {
         skipped: false,
         elapsedMs: now() - t0,
         error: e instanceof Error ? `${e.name}: ${e.message}` : String(e),
+        // 带上原始对象：字符串化的 error 会吃掉 causeChain / details（见字段注释）
+        cause: e,
       }
       results.push(result)
       options.onStepFinish?.(result)

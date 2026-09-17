@@ -290,5 +290,5 @@ if (failedFiles.length > 0 || incomplete.length > 0) {
   process.exit(1)
 }
 
-console.log(`[run-tests] 全部通过 ✓（${results.length} 个文件都拿到了 TAP 汇总行，用例总数可信）`)
+console.log(`[run-tests] 全部通过 ✓（${results.length} 个文件的 TAP 结果全部成功分类，用例总数可信）`)
 console.log('='.repeat(78))

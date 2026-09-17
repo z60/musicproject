@@ -239,7 +239,7 @@ const DOMAINS: DomainExpectation[] = [
   { doc: 'docs/15-功能域-混音导出.md', label: '混音导出', codeGlobs: ['src/main/features/audio/mixer', 'src/main/features/audio/exporter', 'src/renderer/src/features/mixing/'] },
   { doc: 'docs/06-AI抽象层与向量判定.md', label: 'AI 与向量', codeGlobs: ['src/shared/ai/'] },
   { doc: 'docs/04-基础设施与队列.md', label: '基础设施', codeGlobs: ['src/main/infra/'] },
-  { doc: 'docs/20-IPC契约.md', label: 'IPC 层', codeGlobs: ['src/main/ipc/', 'src/main/preload.ts'] },
+  { doc: 'docs/20-IPC契约.md', label: 'IPC 层', codeGlobs: ['src/main/ipc/', 'src/preload/'] },
   { doc: 'docs/03-数据模型与存储.md', label: '数据与项目包', codeGlobs: ['src/main/features/book/package/', 'src/main/infra/db/'] },
   { doc: 'docs/22-错误码与消息体系.md', label: '错误体系', codeGlobs: ['src/shared/errors.ts', 'src/shared/messages.ts', 'src/main/infra/errors/', 'src/renderer/src/shared/lib/error-bus.ts'] },
 ]

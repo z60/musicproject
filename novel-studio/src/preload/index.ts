@@ -30,7 +30,7 @@ import {
   isIpcEventName,
   isIpcSendName,
 } from '../shared/ipc.ts'
-import type { IpcRendererLike } from './infra/electron/types.ts'
+import type { IpcRendererLike } from '../main/infra/electron/types.ts'
 
 // ---------------------------------------------------------------------------
 // 对外暴露的 API 形状（与 src/renderer/src/env.d.ts 的声明一致）
