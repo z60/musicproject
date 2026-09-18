@@ -124,6 +124,14 @@ export interface RegisterAllOptions {
   placeholderForMissing?: boolean
   /** 是否在注册后做契约完整性自检（默认 true；测试里可关掉以单独断言） */
   assertParity?: boolean
+  /**
+   * **领域 handler**（持有服务实例，由装配层用 `createBookHandlers(bookService)` 之类构造）。
+   *
+   * 为什么不写进 `ALL_HANDLERS`：域 handler 需要真实服务，而服务是在启动期装配的。
+   * 放进静态表会让 `handlers/index.ts` 静态依赖「服务 → 仓储 → db」，
+   * 那样 handler 层再也无法在无数据库的测试环境里被 import。
+   */
+  domainHandlers?: readonly RegisteredHandler[]
   /** 额外注册（如 future 的域）在占位之前执行 */
   extra?: readonly RegisteredHandler[]
   /** registry 依赖（日志、wasNotified） */
@@ -167,11 +175,14 @@ export function registerAllHandlers(deps: HandlerDeps, opts?: RegisterAllOptions
   initIpcRegistry(registryDeps)
 
   // ── 1) 真实实现的 handler ────────────────────────────────────────────────
-  const realSpecs: RegisteredHandler[] = [...ALL_HANDLERS, ...(opts?.extra ?? [])]
+  // 三部分来源：静态表（app/system）、装配层注入的域 handler、调用方额外追加的
+  const domainSpecs: readonly RegisteredHandler[] = opts?.domainHandlers ?? []
+  const realSpecs: RegisteredHandler[] = [...ALL_HANDLERS, ...domainSpecs, ...(opts?.extra ?? [])]
   const implementedChannels = realSpecs.map((h) => h.channel)
 
   // 重复登记 / 契约外的通道在这里就炸（handlers/index.ts 的自检）
-  const selfCheck = selfCheckHandlers(true)
+  // 注意要把域 handler 一起传进去：否则「域 handler 撞名」不会被发现
+  const selfCheck = selfCheckHandlers(true, [...domainSpecs, ...(opts?.extra ?? [])])
   if (selfCheck.unknown.length > 0 || selfCheck.duplicates.length > 0) {
     throw new AppError('INTERNAL', {
       details: {
@@ -183,9 +194,15 @@ export function registerAllHandlers(deps: HandlerDeps, opts?: RegisterAllOptions
   }
 
   const registrar = createRegistryRegistrar({ useContractSchemas: opts?.useContractSchemas ?? true })
-  registerSpecList(registrar, deps)
+  // ⚠️ 必须把**域 handler 与 extra 一起**传进去。
+  //    曾经漏传 domainHandlers：它们没被注册，而下面的
+  //    `assertContractParity()` 因为拿不到这些通道直接抛错 ——
+  //    症状是「implemented 28 / placeholders 130 / 合计 158，计数对得上但自检失败」。
+  registerSpecList(registrar, deps, [...domainSpecs, ...(opts?.extra ?? [])])
 
   // ── 2) 未实现通道的显式占位 ──────────────────────────────────────────────
+  // 判据用「契约 − 已实现」，而 implementedChannels 已经包含域 handler，
+  // 因此这些通道不会被重复注册占位（重复会撞 registry 的「通道重复注册」检查）
   const placeholderForMissing = opts?.placeholderForMissing ?? true
   let placeholderChannels: string[] = []
   if (placeholderForMissing) {

@@ -108,13 +108,19 @@ function onLimiterChange(value: boolean | string | number): void {
   mix.patchMaster({ limiterEnabled: value === true })
 }
 
-/** el-radio-group 的载荷是组内 el-radio-button 的 value：44100 / 48000 */
-function onSampleRateChange(value: 44100 | 48000): void {
+/**
+ * el-radio-group 的载荷是组内 el-radio-button 的 value：44100 / 48000。
+ *
+ * 参数声明成宽类型是**必须**的：Element Plus 2.14 起事件参数类型为
+ * `string | number | boolean | undefined`，而函数参数逆变 ——
+ * 精确联合会让 handler 不可赋值给组件的事件签名。
+ */
+function onSampleRateChange(value: string | number | boolean | undefined): void {
   mix.patchMaster({ sampleRate: Number(value) === 44100 ? 44100 : 48000 })
 }
 
-/** el-radio-group 的载荷是组内 el-radio-button 的 value：1 / 2 */
-function onChannelsChange(value: 1 | 2): void {
+/** 同上：载荷是 1 / 2，但参数必须收宽 */
+function onChannelsChange(value: string | number | boolean | undefined): void {
   mix.patchMaster({ channels: Number(value) === 2 ? 2 : 1 })
 }
 
@@ -122,8 +128,8 @@ function onChannelsChange(value: 1 | 2): void {
 const measureScope = ref<'chapter' | 'segment'>(props.defaultMeasureScope)
 const measureSegmentId = ref<string | null>(null)
 
-/** el-radio-group 的载荷是组内 el-radio-button 的 value：'chapter' / 'segment' */
-function onMeasureScopeChange(value: 'chapter' | 'segment'): void {
+/** 同上：载荷是 'chapter' / 'segment'，参数收宽 */
+function onMeasureScopeChange(value: string | number | boolean | undefined): void {
   measureScope.value = String(value) === 'segment' ? 'segment' : 'chapter'
 }
 

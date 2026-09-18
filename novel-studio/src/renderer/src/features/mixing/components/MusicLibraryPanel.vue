@@ -213,8 +213,13 @@ function toggleKind(next: 'bgm' | 'sfx'): void {
 }
 
 // ── 模板事件处理器（el-* 是全局组件，模板里拿不到载荷类型，统一在这里声明）──
-/** el-radio-group 的载荷是组内 el-radio-button 的 value：'bgm' / 'sfx' */
-function onKindChange(value: 'bgm' | 'sfx'): void {
+/**
+ * el-radio-group 的载荷是组内 el-radio-button 的 value：'bgm' / 'sfx'。
+ *
+ * 参数收宽是必须的：Element Plus 2.14 起事件参数类型为
+ * `string | number | boolean | undefined`，精确联合会因逆变而不可赋值。
+ */
+function onKindChange(value: string | number | boolean | undefined): void {
   toggleKind(String(value) === 'sfx' ? 'sfx' : 'bgm')
 }
 

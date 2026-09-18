@@ -40,9 +40,24 @@ const emit = defineEmits<{
   cancel: []
 }>()
 
-/** 保留哪个角色（默认选行数最多的，通常是正主） */
+/**
+ * 保留哪个角色（默认选行数最多的，通常是正主）。
+ *
+ * 类型含 `undefined` 是刻意的：`el-radio-group` 的 `:model-value` 只接受
+ * `string | number | boolean | undefined`，**不接受 null**（Element Plus 2.14 的签名）。
+ * 而「未选中」在模板里用 `targetId ?? undefined` 表达 —— 语义一样（都没有值），
+ * 但类型上能通过。
+ */
 const targetId = ref<Id | null>(null)
 const keepAliases = ref(true)
+
+/**
+ * `el-radio-group` 的载荷类型是 `string | number | boolean | undefined`
+ * （Element Plus 2.14）。选项值是角色 id，所以非空时就是 Id。
+ */
+function onTargetInput(value: string | number | boolean | undefined): void {
+  targetId.value = value === undefined || value === '' ? null : String(value)
+}
 
 watch(() => props.modelValue, (visible) => {
   if (!visible) return
@@ -124,7 +139,14 @@ function onConfirm(): void {
       <!-- 保留哪个 -->
       <section class="ns-merge__section">
         <h4 class="ns-merge__title">保留哪个角色</h4>
-        <el-radio-group v-model="targetId" class="ns-merge__radios">
+        <!-- 不用 v-model：`targetId` 是 `Id | null`，而 el-radio-group 的
+             model-value 只接受 `string | number | boolean | undefined`（不接受 null）。
+             显式绑定 + `?? undefined` 转换，语义完全不变（都表示「没有选中」）。 -->
+        <el-radio-group
+          :model-value="targetId ?? undefined"
+          class="ns-merge__radios"
+          @update:model-value="onTargetInput"
+        >
           <el-radio v-for="character in props.characters" :key="character.id" :value="character.id" border>
             <i class="ns-merge__dot" :style="{ background: character.color ?? '#909399' }" />
             {{ character.name }}

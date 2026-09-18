@@ -97,6 +97,15 @@ async function save(patch: DeepPartial<AppSettings>): Promise<void> {
   }
 }
 
+/**
+ * el-table 的作用域插槽把 `row` 定型为 Element Plus 的 `DefaultRow`（一个宽松记录类型），
+ * 所以模板里不能直接把它交给需要 `ModelStatus` 的函数。
+ *
+ * 收敛写在**脚本**里而不是模板里：本仓库的模板表达式按 JS 解析，写不了 TS 断言
+ * （`check:template-types` 专门拦这类写法，见 package.json 的 template-types 说明）。
+ */
+const asModelStatus = (row: unknown): ModelStatus => row as ModelStatus
+
 /** 状态标签：缺失 / 校验失败 / 就绪 */
 function statusTag(model: ModelStatus): { text: string; type: 'danger' | 'warning' | 'success' } {
   if (!model.exists) return { text: '缺失', type: 'danger' }
@@ -159,7 +168,7 @@ async function openModelFolder(model: ModelStatus): Promise<void> {
         </el-table-column>
         <el-table-column label="状态" width="100">
           <template #default="{ row }">
-            <el-tag size="small" :type="statusTag(row).type">{{ statusTag(row).text }}</el-tag>
+            <el-tag size="small" :type="statusTag(asModelStatus(row)).type">{{ statusTag(asModelStatus(row)).text }}</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="大小" width="100">
@@ -177,13 +186,13 @@ async function openModelFolder(model: ModelStatus): Promise<void> {
         </el-table-column>
         <el-table-column label="修复指引" min-width="260">
           <template #default="{ row }">
-            <span class="ns-models__fix">{{ repairHint(row) }}</span>
+            <span class="ns-models__fix">{{ repairHint(asModelStatus(row)) }}</span>
             <p v-if="row.message" class="ns-models__message">探测信息：{{ row.message }}</p>
           </template>
         </el-table-column>
         <el-table-column label="操作" width="120" fixed="right">
           <template #default="{ row }">
-            <el-button size="small" link @click="openModelFolder(row)">打开所在文件夹</el-button>
+            <el-button size="small" link @click="openModelFolder(asModelStatus(row))">打开所在文件夹</el-button>
           </template>
         </el-table-column>
       </el-table>

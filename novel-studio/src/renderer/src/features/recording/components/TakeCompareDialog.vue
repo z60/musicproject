@@ -127,9 +127,14 @@ async function changeMode(next: CompareMode): Promise<void> {
   if (wasPlaying) await play()
 }
 
-/** 对比模式切换：el-radio-group 的选项值即 CompareMode */
-function onModeInput(value: CompareMode): void {
-  void changeMode(value)
+/**
+ * 对比模式切换：el-radio-group 的选项值即 CompareMode。
+ *
+ * 参数收宽：Element Plus 2.14 起事件参数类型为
+ * `string | number | boolean | undefined`，精确类型因逆变不可赋值。
+ */
+function onModeInput(value: string | number | boolean | undefined): void {
+  void changeMode(value as CompareMode)
 }
 
 function applyPosition(ms: number): void {

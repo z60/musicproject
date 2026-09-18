@@ -206,3 +206,41 @@ export function preloadWhitelistSizes(): { channels: number; events: number; sen
     sends: IPC_SEND_NAMES.length,
   }
 }
+
+// ---------------------------------------------------------------------------
+// 入口自执行
+// ---------------------------------------------------------------------------
+
+/**
+ * **preload 是「加载即生效」的脚本，不是库。**
+ *
+ * ### 这里踩过一个很隐蔽的坑
+ *   本文件一开始只**导出**了 `installPreload`，没有任何地方调用它。
+ *   后果是：preload 被 Electron 正常加载、`installPreload` 也打进了产物，
+ *   但 `window.api` **永远是 undefined** —— 因为没人调用它。
+ *
+ *   而症状指向了完全错误的方向：渲染进程里只会报
+ *   `TypeError: Cannot read properties of undefined (reading 'on')`
+ *   （`window.api.on(...)` 的第一个失败点），
+ *   类型检查也过（`env.d.ts` 里声明了 `window.api` 的形状）——
+ *   看起来像「渲染进程的问题」，实际是 preload 少了一行调用。
+ *
+ * ### 为什么用 try/catch 而不是让它裸抛
+ *   · 在 Electron 的 preload 环境里：正常执行，`contextBridge` 挂上 `window.api`
+ *   · 在 Node 里被 import（测试、脚本）：`require('electron')` 会失败。
+ *     这时抛错会让**测试文件整片加载失败**，而那些测试恰恰是在验证
+ *     `createPreloadApi` 的白名单逻辑 —— 不该因为「不在 Electron 里」而跑不了。
+ *   所以：捕获并把原因**明确打到控制台**（不是静默吞掉），
+ *   让「preload 没生效」这件事在日志里立即可见。
+ *   渲染侧还有第二道防线（`shared/lib/ipc.ts` 会抛带定位信息的错误）。
+ */
+try {
+  installPreload()
+} catch (e) {
+  // 不用 console.error 之外的手段：preload 环境里没有主进程 logger
+  console.error(
+    '[novel-studio:preload] installPreload() 失败，window.api 将不可用 —— ' +
+      '渲染进程会拿不到任何 IPC 能力。原因：',
+    e,
+  )
+}

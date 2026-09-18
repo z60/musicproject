@@ -139,6 +139,13 @@ async function backupNow(): Promise<void> {
   }
 }
 
+/**
+ * el-table 的作用域插槽把 `row` 定型为 Element Plus 的 `DefaultRow`（宽松记录类型），
+ * 模板里无法直接交给需要 `BackupEntry` 的函数。收敛写在脚本里 ——
+ * 模板表达式按 JS 解析，写不了 TS 断言（见 package.json 的 template-types 说明）。
+ */
+const asBackupEntry = (row: unknown): BackupEntry => row as BackupEntry
+
 function askRestore(entry: BackupEntry): void {
   pendingRestore.value = entry
   confirmVisible.value = true
@@ -269,7 +276,7 @@ onMounted(() => {
         <el-table-column label="操作" width="180" fixed="right">
           <template #default="{ row }">
             <el-button size="small" link @click="reveal(row.filePath)">打开文件夹</el-button>
-            <el-button size="small" link type="danger" @click="askRestore(row)">恢复</el-button>
+            <el-button size="small" link type="danger" @click="askRestore(asBackupEntry(row))">恢复</el-button>
           </template>
         </el-table-column>
       </el-table>

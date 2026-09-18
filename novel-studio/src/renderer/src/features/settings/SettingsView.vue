@@ -285,6 +285,16 @@ const preferredDeviceId = ref<string | null>(null)
 
 const inputDevices = computed(() => devices.value.filter(d => d.kind === 'audioinput'))
 
+/**
+ * 「跟随系统默认设备」这个选项的绑定值。
+ *
+ * **运行时它就是 `null`** —— 后端用 `null` 表示「不指定设备」，语义不能改成 `''`。
+ * 这里只是把类型收敛到 `el-option` 的 `value` prop 允许的范围内（它不接受 `null`）。
+ * 断言放在脚本里而不是模板里：模板表达式按 JS 解析，写不了 TS 断言
+ * （`check:template-types` 专门拦这类写法）。
+ */
+const FOLLOW_SYSTEM_DEVICE = null as unknown as string
+
 async function loadDevices(): Promise<void> {
   devicesBusy.value = true
   try {
@@ -409,8 +419,17 @@ function keyIssue(field: ShortcutField): string | null {
   return null
 }
 
-/** 键盘捕获：聚焦后按键 → eventToShortcutString → 回填（docs/12 §9.1） */
-function captureKey(event: KeyboardEvent, field: ShortcutField): void {
+/**
+ * 键盘捕获：聚焦后按键 → eventToShortcutString → 回填（docs/12 §9.1）。
+ *
+ * 参数类型是 `Event | KeyboardEvent` 而不是 `KeyboardEvent`：模板里
+ * `@keydown.prevent="captureKey($event, ...)"` 的 `$event` 在 vue-tsc 下推断为
+ * `Event | KeyboardEvent`（不同 Element Plus 版本会变），声明成 `KeyboardEvent` 会报
+ * TS2345「Argument of type 'Event | KeyboardEvent' is not assignable」。
+ * 函数体内收窄一次，之后仍按 KeyboardEvent 使用。
+ */
+function captureKey(raw: Event | KeyboardEvent, field: ShortcutField): void {
+  const event = raw as KeyboardEvent
   // 纯修饰键不构成键位，等真正的主键
   if (['Control', 'Shift', 'Alt', 'Meta', 'CapsLock', 'Dead', 'Process'].includes(event.key)) return
   const combo = eventToShortcutString(event)
@@ -463,8 +482,9 @@ function setPedalKey(action: string, key: string): void {
   commitPedalMapping({ ...pedalMapping(), [action]: key })
 }
 
-/** 脚踏板映射的按键捕获：认不出的键位就保持原值，不要写进去一个空串 */
-function capturePedalKey(event: KeyboardEvent, action: string): void {
+/** 脚踏板映射的按键捕获：认不出的键位就保持原值，不要写进去一个空串（参数收宽理由同 captureKey） */
+function capturePedalKey(raw: Event | KeyboardEvent, action: string): void {
+  const event = raw as KeyboardEvent
   if (['Control', 'Shift', 'Alt', 'Meta', 'CapsLock', 'Dead', 'Process'].includes(event.key)) return
   const combo = eventToShortcutString(event)
   if (!combo) return
@@ -477,8 +497,9 @@ function removePedalRow(action: string): void {
   commitPedalMapping(next)
 }
 
-/** 踏板测试：按下踏板上的键，看它被识别成什么、映射到哪个动作 */
-function testPedal(event: KeyboardEvent): void {
+/** 踏板测试：按下踏板上的键，看它被识别成什么、映射到哪个动作（参数收宽理由同 captureKey） */
+function testPedal(raw: Event | KeyboardEvent): void {
+  const event = raw as KeyboardEvent
   if (['Control', 'Shift', 'Alt', 'Meta', 'CapsLock', 'Dead', 'Process'].includes(event.key)) return
   const combo = eventToShortcutString(event)
   if (!combo) {
@@ -528,6 +549,18 @@ const filePreview = computed(() => {
 })
 
 const unknownTokens = computed(() => unknownPlaceholders(settings.settings?.export.fileNameTemplate ?? ''))
+
+/**
+ * 未知占位符的展示文本。
+ *
+ * ⚠️ **为什么在 script 里算，而不是直接在模板里 `map(...).join()`**：
+ * 把 token 包成 `{name}` 需要出现「右花括号紧跟右花括号」的两个字符，
+ * 而 Vue 的插值分词器**在遇到那对字符时就认为 `{{ }}` 结束了**，
+ * 于是表达式被从中间截断（留下一个未闭合的模板字符串）→ 编译报
+ * `Error parsing JavaScript expression: Unexpected token, expected "}"`，
+ * 整个构建失败。字符串拼接放在这里就完全绕开了分词器的这一层。
+ */
+const unknownTokensHint = computed(() => unknownTokens.value.map((token) => '{' + token + '}').join('、'))
 
 const chapterTitlePreview = computed(() => renderTemplate(
   settings.settings?.export.chapterTitleTemplate ?? EXPORT_DEFAULTS.chapterTitleTemplate,
@@ -1079,7 +1112,7 @@ const bitDepthHint = computed(() => `采集固定用 float32（${AUDIO_DEFAULTS.
                   :disabled="inputDevices.length === 0"
                   @change="saveGroup('audio')"
                 >
-                  <el-option label="跟随系统默认设备" :value="null" />
+                  <el-option label="跟随系统默认设备" :value="FOLLOW_SYSTEM_DEVICE" />
                   <el-option
                     v-for="device in inputDevices"
                     :key="device.deviceId"
@@ -1675,7 +1708,7 @@ const bitDepthHint = computed(() => `采集固定用 float32（${AUDIO_DEFAULTS.
                   用 <code>/</code> 分隔可以直接生成子目录。非法字符会被清洗，UTF-8 超过 120 字节会截断。
                 </p>
                 <p v-if="unknownTokens.length" class="ns-hint ns-hint--warn">
-                  未知占位符 {{ unknownTokens.map(token => `{${token}}`).join('、') }}：导出时会**原样保留**，
+                  未知占位符 {{ unknownTokensHint }}：导出时会**原样保留**，
                   多半是拼错了，请对照上面的列表改掉。
                 </p>
               </el-form-item>

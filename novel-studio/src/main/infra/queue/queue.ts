@@ -235,6 +235,27 @@ export class TaskQueue {
     return { interrupted }
   }
 
+  /**
+   * 注册（或替换）一个任务定义。
+   *
+   * ### 为什么需要它（而不是只靠构造函数传 specs）
+   *   域服务（如 `book.service.ts`）的任务定义需要**闭包捕获自己的依赖**，
+   *   而队列又要在域服务之前建好（服务需要 queue 引用来 enqueue）——
+   *   两者互相依赖。构造期一次性传入无法表达这个关系。
+   *
+   *   因此：先用空 specs 建队列 → 建服务（把 queue 传进去）→
+   *   服务把自己的 specs 注册回来。这样没有初始化顺序的循环。
+   *
+   * 同 kind 重复注册会**替换**（后注册者生效），并记一条 warn —— 静默替换会让
+   * 「哪个实现真的在跑」变得不可知。
+   */
+  registerSpec(spec: TaskSpec<unknown, unknown>): void {
+    if (this.specs.has(spec.kind)) {
+      this.log('warn', 'task.spec.replaced', { event: 'task.spec.replaced', kind: spec.kind })
+    }
+    this.specs.set(spec.kind, spec)
+  }
+
   /** 把库里遗留的 running/waiting 标记为 interrupted（返回处理条数） */
   async markInterrupted(): Promise<number> {
     const stale = await this.store.loadByStatus(['running', 'waiting'])

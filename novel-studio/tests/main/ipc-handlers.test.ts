@@ -14,6 +14,7 @@ import { describe, it } from 'node:test'
 import { IPC_CHANNELS } from '../../src/shared/ipc.ts'
 import { ALL_HANDLERS, listImplementedChannels, registerAllHandlers, selfCheckHandlers } from '../../src/main/ipc/handlers/index.ts'
 import type { HandlerDeps, RegistrarLike } from '../../src/main/ipc/handlers/index.ts'
+import { createBookHandlers } from '../../src/main/ipc/handlers/book.ts'
 
 // ---------------------------------------------------------------------------
 // 假实现
@@ -215,6 +216,59 @@ describe('registerAllHandlers', () => {
     const { deps, spies } = createFakeDeps()
     registerAllHandlers(registrar, deps)
     assert.ok(spies.logInfo.some(e => e === 'info:ipc.handlers.registered'))
+  })
+
+  /**
+   * 这一条直接覆盖一个真实缺陷：`ipc/index.ts` 的 `registerAllHandlers`
+   * 接到了 `domainHandlers`，却**没有继续传给 `handlers/index.ts` 的这个函数** ——
+   * 域 handler 于是从未被注册，而 `assertContractParity()` 因为拿不到它们而抛错。
+   *
+   * 症状极具迷惑性：启动日志显示「implemented 28 / placeholders 130」看起来正常，
+   * 但契约总数 158 = 28 + 130 —— **计数对得上，集合对不上**。
+   */
+  it('第三个参数 domainHandlers 会被真正注册（不是收了参数就丢掉）', () => {
+    const { registrar, calls } = createFakeRegistrar()
+    const { deps } = createFakeDeps()
+
+    // 借真实的 book 域 handler 验证：它们持有服务，是典型的「域 handler」
+    const fakeBookService = {
+      list: async () => [],
+      get: async () => {
+        throw new Error('not used')
+      },
+      update: async () => {
+        throw new Error('not used')
+      },
+      remove: async () => ({ ok: true }),
+      probeFile: async () => {
+        throw new Error('not used')
+      },
+      detectEncoding: async () => {
+        throw new Error('not used')
+      },
+      previewSplit: async () => ({ drafts: [], cleanReport: {} as never, encoding: 'utf-8' }),
+      commitImport: async () => ({ bookId: 'b', chapterCount: 0 }),
+      findDuplicate: async () => ({ exists: false, bookId: null }),
+      ruleSets: { list: async () => [], save: async (r: never) => r, remove: async () => true },
+      importFile: async () => ({ taskId: 't' }),
+      importText: async () => ({ taskId: 't' }),
+      importUrl: async () => ({ taskId: 't' }),
+      ensureProject: async () => 'default',
+      taskSpecs: () => [],
+      listChapters: async () => [],
+    }
+    const domainHandlers = createBookHandlers(fakeBookService as never)
+
+    const result = registerAllHandlers(registrar, deps, domainHandlers)
+
+    const registered = calls.map(c => c.channel)
+    for (const h of domainHandlers) {
+      assert.ok(
+        registered.includes(h.channel),
+        `域 handler ${h.channel} 没有被注册 —— 参数收到了就必须真的注册`,
+      )
+    }
+    assert.equal(result.implemented.length, ALL_HANDLERS.length + domainHandlers.length)
   })
 })
 

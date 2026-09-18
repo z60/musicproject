@@ -95,8 +95,15 @@ function onEnabledChange(value: boolean | string | number): void {
   patch({ enabled: value === true })
 }
 
-/** el-radio-group 的载荷是组内 el-radio-button 的 value：'sidechain' / 'envelope' */
-function onModeChange(value: 'sidechain' | 'envelope'): void {
+/**
+ * el-radio-group 的载荷是组内 el-radio-button 的 value：'sidechain' / 'envelope'。
+ *
+ * **但参数必须声明成宽类型**：Element Plus 2.14 起把 `change` /
+ * `update:model-value` 的参数类型定为 `string | number | boolean | undefined`，
+ * 而函数参数是逆变的 —— 声明成精确联合会让它**不可赋值**给组件的事件签名。
+ * 所以收宽 + 体内收窄（收窄后依旧类型安全）。
+ */
+function onModeChange(value: string | number | boolean | undefined): void {
   patch({ mode: String(value) === 'envelope' ? 'envelope' : 'sidechain' })
 }
 

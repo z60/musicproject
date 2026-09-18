@@ -71,6 +71,23 @@ for (const f of srcFiles) fileText.set(rel(f), read(f))
 // 1. 通道覆盖
 // ---------------------------------------------------------------------------
 
+/**
+ * 通道名的一段（域或动作）：字母开头，其后允许字母与数字。
+ *
+ * 必须允许数字 —— export:m4b 是真实的通道名（下面正则里写成 m4b）。早先写成
+ * 只允许字母的形式时，这一个通道被正则静默丢弃：接口体明明有 158 个成员，
+ * 脚本只数出 157，于是 docs/90 报 157、export:m4b 从不进入任何统计，
+ * **而且全程不报错**。这类「判据自身漏项、把分母悄悄调小」的缺陷比漏实现更危险，
+ * 因此下面还有 CONTRACT_PARSE 自检把它咬出来。
+ *
+ * 注：这里用正则字面量而不是 new RegExp(模板串) —— 模板串里的 \\s 既难读，
+ * 又曾让 tsc 的扫描器把整条声明吃掉（报 Cannot find name）。字面量最直白。
+ */
+/** 接口体成员行，形如  两空格 + 引号 + domain:action + 引号 + 冒号 */
+const CHANNEL_KEY = /^\s{2}'([A-Za-z][A-Za-z0-9]*:[A-Za-z][A-Za-z0-9]*)':/gm
+/** 运行期数组里的引号字符串，形如 引号 + domain:action + 引号 */
+const CHANNEL_QUOTED = /'([A-Za-z][A-Za-z0-9]*:[A-Za-z][A-Za-z0-9]*)'/g
+
 const ipcSrc = read(join(ROOT, 'src/shared/ipc.ts'))
 const channels: string[] = []
 {
@@ -78,14 +95,19 @@ const channels: string[] = []
   // 不能全文件扫 —— 运行期数组 IPC_CHANNELS 里是同一批字符串，会重复计数。
   // 域与动作都允许大写：`voiceActor:list` 这类驼峰域不是纯小写，
   // 用 [a-z]+ 会在 `voice` 处断开导致漏项（实测会漏 7 个通道）。
+  //
+  // 段内还必须允许数字：`export:m4b` 里的 `m4b`。早先写成 [a-zA-Z]+，
+  // 于是这一个通道被**静默丢弃**（158 被数成 157），既不报错也没有提示 ——
+  // 只是把所有分母悄悄调小 1，属于「用错误的方法测出漂亮数字」。
+  // 下面 CHANNEL_SEG 常量为它固化，并配 CONTRACT_PARSE 自检兜底。
   const iface = ipcSrc.match(/export interface IpcContract \{([\s\S]*?)\n\}/)?.[1] ?? ''
-  for (const m of iface.matchAll(/^\s{2}'([a-zA-Z]+:[a-zA-Z]+)':/gm)) channels.push(m[1])
+  for (const m of iface.matchAll(CHANNEL_KEY)) channels.push(m[1]!)
 }
 /** 运行期数组（用于校验契约与数组是否同步） */
 const runtimeChannels: string[] = []
 {
   const arr = ipcSrc.match(/export const IPC_CHANNELS = \[([\s\S]*?)\] as const satisfies/)?.[1] ?? ''
-  for (const m of arr.matchAll(/'([a-zA-Z]+:[a-zA-Z]+)'/g)) runtimeChannels.push(m[1])
+  for (const m of arr.matchAll(CHANNEL_QUOTED)) runtimeChannels.push(m[1]!)
 }
 
 /**
@@ -301,6 +323,53 @@ const channelParity = {
   onlyInRuntime: runtimeChannels.filter(c => !channels.includes(c)),
 }
 
+/**
+ * 解析器自检（CONTRACT_PARSE）。
+ *
+ * 为什么需要它：上面两条正则**自己漏项时不会报错**。`export:m4b` 曾被
+ * `[a-zA-Z]+` 漏掉，两个数字（158 / 157）不相等却都能打印出来，
+ * 报告照样声称「✓ 契约与数组一致」—— 因为一致性是用同一套漏项的正则
+ * 从两个地方各抓一遍比较的，漏得一样就"一致"了。
+ *
+ * 所以判据必须来自解析之外：接口体成员用**宽松匹配**（任意非引号字符）
+ * 再数一遍，与严格匹配的结果比对。宽松匹配是"宁可多抓"的，
+ * 若严格匹配比它少，说明严格正则漏项，直接失败退出。
+ */
+const contractParse = ((): { ok: boolean; detail: string } => {
+  const iface = ipcSrc.match(/export interface IpcContract \{([\s\S]*?)\n\}/)?.[1] ?? ''
+  const loose: string[] = []
+  for (const m of iface.matchAll(/^\s{2}'([^']+)':/gm)) loose.push(m[1]!)
+
+  const strictSet = new Set(channels)
+  const missed = loose.filter(c => !strictSet.has(c))
+
+  // 非空是最基本的要求：正则整体写坏时两张表都会是空的，
+  // 那样 channelParity 会「一致地」都等于 0，看起来完美。
+  if (channels.length === 0 || runtimeChannels.length === 0) {
+    return { ok: false, detail: `解析结果为空（契约 ${channels.length} / 数组 ${runtimeChannels.length}）—— 正则或源文件结构已变` }
+  }
+  if (missed.length > 0) {
+    return { ok: false, detail: `严格正则漏掉 ${missed.length} 个通道：${missed.join(', ')} —— 请修正 CHANNEL_KEY / CHANNEL_QUOTED` }
+  }
+  if (loose.length !== channels.length) {
+    return { ok: false, detail: `接口成员 ${loose.length} 个，严格解析出 ${channels.length} 个，数量不符` }
+  }
+  if (channels.length !== runtimeChannels.length) {
+    return { ok: false, detail: `契约 ${channels.length} ≠ 运行期数组 ${runtimeChannels.length}` }
+  }
+  return { ok: true, detail: `契约 ${channels.length} 个接口成员全部解析成功，且与运行期数组一致` }
+})()
+
+if (!contractParse.ok) {
+  console.error('')
+  console.error('='.repeat(80))
+  console.error('[check-coverage] ✗ 契约解析自检失败 —— 覆盖度数字不可信，拒绝生成报告')
+  console.error(`  ${contractParse.detail}`)
+  console.error('='.repeat(80))
+  console.error('')
+  process.exit(1)
+}
+
 if (AS_JSON) {
   console.log(JSON.stringify({ ...summary, channelParity }, null, 2))
 } else {
@@ -321,6 +390,7 @@ if (AS_JSON) {
   } else {
     console.log('  ✓ 契约与数组一致')
   }
+  console.log(`  ${contractParse.ok ? '✓' : '✗'} [CONTRACT_PARSE] ${contractParse.detail}`)
   console.log('')
   console.log('【IPC 通道覆盖】')
   console.log(`  契约通道        ${summary.channels.total}`)

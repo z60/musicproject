@@ -21,16 +21,39 @@ import { ElementPlusResolver } from 'unplugin-vue-components/resolvers'
 //   而 `out/main/infra/db/migrations/` 目录**根本不存在**。
 //   结果：应用能起窗口，但没有任何表可用。
 //
-// ### 为什么内联在配置文件里（不 import 自定义模块）
-//   electron-vite 启动时**先用 esbuild 把本文件打成一个临时 bundle**。
-//   跨文件 import 会多一个解析环节，而本仓库的验证环境禁止 spawn（跑不了 esbuild），
-//   **无法预先验证那个 import 能否被解析** —— 不引入无法验证的风险，故内联。
+// ### 第三次踩坑（最终定论）：目标必须是 outDir **本身**
+//   前两次都错了，而且错法不同，值得完整记下：
 //
-// ### 为什么挂 writeBundle 而不是 postbuild 脚本
-//   dev 与 build 两条路都会走 vite 插件；postbuild 脚本只覆盖 build，
-//   `npm run dev` 依然会踩同一个坑。且全程只用 node:fs，不 spawn 任何进程。
+//   ① 第一次：`to = 'main/infra/db/migrations'` → `out/main/main/infra/db/migrations/`
+//      （outDir 已是 out/main，多套了一层）
+//   ② 第二次：`to = 'infra/db/migrations'` → `out/main/infra/db/migrations/`
+//      路径"看起来对"（和源码树 src/main/infra/db/migrations 形状一致），**但仍然是错的**。
+//
+//   为什么 ② 也错 —— 关键在于**别把源码树的形状当成 bundle 后的形状**：
+//     · 源码里 `infra/db/migrations/index.ts` 与 .sql **同目录**
+//     · 但 electron-vite 把整个主进程**内联成单个 bundle**：`out/main/index.js`
+//       （目录结构不复存在，`infra/db/migrations/` 这一层在产物里根本不存在）
+//     · 而 `migrations/index.ts` 里的
+//           `const migrationsDir = dirname(fileURLToPath(import.meta.url))`
+//       被内联进 index.js 后，`import.meta.url` 就是 **out/main/index.js** 的 URL
+//         ⇒ `migrationsDir = <outDir>`（产物里就是这么算的，日志实证：
+//            ENOENT …\out\main\001_init.sql）
+//
+//   所以 SQL 必须与 `index.js` **同级**，即 `to` 必须解析为 `<outDir>` 本身（`'.'`）。
+//
+//   真机日志（第二次修复后）：
+//     causeChain: ["[ENOENT] Error: ENOENT: no such file or directory,
+//                  open '…\novel-studio\out\main\001_init.sql'"]
+//     —— 文件名是 001_init.sql，目录是 out/main，与上面的推导完全一致。
+//
+//   四条纪律：
+//     1. `to` 解析结果必须**正好等于 outDir**；写成任何子目录都会 ENOENT；
+//     2. 源目录不存在 → 直接抛错（静默 continue 会把「打包漏文件」拖到运行时才暴露）；
+//     3. 一个 .sql 都没复制 → 直接抛错；
+//     4. 想改 `to` 之前，先读产物里 `migrationsDir` 的实际取值（见 docs/91 §5.2.1）。
 const RUNTIME_ASSET_DIRS = [
-  { from: 'src/main/infra/db/migrations', to: 'main/infra/db/migrations' },
+  // 目标 = <outDir> 本身（'.'），与产物里 dirname(import.meta.url) 对齐 —— 见上面 ③
+  { from: 'src/main/infra/db/migrations', to: '.' },
 ]
 
 function copyRuntimeAssetsPlugin() {
@@ -45,18 +68,33 @@ function copyRuntimeAssetsPlugin() {
     writeBundle(this: { info(msg: string): void }, options: { dir?: string }) {
       const outDir = options.dir ?? resolve('out')
       let copied = 0
+      const copiedTo: string[] = []
       for (const asset of RUNTIME_ASSET_DIRS) {
         const src = resolve(asset.from)
-        if (!existsSync(src)) continue
+        if (!existsSync(src)) {
+          // 静默跳过会让「源目录改名/移动」这类错误一路潜伏到运行时，
+          // 表现成「库连上了但没有表」——排查成本极高。这里直接失败。
+          throw new Error(
+            `[runtime-assets] 源目录不存在：${src}\n` +
+              `  迁移 SQL 必须存在于源码树中；若已移动，请同步修改 electron.vite.config.ts 的 RUNTIME_ASSET_DIRS。`
+          )
+        }
         const dest = resolve(outDir, asset.to)
         mkdirSync(dest, { recursive: true })
         for (const name of readdirSync(src)) {
           if (!name.endsWith('.sql')) continue
           cpSync(resolve(src, name), resolve(dest, name))
           copied++
+          copiedTo.push(resolve(dest, name))
         }
       }
-      this.info(`[runtime-assets] 已复制 ${copied} 个文件到 ${outDir}`)
+      if (copied === 0) {
+        throw new Error(
+          `[runtime-assets] 一个 .sql 都没复制到 ${outDir} —— 运行时 loadMigrations() 必然 ENOENT。`
+        )
+      }
+      this.info(`[runtime-assets] 已复制 ${copied} 个文件：`)
+      for (const p of copiedTo) this.info(`[runtime-assets]   ${p}`)
     },
   }
 }

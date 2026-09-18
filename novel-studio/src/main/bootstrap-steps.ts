@@ -21,7 +21,7 @@
 import { promises as fsp, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 
-import { AppError } from '../shared/errors.ts'
+import { AppError, summarizeCauseChain } from '../shared/errors.ts'
 import type { FfmpegCapabilities, ModelStatus } from '../shared/types.ts'
 import { formatBootReport, type BootContext, type BootStepHandlers } from './bootstrap/index.ts'
 import { cleanupCaches, cleanupStaleTemps, defaultCleanupTargets, DEFAULT_CACHE_TTL_MS, DEFAULT_TEMP_MAX_AGE_MS } from './bootstrap/cleanup.ts'
@@ -160,15 +160,46 @@ export function createBootStepHandlers(deps: BootDeps): BootStepHandlers {
         const res = await runMigrations({ db: state.requireDb(), backupDir: paths.backupDir, log })
         return { from: res.result.from, to: res.result.to, applied: res.result.applied, backedUp: res.backedUp }
       } catch (e) {
-        // 迁移失败 → 进只读模式而不是直接退出：
+        const appErr = e instanceof AppError ? e : null
+        const reason = appErr ? appErr.key : String(e)
+        const details = (appErr?.details ?? {}) as Record<string, unknown>
+
+        // ── 基础设施残缺 vs 用户数据问题：必须区别对待 ──────────────────────
+        // 「迁移 SQL 读不到」不是用户数据的问题，而是**安装/打包残缺**
+        //   （.sql 没被复制到 out 目录、resources 缺失……）。
+        // 这类情况降级成只读模式毫无意义：应用能开窗口，但一张业务表都没有，
+        // 用户看到的是「点了没反应」，而真实原因只留在日志里。
+        // 踩过的坑：`to` 多写了一层 main/ → SQL 落到 out/main/main/...
+        // 运行时按 out/main 找 → ENOENT → 静默只读 → 库里只有 settings 一张表
+        // （还是 createSettingsStore 自己建的），books/projects/meta 全都不存在。
+        if (details['reason'] === 'sql-not-found') {
+          throw new AppError('DB_MIGRATION_FAILED', {
+            cause: e,
+            details: {
+              ...details,
+              fatal: 'migration-sql-missing',
+              hint: '迁移 SQL 未随构建产物提供：检查 electron.vite.config.ts 的 RUNTIME_ASSET_DIRS 是否正确复制到 out/main/infra/db/migrations/',
+            },
+          })
+        }
+
+        // 其余迁移失败 → 进只读模式而不是直接退出：
         // 用户至少还能导出数据、看诊断信息。写操作由 canWrite() 统一挡住。
+        // 失败**必须**把完整原因链打进日志。
+        // 踩过的坑：这里原来只记了 `reason`（= 'DB_MIGRATION_FAILED'），
+        // 于是「SQL 文件根本没被复制到 out 目录」这个真实原因（ENOENT + 路径）
+        // 在日志里完全看不到，只剩一个抽象错误码 —— 排查时无从下手。
+        const causeChain = appErr?.causeChain ?? summarizeCauseChain(e)
         state.readOnly = true
-        state.readOnlyReason = e instanceof AppError ? e.key : String(e)
+        state.readOnlyReason = reason
         log.error('db.migrate.failed.readOnly', {
           event: 'db.migrate.failed.readOnly',
-          reason: state.readOnlyReason,
+          reason,
+          details,
+          causeChain,
+          stack: e instanceof Error ? e.stack : undefined,
         })
-        return { readOnly: true, reason: state.readOnlyReason }
+        return { readOnly: true, reason, details, causeChain }
       }
     },
 
@@ -294,7 +325,11 @@ export function createBootStepHandlers(deps: BootDeps): BootStepHandlers {
       const settings = state.settings?.current()
       const candidates = ffmpegCandidates({
         paths,
-        settingsFfmpegPath: settings?.paths.ffmpegPath ?? null,
+        // `settings?.paths?.ffmpegPath` 里的第二个 `?.` 不是多余的：
+        // 启动路径上的设置树可能因库里存过坏值而缺一整支（docs/91 §5.2.3 的
+        // `import = null` 就是这么让第 11 步崩掉的）。启动期读取一律取值级兜底，
+        // 宁可退回「按候选路径探测」也不能让启动中止。
+        settingsFfmpegPath: settings?.paths?.ffmpegPath ?? null,
       })
       const ffmpeg = await probeFfmpeg(candidates, state)
       state.log().info('ffmpeg.probed', {

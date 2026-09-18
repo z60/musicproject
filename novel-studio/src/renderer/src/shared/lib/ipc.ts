@@ -73,6 +73,39 @@ export interface CallOptions extends ReportErrorOptions {
 }
 
 /**
+ * 取 `window.api`，缺失时抛出**能直接定位问题**的错误。
+ *
+ * ### 为什么需要这个守卫
+ *   preload 若没生效（历史上真实发生过一次：`src/preload/index.ts` 只导出了
+ *   `installPreload` 却忘了调用它），`window.api` 就是 `undefined`。
+ *   此时裸写 `window.api.on(...)` 只会得到：
+ *
+ *     TypeError: Cannot read properties of undefined (reading 'on')
+ *
+ *   这条信息**把排查方向指错了** —— 看起来像渲染进程某个组件的 bug，
+ *   实际是 preload 一行调用缺失。而类型检查也发现不了：
+ *   `env.d.ts` 里声明了 `window.api` 的形状，`tsc` 认为它一定存在。
+ *
+ *   所以这里在**唯一的 IPC 出口**做一次运行时检查，把「preload 没挂上」
+ *   这个事实明确说出来，并给出可操作的下一步。
+ */
+export function requireWindowApi(): NonNullable<typeof window.api> {
+  const api = window.api
+  if (api === undefined || api === null) {
+    throw new Error(
+      '[ipc] window.api 不存在 —— preload 脚本没有生效，渲染进程无法访问主进程。\n' +
+        '排查顺序：\n' +
+        '  1. out/preload/index.cjs 是否存在（缺 → 构建没产出 preload）\n' +
+        '  2. 它是否为 CJS（行首若有 import/export → sandbox preload 无法加载，\n' +
+        '     须由 electron.vite.config.ts 的 preload 段输出 .cjs）\n' +
+        '  3. src/preload/index.ts 末尾是否调用了 installPreload()（只导出不调用 = 什么都没挂）\n' +
+        '  4. 主进程窗口创建时的 preloadPath 是否指向上面那个文件',
+    )
+  }
+  return api
+}
+
+/**
  * 调用主进程。成功返回数据；失败按 onError 策略处理，默认展示提示并抛出。
  * 调用方若只想在失败时做额外清理，可 try/catch；不需要就完全不写。
  */
@@ -92,7 +125,7 @@ export async function call<C extends IpcChannel>(
     // 断言只影响这一个实参的静态类型：载荷与返回值仍由上面的泛型 C 全程校验。
     // `payload as never` 同理：`invoke<C>` 期望 `IpcReq<C>`，而 C 此时已是「契约键」这种
     // 更宽的键类型，TS 无法证明 `IpcReq<C>` 一定可赋给该通道的具体载荷类型（如 `void`）。
-    raw = (await window.api.invoke(
+    raw = (await requireWindowApi().invoke(
       channel as keyof SharedIpcContract,
       payload as never,
     )) as IpcResult<IpcRes<C>>
@@ -171,7 +204,7 @@ export function on<E extends keyof SharedIpcEventMap & string>(
   //   · handler：`on<E>` 的参数是 `IpcEventPayload<E>`，而 E 在此已是更宽的键类型，
   //     TS 无法证明二者兼容（函数参数逆变），故按 unknown 载荷转一次。
   // 对调用方没有损失：handler 的载荷类型仍由上面的 `SharedIpcEventMap[E]` 全程校验。
-  const subscribe = window.api.on as (
+  const subscribe = requireWindowApi().on as (
     event: keyof SharedIpcEventMap,
     handler: (payload: unknown) => void,
   ) => () => void
@@ -190,5 +223,5 @@ export function onTaskProgress(
 
 /** 单向发送（可丢弃的高频数据） */
 export function send<S extends IpcSendName>(channel: S, payload?: IpcSendPayload<S>): void {
-  window.api.send<S>(channel, payload as IpcSendPayload<S>)
+  requireWindowApi().send<S>(channel, payload as IpcSendPayload<S>)
 }

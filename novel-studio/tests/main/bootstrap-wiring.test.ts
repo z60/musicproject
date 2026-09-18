@@ -17,7 +17,8 @@
  */
 
 import { strict as assert } from 'node:assert'
-import { existsSync, readdirSync, readFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join, normalize, resolve } from 'node:path'
 import { describe, it } from 'node:test'
 
@@ -304,6 +305,40 @@ describe('electron-vite 入口约定（写错的话 npm run dev 起不来）', (
     assert.ok(src.includes('buildHandlerDeps'), '入口必须装配 HandlerDeps')
   })
 
+  it('preload 入口**调用了** installPreload（只导出不调用 = window.api 永远 undefined）', () => {
+    // 真实事故：src/preload/index.ts 只导出了 installPreload，没有任何地方调用它。
+    // preload 被正常加载、产物里也有这个函数，但 window.api 永远是 undefined。
+    // 而症状指向了完全错误的方向 —— 渲染进程只报
+    // `TypeError: Cannot read properties of undefined (reading 'on')`，
+    // 类型检查还过（env.d.ts 声明了 window.api 的形状）。
+    const src = readFileSync(join(ROOT, 'src/preload', 'index.ts'), 'utf8')
+    const code = src
+      .split(/\r?\n/)
+      .filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l))
+      .join('\n')
+
+    // 必须存在一次「带括号的调用」，而不是只有 `export function installPreload`
+    const callSites = code.match(/(?<!function\s)\binstallPreload\(\)/g) ?? []
+    assert.ok(
+      callSites.length >= 1,
+      'src/preload/index.ts 末尾必须调用 installPreload() —— ' +
+        '只导出不调用的话 preload 什么都不会挂上，window.api 恒为 undefined',
+    )
+  })
+
+  it('渲染侧 IPC 出口有 window.api 守卫（否则失败模式无法定位）', () => {
+    const ipcSrc = readFileSync(join(ROOT, 'src/renderer/src/shared/lib/ipc.ts'), 'utf8')
+    assert.ok(ipcSrc.includes('requireWindowApi'), 'ipc.ts 必须有 window.api 守卫')
+    // error-bus 里两处 invoke 也要走守卫：它们是**错误提示按钮**的处理函数，
+    // 在那里再抛一个裸 TypeError 是最糟的体验
+    const busSrc = readFileSync(join(ROOT, 'src/renderer/src/shared/lib/error-bus.ts'), 'utf8')
+    assert.equal(
+      /\bwindow\.api\.invoke\(/.test(busSrc),
+      false,
+      'error-bus.ts 不应直接写 window.api.invoke，要走 requireWindowApi()',
+    )
+  })
+
   it('入口在 whenReady 之后才碰 app.getPath', () => {
     const src = readFileSync(join(ROOT, 'src/main/index.ts'), 'utf8')
     const readyAt = src.indexOf('whenReady')
@@ -354,8 +389,7 @@ describe('electron-vite 入口约定（写错的话 npm run dev 起不来）', (
 // 构建产物：运行时需要的非 JS 资源
 // ---------------------------------------------------------------------------
 
-describe('迁移 SQL 必须进构建产物', () => {
-  /**
+describe('迁移 SQL 必须进构建产物', () => {  /**
    * 防的是一个**静默故障**：
    * 迁移 SQL 是运行时 `readFileSync` 读的，打包器不认识 `.sql`、不会带进 bundle。
    * 少了它，应用照样起窗口，但 `db.opened schemaVersion: 0` —— **一张表都没有**，
@@ -365,9 +399,111 @@ describe('迁移 SQL 必须进构建产物', () => {
     const src = readFileSync(join(ROOT, 'electron.vite.config.ts'), 'utf8')
     assert.ok(src.includes('writeBundle'), '必须挂 writeBundle（dev 与 build 都走 vite 插件）')
     assert.ok(
-      src.includes('main/infra/db/migrations'),
-      '插件必须把 src/main/infra/db/migrations 复制到 out/main/infra/db/migrations',
+      src.includes("'src/main/infra/db/migrations'"),
+      '插件必须从 src/main/infra/db/migrations 复制',
     )
+  })
+
+  /**
+   * 这条是**真机上踩过的坑**补齐的回归：`to` 曾写成 `'main/infra/db/migrations'`，
+   * 而 `main.build.outDir` **已经**是 `out/main` → 文件落到
+   * `out/main/main/infra/db/migrations/`，运行时按 `dirname(import.meta.url)`
+   * （= `out/main`）去找 → 永远找不到。
+   *
+   * 现象极具迷惑性：窗口正常、`createSettingsStore` 还自己建了 `settings` 表，
+   * 于是库里**只有一张 settings**，`books` / `projects` / `meta` 全都没有，
+   * 用户看到的是「点了没反应」+ 兜底错误码。
+   *
+   * ⚠️ **为什么原来的断言没拦住**：原来的写法是
+   * `assert.ok(src.includes('main/infra/db/migrations'))` ——
+   * 而这个子串恰好被**源路径** `src/main/infra/db/migrations` 满足了，
+   * 于是「to 写错」这个 bug 在测试里永远是绿的。
+   * 「断言的是一个字符串出现过」不等于「断言了正确的行为」。
+   *
+   * 现在改成：真的把 `to` 解析出来，按 `outDir` 拼出绝对路径，逐条比对。
+   */
+  it('复制目标必须正好等于 outDir（产物里 dirname(import.meta.url) 就是 outDir）', () => {
+    const configSrc = readFileSync(join(ROOT, 'electron.vite.config.ts'), 'utf8')
+
+    // 1. 取出 main.build.outDir
+    const outDirMatch = configSrc.match(/outDir:\s*'([^']+)'/)
+    assert.ok(outDirMatch, '解析不到 main.build.outDir')
+    const outDir = outDirMatch[1]!
+    assert.equal(outDir, 'out/main', 'main 的 outDir 约定是 out/main')
+
+    // 2. 取出 RUNTIME_ASSET_DIRS 里每一项的 from / to
+    const block = configSrc.match(/const RUNTIME_ASSET_DIRS\s*=\s*\[([\s\S]*?)\n\]/)
+    assert.ok(block, '解析不到 RUNTIME_ASSET_DIRS')
+    const entries = [...block[1]!.matchAll(/\{\s*from:\s*'([^']+)',\s*to:\s*'([^']+)'\s*\}/g)].map((m) => ({
+      from: m[1]!,
+      to: m[2]!,
+    }))
+    assert.ok(entries.length > 0, 'RUNTIME_ASSET_DIRS 不能为空，否则 SQL 不会被复制')
+
+    const migrationEntry = entries.find((e) => e.from.includes('migrations'))
+    assert.ok(migrationEntry, 'RUNTIME_ASSET_DIRS 里必须有迁移 SQL 的条目')
+
+    // 3. 唯一的不变量：复制目标**正好是 outDir**。
+    //
+    //    为什么不能是任何子目录 —— 别把源码树的形状当成 bundle 后的形状：
+    //      · 源码里 infra/db/migrations/index.ts 与 .sql 同目录
+    //      · 但 electron-vite 把整个主进程**内联成单个 bundle** out/main/index.js，
+    //        `infra/db/migrations/` 这一层在产物里**根本不存在**
+    //      · `migrationsDir = dirname(fileURLToPath(import.meta.url))` 被内联后，
+    //        import.meta.url 就是 out/main/index.js ⇒ migrationsDir = outDir
+    //
+    //    真机日志实证（第二次修复后仍失败）：ENOENT …\out\main\001_init.sql
+    //    —— 文件名 001_init.sql、目录 out/main，与上面的推导完全一致。
+    const resolved = resolve(ROOT, outDir, migrationEntry.to)
+    assert.equal(
+      normalize(resolved),
+      normalize(resolve(ROOT, outDir)),
+      `复制目标必须正好是 outDir（${outDir}）。\n` +
+        `  写 'infra/db/migrations' → ${outDir}/infra/db/migrations（路径看着像源码树，但产物里没有这一层）\n` +
+        `  写 'main/infra/db/migrations' → ${outDir}/main/...（多套一层）\n` +
+        `  两者运行时都按 <outDir>/001_init.sql 查找 ⇒ 必然 ENOENT。`,
+    )
+
+    // 4. 用**真实产物**做实证（不靠推测）：从 out/main/infra/db/migrations/index.ts
+    //    的产物 shim 里读回 `readMigrationSql`，再核对它引用的 chunk 里
+    //    `migrationsDir` 的定义 —— 它必须是 dirname(import.meta.url)。
+    //    这一步把「配置里写的路径」与「产物里实际算的路径」绑在一起。
+    //
+    //    若 out 目录不存在（全新检出），跳过：本测试的主判据是上面第 3 条，
+    //    而第 3 条不依赖产物。
+    const builtShim = join(ROOT, 'out', 'main', 'index-CXs-bvdC.js')
+    if (existsSync(builtShim)) {
+      const shimSrc = readFileSync(builtShim, 'utf8')
+      assert.ok(
+        shimSrc.includes('readMigrationSql'),
+        '产物 shim 里应导出 readMigrationSql',
+      )
+      // 找出它 re-export 的 chunk 名，再在该 chunk 里找 migrationsDir 的定义
+      const chunkNames = [...shimSrc.matchAll(/from "\.\/(index[^"]*\.js)"/g)].map((m) => m[1]!)
+      assert.ok(chunkNames.length > 0, 'shim 应 re-export 自某个 index chunk')
+      let found = false
+      for (const name of new Set(chunkNames)) {
+        const chunkPath = join(ROOT, 'out', 'main', name)
+        if (!existsSync(chunkPath)) continue
+        const chunkSrc = readFileSync(chunkPath, 'utf8')
+        if (!chunkSrc.includes('migrationsDir')) continue
+        found = true
+        assert.ok(
+          /const migrationsDir = dirname\(fileURLToPath\(import\.meta\.url\)\)/.test(chunkSrc),
+          '产物里 migrationsDir 必须由 dirname(fileURLToPath(import.meta.url)) 算出',
+        )
+      }
+      assert.ok(found, '应在某个产物 chunk 里找到 migrationsDir 的定义')
+    }
+
+    // 5. 反过来证伪两个真实踩过的错误写法：它们的目标路径都必须不等于正确的那个。
+    for (const wrong of ['infra/db/migrations', 'main/infra/db/migrations']) {
+      assert.notEqual(
+        normalize(resolve(ROOT, outDir, wrong)),
+        normalize(resolved),
+        `to 不能写 '${wrong}' —— 运行时只会按 <outDir> 查找（<outDir>/001_init.sql），必然 ENOENT`,
+      )
+    }
   })
 
   it('迁移 SQL 源文件存在（目录名与插件配置一致）', () => {
@@ -376,6 +512,97 @@ describe('迁移 SQL 必须进构建产物', () => {
     const sqls = readdirSync(dir).filter((n) => n.endsWith('.sql'))
     assert.ok(sqls.length >= 2, `期望至少 2 个迁移 SQL，实际 ${sqls.length}`)
     assert.ok(sqls.includes('001_init.sql'), '缺少 001_init.sql')
+  })
+
+  /**
+   * **端到端复制测试**：不只断言配置文本，而是真的按插件的方式复制一遍，
+   * 再用**与 `readMigrationSql` 完全相同的读回公式**把文件读出来。
+   *
+   * 为什么必须做到这一步：
+   *   上一条测试只证明「配置里的路径自洽」，但复制动作本身（cpSync、
+   *   目录创建、扩展名过滤）仍可能出错。只有真的复制 + 真的读回，
+   *   才算证明「运行期能拿到 SQL」——这是「应用有没有表」的唯一前置条件。
+   *
+   * 注意读回公式必须与产物一致：
+   *   `join(dirname(fileURLToPath(import.meta.url)), file)`
+   *   electron-vite 把整个主进程内联为 `<outDir>/index.js`，所以
+   *   `dirname(import.meta.url)` **就是 outDir 本身**（真机日志实证：
+   *   `ENOENT …\out\main\001_init.sql`）。
+   *   因此 SQL 必须被复制到 outDir，读回时也用 outDir 充当 dirname(import.meta.url)。
+   *   本测试用 `resolve(tmpOutDir, to)` 复现插件目标，`to = '.'` 时即 tmpOutDir 本身。
+   */
+  it('真的复制一遍，并用 readMigrationSql 的公式能读回（端到端）', async () => {
+    const configSrc = readFileSync(join(ROOT, 'electron.vite.config.ts'), 'utf8')
+    const block = configSrc.match(/const RUNTIME_ASSET_DIRS\s*=\s*\[([\s\S]*?)\n\]/)
+    assert.ok(block, '解析不到 RUNTIME_ASSET_DIRS')
+    const entries = [...block[1]!.matchAll(/\{\s*from:\s*'([^']+)',\s*to:\s*'([^']+)'\s*\}/g)].map((m) => ({
+      from: m[1]!,
+      to: m[2]!,
+    }))
+    const migrationEntry = entries.find((e) => e.from.includes('migrations'))
+    assert.ok(migrationEntry, 'RUNTIME_ASSET_DIRS 里必须有迁移 SQL 的条目')
+
+    const tmpOutDir = mkdtempSync(join(tmpdir(), 'ns-assets-'))
+    try {
+      // ── 复现插件的复制动作 ────────────────────────────────────────────────
+      const src = resolve(ROOT, migrationEntry.from)
+      const dest = resolve(tmpOutDir, migrationEntry.to)
+      mkdirSync(dest, { recursive: true })
+      let copied = 0
+      for (const name of readdirSync(src)) {
+        if (!name.endsWith('.sql')) continue
+        cpSync(resolve(src, name), resolve(dest, name))
+        copied++
+      }
+      assert.ok(copied >= 2, `应至少复制 2 个 SQL，实际 ${copied}`)
+
+      // ── 用 readMigrationSql 的公式读回 ───────────────────────────────────
+      // 这里的 `dest` 扮演 dirname(fileURLToPath(import.meta.url))
+      const { MIGRATION_ENTRIES } = await import('../../src/main/infra/db/migrations/index.ts')
+      assert.ok(MIGRATION_ENTRIES.length >= 2, '迁移清单至少 2 项')
+
+      for (const entry of MIGRATION_ENTRIES) {
+        const full = join(dest, entry.file)
+        assert.ok(existsSync(full), `按 dirname(import.meta.url) 公式找不到 SQL：${full}（复制目标 ${dest}）`)
+        const sql = readFileSync(full, 'utf8').replace(/\r\n/g, '\n')
+        assert.ok(sql.length > 1000, `${entry.file} 内容异常小`)
+
+        // hash 必须与清单登记一致 —— 与 loadMigrations() 的校验同源
+        const { computeMigrationHash } = await import('../../src/main/infra/db/migrate.ts')
+        assert.equal(
+          computeMigrationHash(sql),
+          entry.hash,
+          `${entry.file} 的 hash 与清单不符 —— 复制过程损坏了内容或文件不是同一份`,
+        )
+      }
+
+      // ── 反证：两种错误路径都必须读不到 ────────────────────────────────────
+      // 两个都是真机上实际踩过的写法（写死字面量，不要用 to 去拼 —— 那是正确路径）。
+      for (const label of [
+        join('main', 'infra', 'db', 'migrations'), // ① 多一层 main
+        join('infra', 'db', 'migrations'), // ② 照抄源码树形状
+      ]) {
+        const wrongDest = resolve(tmpOutDir, label)
+        assert.notEqual(
+          normalize(wrongDest),
+          normalize(tmpOutDir),
+          `错误路径 ${label} 不能等于 outDir`,
+        )
+        assert.equal(
+          existsSync(join(wrongDest, '001_init.sql')),
+          false,
+          `错误路径 ${wrongDest} 竟然存在 SQL —— 复制目标可能写错了`,
+        )
+      }
+
+      // 正证：正确路径（outDir 本身）必须读得到 —— 这才是运行时的查找位置
+      assert.ok(
+        existsSync(join(tmpOutDir, '001_init.sql')),
+        `outDir 下必须有 001_init.sql（运行时会按 <outDir>/001_init.sql 查找）`,
+      )
+    } finally {
+      rmSync(tmpOutDir, { recursive: true, force: true })
+    }
   })
 
   it('迁移 SQL 已按 LF 归一化（hash 是按 LF 算的，CRLF 会让校验失败）', () => {

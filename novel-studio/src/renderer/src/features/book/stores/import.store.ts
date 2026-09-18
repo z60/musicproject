@@ -28,6 +28,7 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { call, callSafe } from '@/shared/lib/ipc.ts'
+import { AppError } from '@shared/errors.ts'
 import { BUILTIN_RULE_SETS, ENCODING_CANDIDATES, IMPORT_LIMITS, VAD_DEFAULTS } from '@shared/constants.ts'
 import type {
   BookSourceType,
@@ -530,6 +531,10 @@ export const useImportStore = defineStore('book/import', () => {
   const canCommit = computed(() => {
     if (committing.value) return false
     if (!bookMeta.value.title.trim()) return false
+    // 缺少项目上下文时**必须**判为不能提交，与上面的 blockReason（第 6 步）保持一致。
+    // 原来漏了这一条，于是按钮可点、`buildCommitPayload()` 却返回 null，
+    // 最终只报一句与事实不符的「后台任务执行失败」（真机事故 docs/91 §5.2.4）。
+    if (!projectId.value) return false
     if (!canPreview.value) return true
     return includedCount.value > 0 || fallbackStrategy.value !== 'none'
   })
@@ -1309,7 +1314,20 @@ export const useImportStore = defineStore('book/import', () => {
    */
   async function commitImport(): Promise<CommitImportResult | null> {
     const payload = buildCommitPayload()
-    if (!payload) return null
+    if (!payload) {
+      // **绝不静默返回 null**：调用方（useImportFlow.submit）在没有 lastError 时只能报
+      // 一句笼统且与事实不符的「后台任务执行失败」，把真实原因（缺项目上下文 / 缺书名）
+      // 彻底埋掉 —— 这正是真机事故里用户看到的东西（docs/91 §5.2.4）。
+      // 这里把原因写进 commitError（界面内联展示）与 lastError（error-bus 弹窗）。
+      // 目前 `buildCommitPayload()` 唯一返回 null 的原因就是缺 projectId；
+      // 若将来新增别的空缺条件，请在这里补上对应的原因文案（不要退回笼统提示）。
+      const reason = '缺少项目上下文：请先在书架打开一本书，或重启应用以重建默认项目'
+      commitError.value = { key: 'INVALID_PAYLOAD', message: reason }
+      lastError.value = AppError.of('INVALID_PAYLOAD', {
+        details: { reason: 'commit-payload-incomplete', why: reason },
+      })
+      return null
+    }
     committing.value = true
     commitError.value = null
     try {

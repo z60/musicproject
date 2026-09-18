@@ -120,6 +120,8 @@ describe('编号稳定性（防止历史编号漂移）', () => {
     PROVIDER_NETWORK_ERROR: 'E60014',
     DB_BUSY: 'E70000',
     AUDIO_FILE_MISSING: 'E70008',
+    DB_NOT_OPEN: 'E70010',
+    DB_SCHEMA_INCOMPLETE: 'E70011',
     TASK_FAILED: 'E80000',
     TASK_NOT_FOUND: 'E80003',
     APP_SINGLE_INSTANCE: 'E90000',
@@ -411,6 +413,94 @@ describe('wrapUnknown 包裹规则', () => {
     assert.equal(e.key, 'INTERNAL')
     assert.ok(e.causeChain.length > 0)
     assert.match(e.causeChain[0], /something exploded/)
+  })
+
+  /**
+   * 真机报错原样复刻：`[SQLITE_ERROR] SqliteError: no such table: books`
+   *
+   * 为什么必须专门测：
+   *   它的 `code` 是 **`SQLITE_ERROR`** —— SQLite 的**通用**错误码，
+   *   而 `SYSTEM_ERRNO_MAP` 里能映射的是 `SQLITE_BUSY` / `SQLITE_CORRUPT` /
+   *   `SQLITE_READONLY` 这类**专属**码。于是它会一路落到兜底分支 → `INTERNAL`
+   *   → UI 上只显示错误编号「-」和一句「某处缺少精确抛错」，
+   *   用户完全看不出「表没建」这件事。
+   */
+  describe('SQLite 表不存在必须被精确识别（不能落兜底码）', () => {
+    /** 复刻 better-sqlite3 抛出的错误形态：name='SqliteError', code='SQLITE_ERROR' */
+    function sqliteNoSuchTable(msg: string) {
+      return Object.assign(new Error(msg), { name: 'SqliteError', code: 'SQLITE_ERROR' })
+    }
+
+    it('no such table 映射为 DB_SCHEMA_INCOMPLETE，而不是 INTERNAL 兜底码', () => {
+      const e = wrapUnknown(sqliteNoSuchTable('no such table: books'))
+      assert.equal(e.key, 'DB_SCHEMA_INCOMPLETE', '表不存在必须有自己的精确错误码')
+      assert.notEqual(e.key, 'INTERNAL', '绝不能落兜底码 —— 那会让 UI 只显示「-」')
+    })
+
+    it('缺失的表名进 params，渲染后用户文案里能看到是哪张表', () => {
+      const e = wrapUnknown(sqliteNoSuchTable('no such table: books'))
+      assert.equal(e.params['table'], 'books')
+
+      /**
+       * ⚠️ `AppError.message` 就是消息表的 **title**（'数据表不完整'），
+       * 它**不含**插值后的 detail —— 这是刻意设计：message 给日志当标题用，
+       * 用户可见的正文由渲染侧的 `resolve()` / `getMessage(key, params)` 生成。
+       * 所以这里必须走真正的渲染路径，而不是断言 `e.message`。
+       */
+      assert.equal(e.message, '数据表不完整', 'message 是标题，不是正文')
+
+      const r = getMessage(e.key, e.params)
+      // detail 在类型上是可选的（并非每条消息都有正文），这条必须有
+      const detail = r.detail ?? ''
+      assert.ok(detail.length > 0, 'DB_SCHEMA_INCOMPLETE 必须有用户可见正文')
+      assert.match(detail, /books/, '用户可见正文必须真的插上了表名')
+      assert.equal(detail.includes('{'), false, '不能漏出未插值的占位符')
+      assert.equal(detail.includes('}'), false, '不能漏出未插值的占位符')
+    })
+
+    it('details 里保留机器可判的字段（便于日志与诊断包定位）', () => {
+      const e = wrapUnknown(sqliteNoSuchTable('no such table: projects'))
+      assert.equal(e.details?.['reason'], 'sqlite-schema-missing')
+      assert.equal(e.details?.['missingName'], 'projects')
+      assert.equal(e.details?.['sqliteCode'], 'SQLITE_ERROR')
+      assert.ok(typeof e.details?.['hint'] === 'string', '必须给出排查方向')
+    })
+
+    it('view / index / column / trigger 同样识别（措辞不止一种）', () => {
+      const cases: Array<[string, string, string]> = [
+        ['no such table: canvas_lines', 'table', 'canvas_lines'],
+        ['no such view: v_chapter_stats', 'view', 'v_chapter_stats'],
+        ['no such index: idx_books', 'index', 'idx_books'],
+        ['no such column: book_id', 'column', 'book_id'],
+        ['no such trigger: trg_x', 'trigger', 'trg_x'],
+      ]
+      for (const [msg, kind, name] of cases) {
+        const e = wrapUnknown(sqliteNoSuchTable(msg))
+        assert.equal(e.key, 'DB_SCHEMA_INCOMPLETE', `「${msg}」应被识别`)
+        assert.equal(e.details?.['missingKind'], kind)
+        assert.equal(e.details?.['missingName'], name)
+      }
+    })
+
+    it('SQLITE_ERROR 但**不是**「表不存在」时仍走兜底（不能乱认）', () => {
+      // SQLITE_ERROR 是通用码，涵盖语法错、约束错等一大堆情况。
+      // 只有消息明确是 no such X 才能判为 schema 缺失，否则会误报。
+      const e = wrapUnknown(sqliteNoSuchTable('near "SELCT": syntax error'))
+      assert.equal(e.key, 'INTERNAL', '无法断定的 SQLITE_ERROR 应老实落兜底，而不是伪装成表缺失')
+    })
+
+    it('专属码优先于通用判别（SQLITE_CORRUPT 仍映射 DB_CORRUPT）', () => {
+      const e = wrapUnknown(Object.assign(new Error('database disk image is malformed'), {
+        name: 'SqliteError',
+        code: 'SQLITE_CORRUPT',
+      }))
+      assert.equal(e.key, 'DB_CORRUPT')
+    })
+
+    it('DB_SCHEMA_INCOMPLETE 的编号已发布且稳定', () => {
+      // 追加在 7 段末尾，不能在中间插入（否则已发布编号漂移）
+      assert.equal(resolveCode('DB_SCHEMA_INCOMPLETE'), 'E70011')
+    })
   })
 
   it('抛出非 Error（字符串/对象）也不崩', () => {

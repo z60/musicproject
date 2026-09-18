@@ -31,6 +31,9 @@ import { TaskQueue } from './infra/queue/queue.ts'
 import type { IpcEventName, IpcEventPayload, IpcSendName, IpcSendPayload } from '../shared/ipc.ts'
 import type { Logger } from './infra/log/index.ts'
 import { createDbPort } from './db.ts'
+import { createBookService, type BookService } from './features/book/import/book.service.ts'
+import { createBookHandlers } from './ipc/handlers/book.ts'
+import type { RegisteredHandler } from './ipc/handlers/deps.ts'
 import type { AppState } from './app-state.ts'
 
 export interface BuildHandlerDepsOptions {
@@ -58,10 +61,14 @@ export interface BuildHandlerDepsOptions {
   quit: (force: boolean) => void
 }
 
-/** 端口装配的结果：既返回 HandlerDeps，也返回队列句柄（关闭时要 dispose） */
+/** 端口装配的结果：既返回 HandlerDeps，也返回队列与域 handler（关闭/注册时要用） */
 export interface BuiltPorts {
   deps: HandlerDeps
   queue: TaskQueue
+  /** 领域 handler（书籍导入域等）。由 `registerAllHandlers` 的第三参注入。 */
+  domainHandlers: RegisteredHandler[]
+  /** 书籍导入域服务（供启动期的「确保默认项目」使用） */
+  book: BookService
 }
 
 /**
@@ -96,6 +103,28 @@ export function buildHandlerDeps(opts: BuildHandlerDepsOptions): BuiltPorts {
     modelDir: paths.modelDir,
     resourceDir: paths.resourceDir,
   }
+
+  // ── 书籍导入域服务 ───────────────────────────────────────────────────────
+  // 队列要拿到本域的 TaskSpec，因此**先建队列、再建服务**，最后把 specs 注册进去。
+  // 反过来（先建服务）会拿不到 queue 引用，异步导入通道就永远是 NOT_IMPLEMENTED。
+  const bookService = createBookService({
+    getDb: () => state.db,
+    projectRoot: paths.projectRoot,
+    log,
+    queue,
+    // 注意 `import?.maxFileSizeBytes` 里的 `?.`：**分组本身也可能不可靠**。
+    // 真机事故（docs/91 §5.2.3）：库里一行 `import = null` 让整支变成 null，
+    // 而这里原来只写了 `state.settings?.current().import.maxFileSizeBytes` ——
+    // `?.` 只护住了 state.settings，`.import` 为 null 时直接
+    // `TypeError: Cannot read properties of null (reading 'maxFileSizeBytes')`，
+    // 启动在第 11 步中止，应用再也起不来。启动路径上的读取必须取值级兜底。
+    ...(state.settings?.current().import?.maxFileSizeBytes !== undefined
+      ? { importLimits: { maxFileSizeBytes: state.settings.current().import.maxFileSizeBytes } }
+      : {}),
+  })
+  for (const spec of bookService.taskSpecs()) queue.registerSpec(spec)
+
+  const domainHandlers: RegisteredHandler[] = [...createBookHandlers(bookService)]
 
   const dbPort = createDbPort({
     getDb: () => state.db,
@@ -274,7 +303,7 @@ export function buildHandlerDeps(opts: BuildHandlerDepsOptions): BuiltPorts {
     },
   }
 
-  return { deps, queue }
+  return { deps, queue, domainHandlers, book: bookService }
 }
 
 /** 当前能力快照；未探测时给出「全都不可用」的诚实默认值，而不是假装可用 */

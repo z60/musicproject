@@ -99,9 +99,14 @@ async function resolve(): Promise<void> {
 }
 
 // ── 表单事件：类型只写在脚本里（模板表达式按 JS 解析，不能写 TS 语法）──────
-/** 应用范围：el-radio-group 的 change 载荷即选项值（SCOPE_OPTIONS 的值，类型 ProcessScope） */
-function onScopeChange(value: ProcessScope): void {
-  scope.value = value
+/**
+ * 应用范围：el-radio-group 的 change 载荷即选项值（SCOPE_OPTIONS 的值，类型 ProcessScope）。
+ *
+ * 参数收宽 + 体内收窄：Element Plus 2.14 起事件参数类型是
+ * `string | number | boolean | undefined`，精确类型会因逆变而不可赋值。
+ */
+function onScopeChange(value: string | number | boolean | undefined): void {
+  scope.value = value as ProcessScope
 }
 
 /** 角色下拉：el-select 的载荷即选项值（mix.characters 的 value，类型 Id），清空时为 null */

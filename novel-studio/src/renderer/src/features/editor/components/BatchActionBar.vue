@@ -75,6 +75,16 @@ const scopeDetails = computed(() => {
 
 // ── 表单态 ───────────────────────────────────────────────────────────────────
 const speakerId = ref<Id | null>(null)
+
+/**
+ * 「旁白（无角色）」这个选项的绑定值。
+ *
+ * **运行时它就是 `null`** —— 本组件的逻辑用 `speakerId.value === null` 判断「旁白」
+ * （见 askAssignSpeaker），语义不能改成 `''`。这里只是把类型收敛到 `el-option` 的
+ * `value` prop 允许的范围内（它不接受 `null`）。断言放在脚本里而不是模板里：
+ * 模板表达式按 JS 解析，写不了 TS 断言（见 package.json 的 template-types 说明）。
+ */
+const NARRATION_SPEAKER = null as unknown as Id
 const emotion = ref<string | null>(null)
 const speed = ref<SpeedMark | null>(null)
 const pauseMs = ref<number>(CANVAS_DEFAULTS.defaultPauseAfterMs)
@@ -353,7 +363,7 @@ const undoHint = computed(() => (canvas.canUndo ? `Ctrl+Z 撤销「${canvas.undo
       <div class="ns-batch__group">
         <span class="ns-batch__label">说话人</span>
         <el-select v-model="speakerId" size="small" clearable filterable placeholder="选择角色" class="ns-batch__select">
-          <el-option :value="null" label="旁白（无角色）" />
+          <el-option :value="NARRATION_SPEAKER" label="旁白（无角色）" />
           <el-option v-for="character in characterOptions" :key="character.id" :value="character.id" :label="character.name" />
         </el-select>
         <el-button size="small" :disabled="props.readonly" @click="askAssignSpeaker">指派</el-button>

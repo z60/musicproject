@@ -154,6 +154,13 @@ function isSelected(chapterId: string): boolean {
   return store.selectedChapterIds.includes(chapterId)
 }
 
+/**
+ * el-table 的作用域插槽把 `row` 定型为 Element Plus 的 `DefaultRow`（宽松记录类型），
+ * 模板里无法直接交给需要 `ExportChapterRow` 的函数。收敛写在脚本里 ——
+ * 模板表达式按 JS 解析，写不了 TS 断言（见 package.json 的 template-types 说明）。
+ */
+const asChapterRow = (row: unknown): ExportChapterRow => row as ExportChapterRow
+
 function estimateOf(row: ExportChapterRow): string {
   return formatDuration(store.estimateOf(row))
 }
@@ -541,11 +548,11 @@ function onRestart(): void {
             </el-table-column>
             <el-table-column label="缺录" width="90">
               <template #default="{ row }">
-                <span :class="{ 'ns-wiz__bad': missingLinesOf(row) > 0 }">{{ formatInt(missingLinesOf(row)) }}</span>
+                <span :class="{ 'ns-wiz__bad': missingLinesOf(asChapterRow(row)) > 0 }">{{ formatInt(missingLinesOf(asChapterRow(row))) }}</span>
               </template>
             </el-table-column>
             <el-table-column label="预计时长" width="110">
-              <template #default="{ row }">{{ estimateOf(row) }}</template>
+              <template #default="{ row }">{{ estimateOf(asChapterRow(row)) }}</template>
             </el-table-column>
           </el-table>
 
@@ -807,9 +814,12 @@ function onRestart(): void {
               size="small"
               @action="goMixer"
             />
+            <!-- 不用 v-model：`store.mixProjectId` 是 `Id | null`，而 el-radio-group 的
+                 model-value 只接受 `string | number | boolean | undefined`（不接受 null）。
+                 `?? undefined` 语义相同（都表示「没有选中」），类型即可通过。 -->
             <el-radio-group
               v-else
-              :model-value="store.mixProjectId"
+              :model-value="store.mixProjectId ?? undefined"
               class="ns-wiz__plans"
               @update:model-value="onSelectMixProject"
             >

@@ -207,6 +207,9 @@ async function main(): Promise<void> {
       // 契约里每个通道都必须有 handler：未实现的由占位 handler 兜住（抛 NOT_IMPLEMENTED）
       placeholderForMissing: true,
       assertParity: true,
+      // 领域 handler（书籍导入域等）：持有服务实例，因此由装配层注入而不是静态汇总。
+      // 不传的话这些通道会退化成 NOT_IMPLEMENTED 占位 —— 看起来「有 handler」但功能不可用。
+      domainHandlers: built.domainHandlers,
     })
 
     state.log().info('ipc.registered', {
@@ -224,6 +227,23 @@ async function main(): Promise<void> {
         first: result.placeholderChannels.slice(0, 10),
       })
     }
+
+    // ── 确保默认项目存在 ─────────────────────────────────────────────────
+    // 为什么必须在这里做：契约里**没有** project:create 通道，而 `books.project_id`
+    // 是 NOT NULL 外键 —— 没有项目就一本书都建不了。用户第一次打开导入页时
+    // 不应该需要先「创建项目」（那是实现细节，不是产品概念）。
+    //
+    // 失败不致命：只影响「导入/列书」，其它功能照常。
+    try {
+      const projectId = await built.book.ensureProject()
+      state.log().info('book.project.ready', { event: 'book.project.ready', projectId })
+    } catch (e) {
+      state.log().warn('book.project.ensureFailed', {
+        event: 'book.project.ensureFailed',
+        reason: e instanceof Error ? e.message : String(e),
+      })
+    }
+
     return { implemented: result.implemented, placeholders: result.placeholders }
   }
 

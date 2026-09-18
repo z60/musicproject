@@ -122,9 +122,14 @@ function patchActiveLine(patch: CanvasLinePatch, label: string): void {
 
 function gotoRecording(): void { void router.push('/recording') }
 
-/** 中栏视图切换：el-radio-group 的选项值即 CanvasViewMode */
-function onActiveViewInput(value: CanvasViewMode): void {
-  canvas.setActiveView(value)
+/**
+ * 中栏视图切换：el-radio-group 的选项值即 CanvasViewMode。
+ *
+ * 参数收宽是必须的：Element Plus 2.14 起事件参数类型为
+ * `string | number | boolean | undefined`，精确类型因函数参数逆变而不可赋值。
+ */
+function onActiveViewInput(value: string | number | boolean | undefined): void {
+  canvas.setActiveView(value as CanvasViewMode)
 }
 
 /** 说话人筛选：el-select 的选项值为 string（SPEAKER_* 常量或角色 id） */
@@ -180,9 +185,9 @@ type RightPanel = 'source' | 'characters' | 'quality' | 'none'
 const rightPanel = ref<RightPanel>('source')
 function toggleRightPanel(): void { rightPanel.value = rightPanel.value === 'none' ? 'source' : 'none' }
 
-/** 右栏视图切换：el-radio-group 的选项值即这三项之一 */
-function onRightPanelInput(value: 'source' | 'characters' | 'quality'): void {
-  rightPanel.value = value
+/** 右栏视图切换：el-radio-group 的选项值即这三项之一（参数收宽，理由同上） */
+function onRightPanelInput(value: string | number | boolean | undefined): void {
+  rightPanel.value = value as 'source' | 'characters' | 'quality'
 }
 
 // ── 顶栏：强制保存 / 导出文本 / 任务包 ──────────────────────────────────────

@@ -28,6 +28,7 @@ import { call, callSafe, on } from '@/shared/lib/ipc.ts'
 import { reportByKey, reportError } from '@/shared/lib/error-bus.ts'
 import { formatBytes } from '@/shared/lib/format.ts'
 import { debounce } from '@/shared/lib/editable-debounce.ts'
+import { decideProjectContext } from '@/shared/lib/project-context.ts'
 import { useSessionStore } from '@/app/store/session.store.ts'
 import { useSettingsStore } from '@/app/store/settings.store.ts'
 import { useTasksStore } from '@/app/store/tasks.store.ts'
@@ -151,32 +152,33 @@ export function useImportFlow(): ImportFlow {
 
   /**
    * 项目上下文（docs/10 §7 的 Step6 前置）。
-   * 契约里没有「当前项目」通道，`projectId` 只能来自当前书籍；若用户还没选书，
-   * 退一步用 `book:list`（不传 projectId = 全部项目）推断出一个可用项目；
-   * 一本都没有时**不猜**，而是把项目根目录显示给用户并说明原因。
+   *
+   * 契约里没有「当前项目」通道，`projectId` 只能来自当前书籍或书架里的书；
+   * **书架为空时不再判定为「没有项目上下文」**，而是落到主进程启动期就已经
+   * `ensureDefault` 建好的默认项目上。判定规则抽在 `shared/lib/project-context.ts`
+   * （纯函数，有单测）—— 因为这里正是死锁发生的地方：
+   *
+   *     导入需要项目 → 项目需要书 → 书需要导入
+   *
+   * 原先书架为空时提示用户「请先到书架导入或打开一本书」，而书架本来就是空的 ——
+   * 全新安装永远导入不了第一本书。真机事故见 docs/91 §5.2.4。
    */
-  async function resolveProjectContext(): Promise<string | null> {
+  async function resolveProjectContext(): Promise<string> {
     if (session.projectId) {
       store.setProjectContext(session.projectId, '')
       return session.projectId
     }
     const books = await callSafe('book:list', {})
     const list = Array.isArray(books) ? (books as Book[]) : []
-    const first = list.find(b => !!b.projectId)
-    if (first) {
-      const hint = `当前未选中书籍，已使用书架中「${first.title}」所属的项目`
-      store.setProjectContext(first.projectId, hint)
-      return first.projectId
-    }
+    const decision = decideProjectContext({
+      sessionProjectId: null,
+      books: list.map(b => ({ title: b.title, projectId: b.projectId ?? null })),
+    })
+    // Step 6 顶部会展示「项目根目录」（生效值，含默认值），所以这里仍要保证路径已加载。
+    // 注意：这个路径**只用于展示**，不再是「能否导入」的判据。
     if (!session.paths) await session.loadPaths()
-    const root = projectRootHint.value
-    store.setProjectContext(
-      null,
-      root
-        ? `还没有可用的项目上下文：项目根目录是「${root}」，请先到书架导入或打开一本书，导入会写进它所属的项目。`
-        : '还没有可用的项目上下文：请先在「设置 → 路径」里确认项目根目录，再到书架打开一本书。',
-    )
-    return null
+    store.setProjectContext(decision.projectId, decision.hint)
+    return decision.projectId
   }
 
   // ---------------------------------------------------------------------------
@@ -325,9 +327,11 @@ export function useImportFlow(): ImportFlow {
    * （`book:commitImport` 才是携带 drafts 的通道，界面会就此给出警告）。
    */
   async function submitViaTask(duplicatePolicy: 'error' | 'copy'): Promise<SubmitResult> {
+    // 缺上下文时**先尝试解析**（现在解析一定会给出项目），只有真的拿不到才拦。
+    // 原来这里是「报错 + return blocked」，等于把用户送进死路。
+    if (!store.projectId) await resolveProjectContext()
     if (!store.projectId) {
       store.setCommitError('NO_PROJECT', '缺少项目上下文')
-      await resolveProjectContext()
       return 'blocked'
     }
     const options = store.buildTaskOptions(duplicatePolicy)

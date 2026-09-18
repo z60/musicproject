@@ -33,6 +33,42 @@ import type { DbLike } from './infra/db/types.ts'
 /** 设置表名（docs/21 §9） */
 const TABLE = 'settings'
 
+/**
+ * 引导期**兜底**建表语句。
+ *
+ * ⚠️ 这张表的所有权属于迁移 `001_init.sql`；这里的 DDL 只是「数据库还没迁移好也要能起
+ * 内存设置」的兜底。关键在于它执行的**时机**：本文件由启动第 4 步（open-database）调用，
+ * **早于**第 5 步的迁移。因此它的列集合必须与 `001_init.sql` 里的 `settings` **完全一致**：
+ * 只要比迁移少一列，迁移里的 `CREATE TABLE IF NOT EXISTS settings` 就会变成空操作
+ * （表已存在），紧接着引用该列的 `CREATE INDEX ... ON settings(is_secret)` 就会报
+ * `no such column: is_secret` → **整个迁移事务回滚** → 一张业务表都建不出来，
+ * 用户看到的是「缺少 books 表」（E70011）。真机事故见 docs/91 §5.2.2。
+ *
+ * 反过来说：**不要**在这里建任何迁移里没有的表/列，也不要让这张表的形状比迁移"窄"。
+ */
+export const SETTINGS_BOOTSTRAP_DDL = `CREATE TABLE IF NOT EXISTS ${TABLE} (
+  key        TEXT PRIMARY KEY,
+  value      TEXT NOT NULL,
+  is_secret  INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL DEFAULT 0
+);`
+
+/**
+ * 迁移依赖、但历史版本的兜底 DDL 可能没建的列。
+ *
+ * 为什么必须有这个修复：早期版本的兜底 DDL 只建了 `(key, value, updated_at)`，
+ * 并且在真机上**已经把 `settings` 落成了那个形状**。`CREATE TABLE IF NOT EXISTS`
+ * 无法把已存在的表改回宽形状，于是 `001_init.sql` 会在同一行上**永久失败**
+ * （`meta` 建不出来 ⇒ schema_version 恒为 0 ⇒ 每次启动都重试、每次都失败，
+ * 重启与重装都无效）。SQLite 没有 `ADD COLUMN IF NOT EXISTS`，所以逐列判断后补。
+ */
+export const SETTINGS_REQUIRED_COLUMNS: readonly { name: string; add: string }[] = [
+  {
+    name: 'is_secret',
+    add: `ALTER TABLE ${TABLE} ADD COLUMN is_secret INTEGER NOT NULL DEFAULT 0`,
+  },
+]
+
 export interface SettingsStoreOptions {
   /** 数据库句柄；为 null 时退化成「纯内存设置」（数据库打不开的降级模式） */
   db: DbLike | null
@@ -170,6 +206,11 @@ function clone<T>(v: T): T {
   return structuredClone(v)
 }
 
+/** 是否是「普通对象」——设置树里的**分组**；数组与 null 都不算（数组是叶子值） */
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return v !== null && typeof v === 'object' && !Array.isArray(v)
+}
+
 export interface SettingsStore {
   /** 读取全部（深拷贝，调用方改不脏内部状态） */
   getAll(): AppSettings
@@ -188,6 +229,44 @@ export interface SettingsStore {
 }
 
 /**
+ * 确保 `settings` 表存在**且列齐全**（幂等）。三步：
+ *
+ *   1. `CREATE TABLE IF NOT EXISTS` —— 全新库走这条，直接建成与迁移一致的宽表
+ *   2. 读 `PRAGMA table_info` 对照 {@link SETTINGS_REQUIRED_COLUMNS}
+ *   3. 缺列则 `ALTER TABLE ... ADD COLUMN` —— 修「历史版本的窄表」
+ *
+ * 全程吞错是刻意的，且与调用方语义一致：只读库/表被锁时设置应退化成内存值，
+ * 而不是把整个启动过程炸掉。真正的结构问题不由这里负责报错 —— 它会在第 5 步迁移里
+ * 以精确形式暴露（`no such column: is_secret` → `DB_SCHEMA_INCOMPLETE`，见 shared/errors.ts）。
+ */
+function ensureSettingsSchema(db: DbLike): void {
+  try {
+    db.exec(SETTINGS_BOOTSTRAP_DDL)
+  } catch {
+    /* 表已存在或库只读：忽略，下面的读写会各自兜错 */
+  }
+
+  let existing: string[]
+  try {
+    const rows = db.prepare(`PRAGMA table_info(${TABLE})`).all() as Array<Record<string, unknown>>
+    existing = rows.map((r) => String(r['name'] ?? ''))
+  } catch {
+    return
+  }
+  // 表不存在（建表那一步也失败了，例如只读库）→ 没什么可补的
+  if (existing.length === 0) return
+
+  for (const col of SETTINGS_REQUIRED_COLUMNS) {
+    if (existing.includes(col.name)) continue
+    try {
+      db.exec(col.add)
+    } catch {
+      /* 补不上（只读库/被占用）：留给迁移层报精确错误，不在这里吞掉真实原因 */
+    }
+  }
+}
+
+/**
  * 创建设置存储。
  *
  * @param opts.db 为 null 时退化为纯内存（数据库打不开 → 应用仍能进只读/降级模式）
@@ -196,21 +275,10 @@ export function createSettingsStore(opts: SettingsStoreOptions): SettingsStore {
   const defaults = buildDefaultSettings({ paths: opts.pathDefaults, ...(opts.logLevel ? { logLevel: opts.logLevel } : {}) })
   const db = opts.db
 
-  // 1) 建表（幂等）。settings 表的 DDL 由 001_init.sql 建好，这里只兜底 ——
-  //    数据库初始化失败时仍能起内存设置，不让整个应用起不来。
-  if (db) {
-    try {
-      db.exec(
-        `CREATE TABLE IF NOT EXISTS ${TABLE} (
-           key TEXT PRIMARY KEY,
-           value TEXT NOT NULL,
-           updated_at INTEGER NOT NULL DEFAULT 0
-         );`,
-      )
-    } catch {
-      /* 表已存在或库只读：忽略，下面的读写会各自兜错 */
-    }
-  }
+  // 1) 建表 + 补列（幂等）。settings 表的**所有权属于** 001_init.sql，这里只做兜底 ——
+  //    数据库还没迁移好时也要能起内存设置，不让整个应用起不来。补列那一步是为了修
+  //    「历史版本的窄 settings 表」，否则迁移会永久失败（详见上方常量注释）。
+  if (db) ensureSettingsSchema(db)
 
   const state: { value: AppSettings } = { value: clone(defaults) }
 
@@ -223,6 +291,16 @@ export function createSettingsStore(opts: SettingsStoreOptions): SettingsStore {
         try {
           const parsed: unknown = JSON.parse(row.value)
           // 只覆盖默认树里**已存在**的叶子：老版本残留的 key 不会污染当前结构
+          // （`setByPath` 对不存在的路径返回 false，天然实现了这一点）
+          //
+          // 但**分支级键必须挡住非对象值**：真机库里曾出现 `import = null` 这样的行
+          // （成因见 applyPatch 的注释），若照单全收就会把整支设成 null，
+          // 启动时 `ports.ts` 读 `import.maxFileSizeBytes` 抛 TypeError —— 而且因为坏值
+          // 就在库里，**每次启动都抛**，应用再也起不来。
+          // 这里的取舍很明确：宁可忽略一个坏设置（用默认值），也不能让应用起不来。
+          if (isPlainObject(getByPath(defaults, row.key)) && !isPlainObject(parsed)) {
+            continue
+          }
           setByPath(state.value, row.key, parsed)
         } catch {
           /* 单条坏了不影响其余设置：跳过 */
@@ -266,6 +344,21 @@ export function createSettingsStore(opts: SettingsStoreOptions): SettingsStore {
   function applyPatch(patch: Record<string, unknown>): string[] {
     const changed: string[] = []
     for (const [key, value] of Object.entries(patch)) {
+      // ── 分支级键**绝不能被 `undefined` / `null` 赋值** ────────────────────
+      //
+      // 为什么必须在这里挡（真机事故，docs/91 §5.2.3）：
+      // IPC 校验层（infra/validate/schema.ts 的 `ObjectSchema._parse`）会把 shape 里
+      // **每一个**键都物化进结果 —— 输入里没出现的分支就变成 `undefined`。于是用户在
+      // UI 上只改一个分组（例如「路径」）时，到达这里的补丁其实是
+      // 「12 个分组全在、其中 11 个是 undefined」。
+      // 若照单全收：整支被赋成 undefined → `persist` 里 `JSON.stringify(v ?? null)`
+      // 写成 `null` → 下次启动 `loadFromDb` 用这个 null 覆盖整棵树 →
+      // `ports.ts` 读 `import.maxFileSizeBytes` 抛 TypeError → **启动永久失败**
+      // （坏值在库里，重启重装都无效）。
+      //
+      // 语义上「整支 = null」也不是任何 UI 操作能表达的意思：分组只能是对象。
+      if ((value === undefined || value === null) && isPlainObject(getByPath(defaults, key))) continue
+
       // 支持两种写法：`{ 'audio.sampleRate': 48000 }` 与 `{ audio: { sampleRate: 48000 } }`
       if (value !== null && typeof value === 'object' && !Array.isArray(value) && key.includes('.') === false) {
         for (const leaf of collectLeafKeys(value, key)) {
@@ -328,7 +421,13 @@ export function createSettingsStore(opts: SettingsStoreOptions): SettingsStore {
     },
 
     reset(keys?: string[]): void {
-      const targets = keys && keys.length > 0 ? keys : collectLeafKeys(defaults)
+      // 先把可能的**分支名**展开成叶子键：`SECTIONS.resetKeys` 给的就是 `['paths']` /
+      // `['audio']` 这类分组名。若按整支写库，settings 表里会多出一行
+      // `paths = {整个对象}` —— 与「一行为一个叶子」的表语义不符，读取时还会与叶子行
+      // 互相覆盖（`SELECT key, value` 没有 ORDER BY，覆盖顺序不确定）。
+      const targets = (keys && keys.length > 0 ? keys : collectLeafKeys(defaults)).flatMap((key) =>
+        collectLeafKeys(getByPath(defaults, key), key),
+      )
       const changed: string[] = []
       for (const key of targets) {
         const def = getByPath(defaults, key)

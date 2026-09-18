@@ -251,6 +251,12 @@ export function wrapUnknown(e: unknown, fallbackKey: MessageKey = 'INTERNAL'): A
   }
 
   if (e instanceof Error) {
+    // SQLite 的「表/视图不存在」必须在通用的 errno 映射之前识别。
+    // 理由见 detectSqliteSchemaError 的注释：它的 code 是通用的 SQLITE_ERROR，
+    // 没有专属 errno 可映射，不特殊处理就会被兜底成 INTERNAL（UI 显示错误编号「-」）。
+    const schemaErr = detectSqliteSchemaError(e)
+    if (schemaErr) return schemaErr
+
     const sysCode = readErrorCode(e)
     const mapped = sysCode ? SYSTEM_ERRNO_MAP[sysCode] : undefined
     if (mapped) {
@@ -264,6 +270,54 @@ export function wrapUnknown(e: unknown, fallbackKey: MessageKey = 'INTERNAL'): A
 
   // 抛了非 Error（字符串 / 对象 / undefined）
   return new AppError(fallbackKey, { details: { raw: safeStringify(e) } })
+}
+
+/**
+ * 识别 SQLite 的「表不存在」类错误，转成可读的 `DB_SCHEMA_INCOMPLETE`。
+ *
+ * ### 为什么必须单独做这件事（真机上踩过）
+ *   真实报错：`[SQLITE_ERROR] SqliteError: no such table: books`
+ *   它的 `code` 是 **`SQLITE_ERROR`** —— SQLite 的**通用**错误码，
+ *   而 `SYSTEM_ERRNO_MAP` 里能映射的是 `SQLITE_BUSY` / `SQLITE_CORRUPT` /
+ *   `SQLITE_READONLY` 这类**专属**码。于是 `SQLITE_ERROR` 一路落到
+ *   `wrapUnknown` 的兜底分支 → `INTERNAL` → UI 只显示错误编号「-」，
+ *   附一句「某处缺少精确抛错，应补齐」。
+ *
+ *   用户实际需要知道的是「表没建」，而不是「未知错误」——这两者对
+ *   排查的指导价值天差地别。所以这里按**消息模式**补一条精确映射。
+ *
+ * ### 为什么放在 shared 层而不是仓库层
+ *   仓库层逐个 `try/catch` 需要改十几处、且以后新增仓库必然漏。
+ *   这个判断是纯字符串/字段检查，零依赖，放在错误归一化的唯一入口最可靠。
+ */
+export function detectSqliteSchemaError(e: unknown): AppError | null {
+  if (!(e instanceof Error)) return null
+  const code = (e as { code?: unknown }).code
+  if (code !== 'SQLITE_ERROR') return null
+
+  // 覆盖 SQLite 的三种措辞：
+  //   no such table: books
+  //   no such view: v_xxx
+  //   no such index: idx_xxx
+  const m = /\bno such (?:table|view|index|column|trigger):\s*([A-Za-z_][\w.]*)/.exec(e.message)
+  if (!m) return null
+
+  const kind = /\bno such (table|view|index|column|trigger)\b/.exec(e.message)?.[1] ?? 'table'
+  const name = m[1]!
+  return new AppError('DB_SCHEMA_INCOMPLETE', {
+    cause: e,
+    params: { table: name },
+    details: {
+      reason: 'sqlite-schema-missing',
+      missingKind: kind,
+      missingName: name,
+      sqliteCode: 'SQLITE_ERROR',
+      hint:
+        '表不存在通常意味着数据库迁移没有完成。检查启动日志里是否有 ' +
+        'db.migrate.failed.readOnly / DB_MIGRATION_FAILED —— ' +
+        '最常见成因是迁移 SQL（.sql）没有被复制进构建产物。',
+    },
+  })
 }
 
 /** 断言：用于「不该发生」的路径，抛出的仍是业务异常 */

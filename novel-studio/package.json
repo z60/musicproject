@@ -16,7 +16,8 @@
     "error-docs": "错误码文档（docs/23-错误码一览.md）的唯一来源是 src/shared/messages.ts。改动 messages.ts 或 errors.ts 后必须跑 errors:docs 重新生成；CI 用 errors:docs:check 拦截不同步。",
     "import-ext": "src/shared/*.ts 之间以及 scripts/ 的 import 显式带 .ts 扩展名，以便被 Node 直接以 ESM 执行（文档生成脚本要连运行时导入这些模块）。tsconfig 需开启 allowImportingTsExtensions，electron-vite 侧正常解析。",
     "template-types": "Vue 模板表达式是按 JavaScript 解析的，不是 TypeScript：模板里写 `(v: number) => f(v)` 会让 vue-tsc 报 TS1109/TS1005 并**跳过整个文件的类型检查**（真正的类型错误全被掩盖）。check:template-types 拦截这类写法，fix:template-types 自动去掉参数类型标注（类型仍由子组件的 defineEmits/props 推断）。",
-    "no-postinstall-rebuild": "**故意没有 postinstall 钩子**。曾经有 `postinstall: electron-rebuild ...`，后果是：它在受限环境（禁止 spawn 子进程）里失败 → **整个 npm install 以非零退出码结束**，而依赖其实已经装好了，用户看到的却是一个失败。更糟的是它掩盖了真正的问题——electron 二进制没下载。正确做法：npm install 只装依赖（electron 自己的 postinstall 会下载 Electron 二进制），原生模块 ABI 重建由需要的人在需要的时候显式跑 `npm run rebuild`。"
+    "no-postinstall-rebuild": "**故意没有 postinstall 钩子**。曾经有 `postinstall: electron-rebuild ...`，后果是：它在受限环境（禁止 spawn 子进程）里失败 → **整个 npm install 以非零退出码结束**，而依赖其实已经装好了，用户看到的却是一个失败。更糟的是它掩盖了真正的问题——electron 二进制没下载。正确做法：npm install 只装依赖（electron 自己的 postinstall 会下载 Electron 二进制），原生模块 ABI 重建由需要的人在需要的时候显式跑 `npm run rebuild`。",
+    "runtime-assets": "迁移 SQL 是运行时 readFileSync 读的（打包器不认识 .sql，不会带进 bundle）。关键事实：electron-vite 把整个主进程**内联成单个** out/main/index.js，所以被内联的 `dirname(import.meta.url)` **就是 outDir 本身** —— SQL 必须复制到 outDir，写成任何子目录（哪怕是照抄源码树形状的 infra/db/migrations）都会 ENOENT，表现为「应用能开窗口、但一张业务表都没有」。真机日志实证：ENOENT …\\out\\main\\001_init.sql。check:assets 直接 import electron.vite.config.ts 取出插件、对着临时 outDir 真跑一次 writeBundle 来验证 —— 这样绕开了本环境禁止 spawn（esbuild 起不来）导致配置加载不了的死结。"
   },
   "scripts": {
     "dev": "electron-vite dev",
@@ -28,6 +29,8 @@
     "ensure:electron": "node --experimental-strip-types scripts/ensure-electron.ts",
     "fetch:native-prebuild": "node --experimental-strip-types scripts/fetch-native-prebuild.ts",
     "check:native": "node --experimental-strip-types scripts/check-native.ts",
+    "check:config": "node --experimental-strip-types scripts/probe-vite-config.ts",
+    "check:assets": "node --experimental-strip-types scripts/check-runtime-assets.ts",
     "rebuild": "electron-rebuild -f -w better-sqlite3,onnxruntime-node",
     "test": "node --experimental-strip-types scripts/run-tests.ts",
     "test:all": "node --experimental-strip-types scripts/run-tests.ts",
@@ -45,7 +48,7 @@
     "check:coverage:strict": "node --experimental-strip-types scripts/check-coverage.ts --strict",
     "fix:imports": "node --experimental-strip-types scripts/fix-relative-imports.ts --write",
     "fix:imports:check": "node --experimental-strip-types scripts/fix-relative-imports.ts --check",
-    "verify": "npm run check:syntax && npm run check:template-types && npm run test && npm run errors:docs:check && npm run check:structure && npm run fix:imports:check",
+    "verify": "npm run check:syntax && npm run check:template-types && npm run check:assets && npm run test && npm run errors:docs:check && npm run check:structure && npm run fix:imports:check",
     "dist:win": "npm run build && electron-builder --win --x64",
     "dist:mac": "npm run build && electron-builder --mac",
     "dist:linux": "npm run build && electron-builder --linux"

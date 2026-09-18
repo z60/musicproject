@@ -21,7 +21,7 @@ import { readdirSync, statSync } from 'node:fs'
 import { promises as fsp } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 
-import { AppError } from '../shared/errors.ts'
+import { AppError, isAppError } from '../shared/errors.ts'
 import {
   applyPragmas,
   backupDatabase,
@@ -213,9 +213,27 @@ export async function runMigrations(opts: {
     })
     return { result, schemaVersion, backedUp }
   } catch (e) {
+    // **不要把内层诊断信息丢掉。**
+    // 踩过的坑：这里原来无条件重建 `new AppError('DB_MIGRATION_FAILED', {
+    // details: { from, to, backedUp } })`，于是内层 `readMigrationSql` 抛出的
+    // `reason: 'sql-not-found'`（连同 migrationsDir、ENOENT 的绝对路径）被整个覆盖 ——
+    // 日志里只剩一个抽象错误码，真实原因（SQL 没被复制到 out 目录）完全不可见。
+    //
+    // 两条纪律：
+    //   1. 内层的 `details` 必须原样保留，本层的上下文补在后面（而不是覆盖）；
+    //   2. 已经是「基础设施残缺」类的错误直接往上抛，不再套一层壳。
+    if (isAppError(e) && e.key === 'DB_MIGRATION_FAILED' && e.details?.['reason'] === 'sql-not-found') {
+      throw e
+    }
+    const inner = isAppError(e) ? e.details : undefined
     throw new AppError('DB_MIGRATION_FAILED', {
       cause: e,
-      details: { from: currentSchemaVersion(opts.db), to: target, backedUp },
+      details: {
+        ...(inner ?? {}),
+        from: currentSchemaVersion(opts.db),
+        to: target,
+        backedUp,
+      },
     })
   }
 }

@@ -22,6 +22,32 @@ import type { DisplayableError, SerializedAppError } from '@shared/errors.ts'
 import type { ErrorAction, MessageKey, Severity } from '@shared/messages.ts'
 
 // ---------------------------------------------------------------------------
+// window.api 守卫（**故意不 import ipc.ts**）
+// ---------------------------------------------------------------------------
+// `ipc.ts` 会 import 本文件的 `reportError`。若这里反过来 import 它的
+// `requireWindowApi`，就形成循环依赖 —— 循环依赖在运行期的表现是
+// 「某个导出在特定加载顺序下是 undefined」，那是比原 bug 更难查的一类问题。
+// 因此这里**本地**实现同一件事（9 行），宁可重复也不引入循环。
+//
+// 失败模式的说明见 shared/lib/ipc.ts 的 requireWindowApi 注释：
+// preload 没生效时 `window.api` 是 undefined，而类型检查发现不了
+// （env.d.ts 声明了它的形状）。
+function requireWindowApi(): NonNullable<typeof window.api> {
+  const api = window.api
+  if (api === undefined || api === null) {
+    throw new Error(
+      '[ipc] window.api 不存在 —— preload 脚本没有生效，渲染进程无法访问主进程。\n' +
+        '排查顺序：\n' +
+        '  1. out/preload/index.cjs 是否存在\n' +
+        '  2. 它是否为 CJS（行首有 import/export → sandbox preload 加载不了）\n' +
+        '  3. src/preload/index.ts 末尾是否调用了 installPreload()\n' +
+        '  4. 主进程窗口的 preloadPath 是否指向上面那个文件',
+    )
+  }
+  return api
+}
+
+// ---------------------------------------------------------------------------
 // 对外类型
 // ---------------------------------------------------------------------------
 
@@ -324,7 +350,11 @@ function buildActions(
   if (action === 'open_folder') {
     actions.push({
       label: '打开文件夹',
-      handler: () => { void window.api.invoke('app:getPaths', undefined as never) },
+      // 用 requireWindowApi() 而不是裸 window.api：preload 没生效时
+      // 这条会抛出**说明原因**的错误（「preload 脚本没有生效」+ 排查顺序），
+      // 而不是 `Cannot read properties of undefined (reading 'invoke')`。
+      // 在错误提示的按钮里再报一个看不懂的错，是最糟的体验。
+      handler: () => { void requireWindowApi().invoke('app:getPaths', undefined as never) },
     })
   }
 
@@ -336,7 +366,7 @@ function buildActions(
     actions.push({
       label: '导出诊断包',
       handler: () => {
-        void window.api.invoke('app:diagnostics', undefined as never)
+        void requireWindowApi().invoke('app:diagnostics', undefined as never)
           .catch(e => reportError(e, { event: 'renderer.diagnosticsFailed', action: 'dismiss' }))
       },
     })

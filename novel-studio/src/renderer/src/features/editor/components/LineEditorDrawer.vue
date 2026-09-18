@@ -140,9 +140,15 @@ const reviewField = markField<boolean>(() => props.line?.needsReview ?? false, v
 // 下面三个是模板里下拉/滑杆/开关的载荷适配：Element Plus 不给上下文类型，
 // 所以把转换从模板搬到这里，参数类型显式写清（模板里禁止写 TS 类型标注）。
 
-/** 语速单选（el-radio-group）：选项值为 SpeedMark，空串表示「默认」 */
-function onSpeedInput(value: SpeedMark | ''): void {
-  speedField.set(value || null)
+/**
+ * 语速单选（el-radio-group）：选项值为 SpeedMark，空串表示「默认」。
+ *
+ * 参数收宽 + 体内收窄：Element Plus 2.14 起事件参数类型是
+ * `string | number | boolean | undefined`，精确类型因逆变不可赋值。
+ */
+function onSpeedInput(value: string | number | boolean | undefined): void {
+  const v = String(value ?? '')
+  speedField.set((v === 'slow' || v === 'normal' || v === 'fast' ? v : null) as SpeedMark | null)
 }
 
 /** 音量偏移滑杆（el-slider）：载荷为 number | number[]（show-input 时同样是 number） */

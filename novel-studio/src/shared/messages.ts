@@ -876,6 +876,20 @@ export const MESSAGES = {
     severity: 'error', action: 'dismiss',
     dev: '启动流程在 open-database 步骤失败（或进了只读模式）后，DbPort 的写类操作会走到这里。',
   },
+  DB_SCHEMA_INCOMPLETE: {
+    title: '数据表不完整',
+    detail: '数据库里缺少「{table}」这张表，说明建表步骤没有完成。',
+    hint: '请重启应用；若表依然缺失，说明安装不完整，请重新安装或导出诊断包反馈。',
+    severity: 'fatal', action: 'contact_support',
+    params: ['table'],
+    dev:
+      'SQLite 原始错误是 SQLITE_ERROR: no such table —— 注意它的 code 是 **SQLITE_ERROR**（通用错误），' +
+      '而不是 SYSTEM_ERRNO_MAP 里能映射的 SQLITE_BUSY/CORRUPT/READONLY。' +
+      '因此不显式包装就会被 wrapUnknown 兜底成 INTERNAL，UI 上只显示错误编号「-」，' +
+      '用户完全看不出「表没建」这件事。' +
+      '真实成因：迁移 SQL 未随产物提供（.sql 没被复制到 out 目录）→ 迁移整体失败 → 应用进只读模式，' +
+      '而 createSettingsStore 自己建了 settings 表，于是库里恰好只有这一张表。',
+  },
 
   // --- 8xxx 任务队列 ------------------------------------------------------
   TASK_FAILED: {
@@ -1052,7 +1066,7 @@ const SEGMENTS: ReadonlyArray<{ segment: number; label: string; keys: readonly M
     segment: 7, label: 'DATA',
     keys: ['DB_BUSY', 'DB_CORRUPT', 'DB_MIGRATION_FAILED', 'DB_BACKUP_FAILED', 'DB_RESTORE_FAILED',
            'PROJECT_ID_CONFLICT', 'PATH_ESCAPE_BLOCKED', 'TEMP_CLEANUP_PARTIAL', 'AUDIO_FILE_MISSING',
-           'DB_OPEN_FAILED', 'DB_NOT_OPEN'],
+           'DB_OPEN_FAILED', 'DB_NOT_OPEN', 'DB_SCHEMA_INCOMPLETE'],
   },
   {
     segment: 8, label: 'TASK',

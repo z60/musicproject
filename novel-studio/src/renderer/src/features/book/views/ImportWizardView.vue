@@ -421,7 +421,7 @@ const sourceSummary = computed(() => {
       </dl>
 
       <p v-if="!store.projectId" class="wiz__block" role="alert">
-        {{ store.projectHint || '缺少项目上下文：请先在书架打开一本书，或确认「设置 → 路径」里的项目根目录可用。' }}
+        {{ store.projectHint || '缺少项目上下文：导入会写进主进程的默认项目；若这里一直为空，请重启应用以重建默认项目。' }}
       </p>
 
       <!-- 去重（docs/10 §9 三选一，绝不静默选择） -->
