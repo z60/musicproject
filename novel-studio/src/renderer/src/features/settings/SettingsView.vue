@@ -219,7 +219,36 @@ async function loadPaths(): Promise<void> {
   if (loaded) pathsInfo.value = loaded as AppPaths
 }
 
-type PathKey = 'projectRoot' | 'exportDir' | 'modelDir' | 'cacheDir' | 'backupDir'
+type PathKey = 'projectRoot' | 'exportDir' | 'ffmpegPath' | 'modelDir' | 'cacheDir' | 'backupDir'
+
+/**
+ * 保存**单个**路径字段（路径输入框的 `@change`）。
+ *
+ * 为什么不再用 `saveGroup('paths')`：输入框被清空时 `v-model` 给出的是**空串**，
+ * 而空串既不是合法路径、也不是 schema 眼里的「未设置」。原来的写法会把这一个空串
+ * 混进整组一起提交 —— 该项校验不过，整组就被拒收，**连刚选好的其它目录一起白改**。
+ *
+ * 归一规则（与 `AppSettings` 的类型保持一致）：
+ *   · 可空字段（`paths.ffmpegPath` / `paths.modelDir`，类型即 `string | null`）
+ *     清空 → `null`，表示「用随应用分发的默认位置」
+ *   · 其余路径字段类型是 `string`，不允许为空 → 清空时回落成**当前生效值**（不再覆盖）
+ */
+function savePathField(key: PathKey): void {
+  const current = settings.settings
+  if (!current) return
+
+  const raw = String(current.paths[key] ?? '').trim()
+  const nullable = key === 'ffmpegPath' || key === 'modelDir'
+  const fallback = nullable ? null : (pathsInfo.value?.[key] ?? '')
+  const next: string | null = raw || fallback
+
+  // 空且连生效值都拿不到（`app:getPaths` 还没回来）：不提交 —— 宁可不改，
+  // 也不能把 `''` 这种非法值写进设置树。
+  if (next === '') return
+
+  ;(current.paths as Record<string, unknown>)[key] = next
+  void save({ paths: { [key]: next } } as DeepPartial<AppSettings>)
+}
 
 async function pickFolder(key: PathKey, title: string): Promise<void> {
   const current = settings.settings
@@ -924,7 +953,7 @@ const bitDepthHint = computed(() => `采集固定用 float32（${AUDIO_DEFAULTS.
 
             <el-form-item label="项目目录" :class="{ 'ns-field--hl': isHl('paths.projectRoot') }" data-anchor="paths.projectRoot">
               <div class="ns-inline">
-                <el-input v-model="s.paths.projectRoot" class="ns-input" @change="saveGroup('paths')" />
+                <el-input v-model="s.paths.projectRoot" class="ns-input" @change="savePathField('projectRoot')" />
                 <el-button @click="pickFolder('projectRoot', '选择项目根目录')">选择目录</el-button>
                 <el-button :disabled="!s.paths.projectRoot" @click="reveal(s.paths.projectRoot)">打开</el-button>
               </div>
@@ -936,7 +965,7 @@ const bitDepthHint = computed(() => `采集固定用 float32（${AUDIO_DEFAULTS.
 
             <el-form-item label="导出目录" :class="{ 'ns-field--hl': isHl('paths.exportDir') }" data-anchor="paths.exportDir">
               <div class="ns-inline">
-                <el-input v-model="s.paths.exportDir" class="ns-input" @change="saveGroup('paths')" />
+                <el-input v-model="s.paths.exportDir" class="ns-input" @change="savePathField('exportDir')" />
                 <el-button @click="pickFolder('exportDir', '选择导出目录')">选择目录</el-button>
                 <el-button :disabled="!s.paths.exportDir" @click="reveal(s.paths.exportDir)">打开</el-button>
               </div>
@@ -949,7 +978,7 @@ const bitDepthHint = computed(() => `采集固定用 float32（${AUDIO_DEFAULTS.
                   v-model="s.paths.ffmpegPath"
                   class="ns-input"
                   placeholder="留空则使用随应用分发的 ffmpeg"
-                  @change="saveGroup('paths')"
+                  @change="savePathField('ffmpegPath')"
                 />
                 <el-button @click="pickFfmpegPath">选择文件</el-button>
                 <el-button :disabled="!s.paths.ffmpegPath" @click="reveal(s.paths.ffmpegPath)">打开</el-button>
@@ -970,7 +999,7 @@ const bitDepthHint = computed(() => `采集固定用 float32（${AUDIO_DEFAULTS.
                   v-model="s.paths.modelDir"
                   class="ns-input"
                   placeholder="留空则使用随应用分发的模型目录"
-                  @change="saveGroup('paths')"
+                  @change="savePathField('modelDir')"
                 />
                 <el-button @click="pickFolder('modelDir', '选择模型目录')">选择目录</el-button>
                 <el-button :disabled="!s.paths.modelDir" @click="reveal(s.paths.modelDir)">打开</el-button>
@@ -985,7 +1014,7 @@ const bitDepthHint = computed(() => `采集固定用 float32（${AUDIO_DEFAULTS.
 
             <el-form-item label="缓存目录" :class="{ 'ns-field--hl': isHl('paths.cacheDir') }" data-anchor="paths.cacheDir">
               <div class="ns-inline">
-                <el-input v-model="s.paths.cacheDir" class="ns-input" @change="saveGroup('paths')" />
+                <el-input v-model="s.paths.cacheDir" class="ns-input" @change="savePathField('cacheDir')" />
                 <el-button @click="pickFolder('cacheDir', '选择缓存目录')">选择目录</el-button>
                 <el-button :disabled="!s.paths.cacheDir" @click="reveal(s.paths.cacheDir)">打开</el-button>
               </div>
@@ -997,7 +1026,7 @@ const bitDepthHint = computed(() => `采集固定用 float32（${AUDIO_DEFAULTS.
 
             <el-form-item label="备份目录" :class="{ 'ns-field--hl': isHl('paths.backupDir') }" data-anchor="paths.backupDir">
               <div class="ns-inline">
-                <el-input v-model="s.paths.backupDir" class="ns-input" @change="saveGroup('paths')" />
+                <el-input v-model="s.paths.backupDir" class="ns-input" @change="savePathField('backupDir')" />
                 <el-button @click="pickFolder('backupDir', '选择备份目录')">选择目录</el-button>
                 <el-button :disabled="!s.paths.backupDir" @click="reveal(s.paths.backupDir)">打开</el-button>
               </div>

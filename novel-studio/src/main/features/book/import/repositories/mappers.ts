@@ -21,6 +21,7 @@ import type {
   Chapter,
   ChapterCanvasState,
   ChapterKind,
+  ChapterProgress,
   Id,
   Timestamp,
 } from '../../../../../shared/types.ts'
@@ -177,6 +178,46 @@ export interface ChapterRow {
   created_at: number
   updated_at: number
   deleted_at: number | null
+}
+
+/**
+ * 章节进度概览的行形状（`ChapterProgress` 的 snake_case 对应物）。
+ *
+ * 与 `001_init.sql` 的 `v_chapter_progress` 视图**列名一致**，所以视图与本仓库里那条
+ * 等价查询（见 `chapter.repo.sqlite.ts` 的 `PROGRESS_SELECT`）都能直接喂给它。
+ */
+export interface ChapterProgressRow {
+  chapter_id: string
+  book_id: string
+  seq: number
+  title: string
+  line_count: number | null
+  recorded_count: number | null
+  review_count: number | null
+  unassigned_count: number | null
+  audio_ms: number | null
+  char_count: number | null
+}
+
+/**
+ * 进度行 → 领域对象。
+ *
+ * 那些 `SUM(...)` 出来的列在没有任何画本行时会是 **NULL**（SQL 的 SUM 对空集返回 NULL），
+ * 所以逐个 `?? 0` —— 让上层拿到 `0` 而不是 `null`，否则 UI 会出现「已完成 NaN 行」。
+ */
+export function chapterProgressFromRow(row: ChapterProgressRow): ChapterProgress {
+  return {
+    chapterId: row.chapter_id,
+    bookId: row.book_id,
+    seq: row.seq,
+    title: row.title,
+    lineCount: row.line_count ?? 0,
+    recordedCount: row.recorded_count ?? 0,
+    reviewCount: row.review_count ?? 0,
+    unassignedCount: row.unassigned_count ?? 0,
+    audioMs: row.audio_ms ?? 0,
+    charCount: row.char_count ?? 0,
+  }
 }
 
 export function chapterFromRow(row: ChapterRow): Chapter {

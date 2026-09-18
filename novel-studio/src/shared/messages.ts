@@ -430,6 +430,17 @@ export const MESSAGES = {
     dev: '灾难性回溯防护：(a+)+ 这类模式。匹配加 100 ms 超时。',
   },
 
+  CHAPTER_HAS_CANVAS_LINES: {
+    title: '这一章已经有画本了',
+    detail: '合并或拆分会让这一章的画本行（以及它们的章内位置）失效。',
+    hint: '请先在画本里处理这些行，或改用其它章节；这样不会影响你已经录好的内容。',
+    severity: 'warning', action: 'dismiss',
+    dev:
+      '章节管理的合并/拆分不做画本行迁移：行级 seq 与 charStart/charEnd 在章节边界变化后' +
+      '不再成立，而文档没有规定迁移规则。实现选择明确拒绝（INVALID_PAYLOAD + 本消息），' +
+      '而不是发明一套「看起来合理」的搬运（那样会静默销毁用户的录音成果）。见 docs/91 §5.2.8。',
+  },
+
   // --- 4xxx 混音与导出 ----------------------------------------------------
   EXPORT_QCPRECHECK_FAILED: {
     title: '导出前检查未通过',
@@ -1034,7 +1045,9 @@ const SEGMENTS: ReadonlyArray<{ segment: number; label: string; keys: readonly M
            'PDF_ENCRYPTED', 'PDF_PARSE_LOW_QUALITY', 'DOCX_CORRUPT', 'NO_CHAPTER_MATCHED',
            'CHAPTER_SPLIT_SUSPICIOUS', 'FETCH_FAILED', 'FETCH_BLOCKED', 'FETCH_FORBIDDEN_TARGET',
            'FETCH_TOO_MANY_PAGES', 'DUPLICATE_BOOK', 'IMPORT_CLEAN_REMOVED_CONTENT',
-           'RULE_PATTERN_INVALID', 'RULE_PATTERN_UNSAFE'],
+           'RULE_PATTERN_INVALID', 'RULE_PATTERN_UNSAFE',
+           // ⚠️ 新增消息**只能在段末追加**（否则历史错误编号会漂移，见本文件头部纪律）
+           'CHAPTER_HAS_CANVAS_LINES'],
   },
   {
     segment: 4, label: 'EXPORT',

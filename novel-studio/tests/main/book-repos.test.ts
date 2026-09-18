@@ -191,17 +191,26 @@ CREATE TABLE IF NOT EXISTS demo (
     }
   })
 
-  it('仓储源码里 SELECT/INSERT/UPDATE 引用的列名都合法', () => {
+  it('仓储源码里 SELECT/INSERT/UPDATE 引用的列名都合法（含**别名限定**列）', () => {
     // 这是本文件的主力断言：把仓储源码里出现的裸标识符当候选列名，
     // 凡是「看起来像列名（snake_case）但不在 DDL 里」的都报出来。
+    //
+    // ⚠️ **为什么要单独处理别名限定列**：原先只在 books/chapters/projects 三张表的列集合里
+    // **并集**查找，于是 `l.char_count` 里的 `char_count` 会被 chapters 的列名喂饱 ——
+    // 而它实际限定的是 `canvas_lines`（**那张表没有 char_count 列**），
+    // 真机上会 100% 抛 `SQLITE_ERROR: no such column: l.char_count`。
+    // 这个假绿差点放过一个「每次调用必炸」的缺陷（docs/91 §5.2.8）。
+    // 现在：先把源码里的 `FROM/JOIN <表> <别名>` 收成别名表，再拿 `别名.列` 去**对应表**里查。
     const files = [
       'src/main/features/book/import/repositories/book.repo.sqlite.ts',
       'src/main/features/book/import/repositories/chapter.repo.sqlite.ts',
       'src/main/features/book/import/repositories/project.repo.ts',
     ]
-    const booksCols = parseDdlColumns(DDL, 'books')
-    const chaptersCols = parseDdlColumns(DDL, 'chapters')
-    const projectsCols = parseDdlColumns(DDL, 'projects')
+    const TYPED_TABLES = ['books', 'chapters', 'projects', 'canvas_lines', 'voice_segments', 'takes']
+    const tableCols = new Map<string, Set<string>>(TYPED_TABLES.map((t) => [t, parseDdlColumns(DDL, t)]))
+    const allCols = new Set<string>()
+    for (const cols of tableCols.values()) for (const c of cols) allCols.add(c)
+
     // 允许出现的非列名标识符（SQL 关键字、表名、别名、函数名）
     const allowed = new Set([
       'id', 'book_id', 'project_id', 'deleted_at', 'created_at', 'updated_at',
@@ -210,22 +219,58 @@ CREATE TABLE IF NOT EXISTS demo (
       'begin', 'immediate', 'commit', 'rollback', 'pragma', 'sqlite_',
       'books', 'chapters', 'projects', 'chapter_rule_sets',
       'name', 'value', 'key', 'settings', 'description', 'root_dir', 'schema_version', 'definition', 'builtin',
+      // 别名限定列里会用到的 SQL 函数（`SUM(LENGTH(l.text))` 等）
+      'length', 'sum', 'coalesce', 'case', 'when', 'then', 'else', 'end', 'in', 'join', 'left', 'inner', 'group',
+      'true', 'false', 'max', 'min', 'abs', 'replace', 'exists',
     ])
+    // 表名本身不是列名，别让它们被裸标识符检查误报（新增表时自动生效，不必手工维护）
+    for (const t of TYPED_TABLES) allowed.add(t)
 
     for (const rel of files) {
       const src = readFileSync(join(ROOT, rel), 'utf8')
+
+      /** 别名 → 表（文件级收集：`${PROGRESS_COLS}` 这类片段会把别名与 FROM 拆到两处） */
+      const aliasToTable = new Map<string, string>()
+      for (const m of src.matchAll(/\b(?:FROM|JOIN)\s+([a-z_][a-z0-9_]*)\s+(?:AS\s+)?([a-z][a-z0-9_]*)\b/gi)) {
+        const table = m[1]!
+        const alias = m[2]!
+        if (!tableCols.has(table)) continue
+        // `... FROM chapters WHERE` 这类：第二个词是关键字而不是别名
+        if (allowed.has(alias)) continue
+        aliasToTable.set(alias, table)
+      }
+
       // 只检查 SQL 字符串字面量内部（反引号与单引号包裹的多行 SQL）
       const sqlChunks = [...src.matchAll(/`([^`]*?(?:SELECT|INSERT|UPDATE|DELETE)[^`]*?)`/gis)].map((m) => m[1]!)
       for (const chunk of sqlChunks) {
+        // ① 别名（或表名）限定列：`l.char_count` → 必须是 canvas_lines 的列
+        for (const m of chunk.matchAll(/\b([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)\b/g)) {
+          const qualifier = m[1]!
+          const col = m[2]!
+          const table = aliasToTable.get(qualifier) ?? (tableCols.has(qualifier) ? qualifier : null)
+          if (!table) continue
+          assert.ok(
+            tableCols.get(table)!.has(col),
+            `${rel} 的 SQL 里出现 '${qualifier}.${col}'，但 **${table} 表没有 '${col}' 列**。\n` +
+              `  这类缺陷数据库要到真正 prepare/执行时才报 'no such column'，` +
+              `而并集式检查会把它放过去 —— 所以这里按别名解析到具体表再查。`,
+          )
+        }
+
+        // ② 裸标识符（原有检查，并集）
+        //    `AS xxx` 定义的是**输出别名**，不是对已有列的引用 —— 自动视为合法，
+        //    否则每加一个派生列都要来手工维护白名单（而漏维护只会得到假红）。
+        const outputAliases = new Set(
+          [...chunk.matchAll(/\bAS\s+([a-z][a-z0-9_]*)\b/gi)].map((m) => m[1]!),
+        )
         const tokens = chunk.match(/\b[a-z][a-z0-9_]*\b/g) ?? []
         for (const t of tokens) {
-          if (allowed.has(t)) continue
+          if (allowed.has(t) || outputAliases.has(t)) continue
           // 只对「snake_case 且长度>3」的 token 报错，避免误报普通单词
           if (!t.includes('_') || t.length < 4) continue
-          const known = booksCols.has(t) || chaptersCols.has(t) || projectsCols.has(t)
           assert.ok(
-            known,
-            `${rel} 的 SQL 里出现 '${t}' —— 不在 books/chapters/projects 的列里。` +
+            allCols.has(t),
+            `${rel} 的 SQL 里出现 '${t}' —— 不在任何已声明表的列里。` +
               `若这是新加的列，请先在 001_init.sql 里加（或用新迁移）。`,
           )
         }

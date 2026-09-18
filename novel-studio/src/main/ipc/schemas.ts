@@ -28,6 +28,22 @@ const Id = v.string().max(128)
 const IdOrNull = v.nullable(Id)
 const OptId = v.optional(v.nullable(Id))
 const OptString = v.optional(v.string())
+/**
+ * 可空字符串：`null`（或空串）表示「不设置 / 用默认值」。
+ *
+ * **只用于 `AppSettings` 类型里声明为 `string | null` 的字段**（`paths.ffmpegPath` /
+ * `paths.modelDir` / `audio.defaultInputDeviceId` / `export.coverPath`）。
+ *
+ * 为什么必须允许 `null`：这几个字段的「未设置」状态在 UI 上是**正常操作**
+ * ——「跟随系统默认设备」把设备选成 `null`、「清除封面」把封面清成 `null`，
+ * 而 `002_seed.sql` 也正是把它们预置成 `'null'`。此前 schema 写的是 `OptString`
+ * （`v.optional(v.string())`，不接受 `null` 也不接受空串），导致这些操作**保存必失败**
+ * （`SchemaError: 应为字符串，实际是 null`）—— 见 docs/91 §5.2.7 待办。
+ *
+ * 同时允许空串：路径输入框被清空时 UI 天然产生 `''`，边界上宽容一点、
+ * 由渲染进程归一到 `null`（不让 `''` 进入设置树）。
+ */
+const OptNullableString = v.optional(v.nullable(v.string().allowEmpty()))
 // （已移除：StringOrNull 未被使用）
 const StrArray = v.array(v.string().allowEmpty(), { max: 10_000 })
 const OptBool = v.optional(v.boolean())
@@ -346,8 +362,8 @@ const AppSettingsShape = v.object({
   paths: v.object({
     projectRoot: OptString,
     exportDir: OptString,
-    ffmpegPath: OptString,
-    modelDir: OptString,
+    ffmpegPath: OptNullableString,
+    modelDir: OptNullableString,
     cacheDir: OptString,
     backupDir: OptString,
   }).partial(),
@@ -355,7 +371,7 @@ const AppSettingsShape = v.object({
     sampleRate: v.optional(v.union([v.literal(44100), v.literal(48000)])),
     bitDepth: v.optional(v.union([v.literal(16), v.literal(24), v.literal(32)])),
     channels: v.optional(v.union([v.literal(1), v.literal(2)])),
-    defaultInputDeviceId: OptString,
+    defaultInputDeviceId: OptNullableString,
     monitorEnabled: OptBool,
     monitorGainDb: OptNum,
     inputGainDb: OptNum,
@@ -407,7 +423,7 @@ const AppSettingsShape = v.object({
     fileNameTemplate: OptString,
     chapterTitleTemplate: OptString,
     writeMetadata: OptBool,
-    coverPath: OptString,
+    coverPath: OptNullableString,
     splitM4bEvery: OptInt,
   }).partial(),
   ai: v.object({
@@ -522,7 +538,10 @@ export const IPC_REQ_SCHEMAS = {
   'chapter:update': v.object({
     chapterId: Id,
     patch: v
-      .object({ title: OptString, kind: v.optional(ChapterKind), volumeTitle: OptString })
+      // `volumeTitle` 在领域类型里是 `string | null`（types.ts），而 UI 的「清除卷名」
+      // 发的正是空串/`null` —— 用 OptString（非空）会直接 INVALID_PAYLOAD，
+      // 表现为「改卷名永远不生效」。服务端会把空串归一到 null（见 chapter.service）。
+      .object({ title: OptString, kind: v.optional(ChapterKind), volumeTitle: OptNullableString })
       .partial(),
   }),
   'chapter:reorder': v.object({ bookId: Id, orderedIds: v.array(Id, { max: 50_000 }) }),

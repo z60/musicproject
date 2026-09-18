@@ -25,7 +25,14 @@
  *   （VAD_DEFAULTS / EXPORT_DEFAULTS / CANVAS_DEFAULTS 等），避免同一份默认值写两处。
  */
 
-import { CANVAS_DEFAULTS, EXPORT_DEFAULTS, IMPORT_LIMITS, VAD_DEFAULTS } from '../shared/constants.ts'
+import {
+  ARRANGE_DEFAULTS,
+  CANVAS_DEFAULTS,
+  EXPORT_DEFAULTS,
+  IMPORT_LIMITS,
+  RECORD_LIMITS,
+  VAD_DEFAULTS,
+} from '../shared/constants.ts'
 import type { AppSettings } from '../shared/types.ts'
 import { readPragma } from './infra/db/pragma.ts'
 import type { DbLike } from './infra/db/types.ts'
@@ -78,13 +85,36 @@ export interface SettingsStoreOptions {
   logLevel?: AppSettings['advanced']['logLevel']
 }
 
-/** 出厂默认设置。**唯一来源**：所有默认值都从 constants.ts 派生，不另写字面量。 */
+/**
+ * 出厂默认设置。
+ *
+ * ⚠️ **取值以 `002_seed.sql` 为准**：那份迁移把同样的键预置进库里
+ * （`INSERT OR IGNORE INTO settings(...)`），而它是**已发布的迁移**（hash 固定在
+ * `MIGRATION_ENTRIES`，改内容会导致启动校验失败）。真实库上 seed 的行会覆盖这里的
+ * 默认值（`loadFromDb` 里库值优先），所以两边**必须逐项一致**，否则「默认值是多少」
+ * 就取决于有没有跑过迁移 —— 这在单测（内存库、不跑迁移）与真机之间会得到两种答案。
+ *
+ * `tests/main/settings-defaults-seed.test.ts` 会逐项比对两边，改任意一边都必须同步另一边。
+ *
+ * 能复用 `src/shared/constants.ts` 的就复用（`VAD_DEFAULTS` / `EXPORT_DEFAULTS` /
+ * `CANVAS_DEFAULTS` / `ARRANGE_DEFAULTS` / `RECORD_LIMITS`），其余按 seed 的字面量写。
+ */
 export function buildDefaultSettings(opts: {
   paths: AppSettings['paths']
   logLevel?: AppSettings['advanced']['logLevel']
 }): AppSettings {
   return {
-    paths: { ...opts.paths },
+    paths: {
+      // 这 4 个由运行时解析（seed 的注释明确说「不在此预置」，见 002_seed.sql 第 44 行）
+      projectRoot: opts.paths.projectRoot,
+      exportDir: opts.paths.exportDir,
+      cacheDir: opts.paths.cacheDir,
+      backupDir: opts.paths.backupDir,
+      // 这 2 个是**可选覆盖**：null = 用随应用分发/运行时解析的位置
+      // （seed 也是把它们预置成 `'null'`，设置页的输入框留空即此意）
+      ffmpegPath: null,
+      modelDir: null,
+    },
     audio: {
       sampleRate: 48000,
       bitDepth: 24,
@@ -94,22 +124,22 @@ export function buildDefaultSettings(opts: {
       monitorGainDb: 0,
       inputGainDb: 0,
       agcEnabled: false,
-      countdownMs: 2000,
+      countdownMs: 3000,
       autoTrim: true,
-      trimThresholdDb: -50,
-      trimPaddingMs: 120,
+      trimThresholdDb: -45,
+      trimPaddingMs: 100,
       echoCancellation: false,
     },
     recording: {
       defaultMode: 'line_by_line',
       stopKey: 'Space',
-      nextLineKey: 'Enter',
-      redoKey: 'Ctrl+Z',
+      nextLineKey: 'ArrowDown',
+      redoKey: 'Ctrl+R',
       playKey: 'P',
       footPedalEnabled: false,
-      footPedalMapping: {},
+      footPedalMapping: { F13: 'stop_and_next', F14: 'redo' },
       vad: { ...VAD_DEFAULTS },
-      maxSessionMinutes: 120,
+      maxSessionMinutes: RECORD_LIMITS.defaultMaxSessionMinutes,
     },
     canvas: {
       attributionThreshold: CANVAS_DEFAULTS.attributionThreshold,
@@ -130,14 +160,14 @@ export function buildDefaultSettings(opts: {
       defaultMusicGainDb: -18,
       duckAmountDb: -12,
       duckAttackMs: 150,
-      duckReleaseMs: 600,
-      maxCrossTrackOverlapMs: 500,
+      duckReleaseMs: 400,
+      maxCrossTrackOverlapMs: ARRANGE_DEFAULTS.maxCrossTrackOverlapMs,
       maxGapMs: 5000,
     },
     export: {
       // ExportFormat 只有 mp3 | wav | m4a：M4B 是「封装 + 章节」而不是另一种编码，
       // 容器仍是 M4A(AAC)，章节信息走 ffmetadata（见 docs/15 §5）
-      format: 'm4a',
+      format: 'mp3',
       mp3Bitrate: EXPORT_DEFAULTS.mp3Bitrate,
       m4bBitrate: EXPORT_DEFAULTS.m4bBitrate,
       fileNameTemplate: EXPORT_DEFAULTS.fileNameTemplate,
@@ -149,13 +179,13 @@ export function buildDefaultSettings(opts: {
     ai: {
       provider: 'mock',
       baseUrl: '',
-      model: '',
+      model: 'mock',
       timeoutMs: 60_000,
       maxConcurrency: 2,
       allowSendTextToCloud: false,
     },
-    embedding: { modelId: 'bge-small-zh-v1.5', batchSize: 16, threads: 2 },
-    asr: { modelId: 'whisper-small', language: 'zh', threads: 4, translate: false },
+    embedding: { modelId: 'bge-small-zh-v1.5', batchSize: 16, threads: 4 },
+    asr: { modelId: 'ggml-base.bin', language: 'zh', threads: 4, translate: false },
     import: {
       maxFileSizeBytes: IMPORT_LIMITS.maxFileSizeBytes,
       maxUrlPages: IMPORT_LIMITS.maxUrlPages,
@@ -165,8 +195,8 @@ export function buildDefaultSettings(opts: {
     advanced: {
       logLevel: opts.logLevel ?? 'info',
       autoBackup: 'daily',
-      keepBackups: 10,
-      autoCleanupTakes: true,
+      keepBackups: 7,
+      autoCleanupTakes: false,
     },
   }
 }
@@ -364,7 +394,12 @@ export function createSettingsStore(opts: SettingsStoreOptions): SettingsStore {
       // 「整支 = null」不是任何 UI 操作能表达的意思：分组只能是对象。
       if (value === null && isPlainObject(getByPath(defaults, key))) continue
 
-      // 支持两种写法：`{ 'audio.sampleRate': 48000 }` 与 `{ audio: { sampleRate: 48000 } }`
+      // 支持两种写法：
+      //   · `{ audio: { sampleRate: 48000 } }` —— **经 IPC 的唯一写法**（schema 是嵌套对象形状）
+      //   · `{ 'audio.sampleRate': 48000 }` —— **仅 store 层**：点分键在 `settings:set` 的
+      //     schema 里属未声明键，会被按 strip 静默剥掉（实测 `changed=[]`）。
+      //     保留这条分支是为了让 store 的单测与内部调用能直接点着路径改，不要据此以为
+      //     渲染进程可以发点分键。
       if (value !== null && typeof value === 'object' && !Array.isArray(value) && key.includes('.') === false) {
         for (const leaf of collectLeafKeys(value, key)) {
           const leafValue = getByPath(value, leaf.slice(key.length + 1))

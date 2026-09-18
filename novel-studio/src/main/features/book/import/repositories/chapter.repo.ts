@@ -65,6 +65,18 @@ export interface ChapterRepo {
   deleteByBook(bookId: Id): Promise<number>
   /** 按 id 批量删除（返回删除条数） */
   deleteByIds(ids: readonly Id[]): Promise<number>
+  /**
+   * 按 id 批量**软删除**（置 `deleted_at`，返回影响条数）。
+   *
+   * 为什么章节管理必须用软删除而不是 `deleteByIds`：docs/21 §「软删除」明确
+   * **音频相关实体禁物理删除**。`chapters → canvas_lines → voice_segments` 都是
+   * `ON DELETE CASCADE`，物理删一章会把它的画本行与**录音片段**一起级联删掉，
+   * 那是不可恢复的用户数据。软删除后行还在、录音还在，可以恢复。
+   *
+   * `deleteByIds` / `deleteByBook`（物理删除）只用于「整本书被删除且用户确认删音频」这类
+   * 显式场景 —— 那条路径由 `book:delete` 的 `deleteAudio` 参数把关。
+   */
+  softDeleteByIds(ids: readonly Id[]): Promise<number>
   /** 下一个可用 seq（追加章节用） */
   nextSeq(bookId: Id): Promise<number>
 }
@@ -89,6 +101,17 @@ export type MemoryChapterRepo = ChapterRepo & MemoryChapterRepoExtras
 export function createMemoryChapterRepo(seed: readonly ChapterWithText[] = []): MemoryChapterRepo {
   const byId = new Map<Id, ChapterWithText>()
   for (const item of seed) byId.set(item.chapter.id, { ...item, chapter: { ...item.chapter } })
+
+  /**
+   * 软删除标记（章节 id → 删除时间）。
+   *
+   * 为什么用侧表而不是给 `Chapter` 加字段：领域类型 `Chapter` 里**故意没有** `deletedAt`
+   * （删除状态是存储层的事，见 docs/03 §「软删除」），上层拿到的章节不该带这个字段。
+   * SQLite 实现用 `deleted_at` 列 + 读取时过滤；这里用侧表复刻同一语义 ——
+   * 两个实现必须给出同样的可见性，否则以内存实现为基准的测试会与真机行为分叉。
+   */
+  const deletedAt = new Map<Id, number>()
+  const alive = (id: Id): boolean => byId.has(id) && !deletedAt.has(id)
 
   return {
     async insertMany(items: readonly ChapterWithText[]): Promise<void> {
@@ -115,12 +138,12 @@ export function createMemoryChapterRepo(seed: readonly ChapterWithText[] = []): 
     },
 
     async findById(id: Id): Promise<Chapter | null> {
-      const item = byId.get(id)
+      const item = alive(id) ? byId.get(id) : undefined
       return item ? { ...item.chapter } : null
     },
 
     async listByBook(bookId: Id, options?: ChapterListOptions): Promise<Chapter[]> {
-      let items = [...byId.values()].filter((i) => i.chapter.bookId === bookId)
+      let items = [...byId.values()].filter((i) => i.chapter.bookId === bookId && alive(i.chapter.id))
       if (options?.afterSeq !== undefined) items = items.filter((i) => i.chapter.seq > options.afterSeq!)
       items.sort((a, b) => a.chapter.seq - b.chapter.seq)
       const offset = options?.offset ?? 0
@@ -130,17 +153,17 @@ export function createMemoryChapterRepo(seed: readonly ChapterWithText[] = []): 
 
     async countByBook(bookId: Id): Promise<number> {
       let n = 0
-      for (const item of byId.values()) if (item.chapter.bookId === bookId) n++
+      for (const item of byId.values()) if (item.chapter.bookId === bookId && alive(item.chapter.id)) n++
       return n
     },
 
     async getText(chapterId: Id): Promise<ChapterText | null> {
-      const item = byId.get(chapterId)
+      const item = alive(chapterId) ? byId.get(chapterId) : undefined
       return item ? { rawText: item.rawText, text: item.text } : null
     },
 
     async update(id: Id, patch: Partial<Omit<Chapter, 'id' | 'bookId'>>): Promise<Chapter> {
-      const item = byId.get(id)
+      const item = alive(id) ? byId.get(id) : undefined
       if (!item) throw new AppError('NOT_FOUND', { details: { what: 'chapter', id } })
       const next: Chapter = { ...item.chapter, ...patch, id: item.chapter.id, bookId: item.chapter.bookId }
       byId.set(id, { ...item, chapter: next })
@@ -148,7 +171,7 @@ export function createMemoryChapterRepo(seed: readonly ChapterWithText[] = []): 
     },
 
     async updateText(chapterId: Id, patch: Partial<ChapterText>): Promise<void> {
-      const item = byId.get(chapterId)
+      const item = alive(chapterId) ? byId.get(chapterId) : undefined
       if (!item) throw new AppError('NOT_FOUND', { details: { what: 'chapter', id: chapterId } })
       byId.set(chapterId, {
         ...item,
@@ -162,6 +185,7 @@ export function createMemoryChapterRepo(seed: readonly ChapterWithText[] = []): 
       for (const [id, item] of [...byId]) {
         if (item.chapter.bookId === bookId) {
           byId.delete(id)
+          deletedAt.delete(id)
           removed++
         }
       }
@@ -170,14 +194,30 @@ export function createMemoryChapterRepo(seed: readonly ChapterWithText[] = []): 
 
     async deleteByIds(ids: readonly Id[]): Promise<number> {
       let removed = 0
-      for (const id of ids) if (byId.delete(id)) removed++
+      for (const id of ids) {
+        if (byId.delete(id)) {
+          deletedAt.delete(id)
+          removed++
+        }
+      }
+      return removed
+    },
+
+    async softDeleteByIds(ids: readonly Id[]): Promise<number> {
+      const now = Date.now()
+      let removed = 0
+      for (const id of ids) {
+        if (!alive(id)) continue
+        deletedAt.set(id, now)
+        removed++
+      }
       return removed
     },
 
     async nextSeq(bookId: Id): Promise<number> {
       let max = 0
       for (const item of byId.values()) {
-        if (item.chapter.bookId === bookId) max = Math.max(max, item.chapter.seq)
+        if (item.chapter.bookId === bookId && alive(item.chapter.id)) max = Math.max(max, item.chapter.seq)
       }
       return max + 1
     },

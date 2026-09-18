@@ -35,6 +35,8 @@ import type { CleanOptions, CleanReportDetail } from '../../../../shared/text/cl
 import type { ChapterDraft } from '../../../../shared/types.ts'
 import { detectEncoding, type Decoder } from '../../../../shared/text/encoding.ts'
 import type { DbLike } from '../../../infra/db/types.ts'
+import { withTransactionAsync } from '../../../infra/db/with-transaction.ts'
+import { countNonEmptyLines } from '../../../../shared/text/lines.ts'
 import type { Logger } from '../../../infra/log/index.ts'
 import type { TaskSpec } from '../../../infra/queue/types.ts'
 import type { TaskQueue } from '../../../infra/queue/queue.ts'
@@ -218,14 +220,8 @@ export function createBookService(deps: BookServiceDeps): BookService {
   }
 
   /**
-   * 真实事务包装。
-   *
-   * better-sqlite3 的 `db.transaction()` 要求回调**同步**，而 `runImport` 的
-   * `withTransaction` 签名允许 async。这里用 `BEGIN IMMEDIATE` / `COMMIT` / `ROLLBACK`
-   * 手工控制：写法更长，但支持 async 回调（`insertMany` 是 async 的）。
-   *
-   * 用 IMMEDIATE 而不是 DEFERRED：导入是「先读后写」的形状，
-   * DEFERRED 会在第一次写时才拿写锁，两个并发导入会在中途死锁/报 BUSY。
+   * 真实事务包装。实现已提取到 `infra/db/with-transaction.ts`（章节管理域也要用同一套），
+   * 这里只保留「本域的仓储上下文 + 日志前缀」。
    */
   async function withTransaction<T>(fn: (tx: ImportTxContext) => Promise<T> | T): Promise<T> {
     const db = requireDb()
@@ -233,24 +229,7 @@ export function createBookService(deps: BookServiceDeps): BookService {
       bookRepo: createSqliteBookRepo(db),
       chapterRepo: createSqliteChapterRepo(db),
     }
-    db.exec('BEGIN IMMEDIATE')
-    try {
-      const out = await fn(tx)
-      db.exec('COMMIT')
-      return out
-    } catch (e) {
-      try {
-        db.exec('ROLLBACK')
-      } catch (rollbackErr) {
-        // 回滚失败意味着连接状态不可信：记下来，别吞掉
-        log.warn('book.tx.rollbackFailed', {
-          event: 'book.tx.rollbackFailed',
-          reason: String(rollbackErr),
-          cause: e instanceof Error ? e.message : String(e),
-        })
-      }
-      throw e
-    }
+    return withTransactionAsync(db, () => fn(tx), { log, eventPrefix: 'book.tx' })
   }
 
   /** 组装 runImport 的依赖（每次调用现取，保证用的是当前库） */
@@ -361,7 +340,17 @@ export function createBookService(deps: BookServiceDeps): BookService {
     text?: string
     ruleSetId?: string | null
     cleanOptions?: Record<string, boolean>
-  }): Promise<{ drafts: ChapterDraft[]; cleanReport: CleanReportDetail; encoding: string; contentHash: string }> {
+  }): Promise<{
+    drafts: ChapterDraft[]
+    cleanReport: CleanReportDetail
+    encoding: string
+    contentHash: string
+    /** 以下为渲染进程按「可选超集字段」读取的摘要（不含整本书的正文） */
+    suspicious: boolean
+    totalChars: number
+    title: string | null
+    split: Pick<ImportPreview['split'], 'strategy' | 'matchedRuleIds' | 'candidateCount' | 'mergedCount' | 'warnings'>
+  }> {
     const ruleSet = await resolveRuleSet(input.ruleSetId ?? null)
     const projectId = await ensureProject(null)
 
@@ -397,6 +386,22 @@ export function createBookService(deps: BookServiceDeps): BookService {
       // 断言读可选字段，把契约不一致静默掉了，直到用户点「开始导入」才以
       // `INVALID_PAYLOAD: source.contentHash 不能为空字符串` 暴露（docs/91 §5.2.6）。
       contentHash: preview.contentHash,
+      // ── 以下为「可控大小的预览摘要」────────────────────────────────────────
+      // 渲染进程的 `PreviewSplitResult` 早就按**可选超集字段**读它们
+      // （`suspicious` / `totalChars` / `title` / `split`），但主进程一直没回传，
+      // 于是那些 UI 一直走降级分支（书名不回填、分章告警不显示、总字数靠前端自己累加）。
+      // 这里补齐；**不回传** `rawText` / `cleanedText`（整本书的正文，几 MB 级，
+      // 过 IPC 只会白白拷贝一遍）。
+      suspicious: preview.suspicious,
+      totalChars: preview.totalChars,
+      title: preview.title ?? null,
+      split: {
+        strategy: preview.split.strategy,
+        matchedRuleIds: preview.split.matchedRuleIds,
+        candidateCount: preview.split.candidateCount,
+        mergedCount: preview.split.mergedCount,
+        warnings: preview.split.warnings,
+      },
     }
   }
 
@@ -672,12 +677,6 @@ function defaultSha256Hex(data: string | Uint8Array): string {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { createHash } = require('node:crypto') as typeof import('node:crypto')
   return createHash('sha256').update(data).digest('hex')
-}
-
-function countNonEmptyLines(text: string): number {
-  let n = 0
-  for (const line of text.split('\n')) if (line.trim().length > 0) n++
-  return n
 }
 
 /** drafts → Chapter（与 import.service.ts 的 buildChapter 同语义，但不需要 volumes 上下文） */

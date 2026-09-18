@@ -18,12 +18,14 @@
  */
 
 import { AppError } from '../../../../../shared/errors.ts'
-import type { Chapter, Id } from '../../../../../shared/types.ts'
+import type { Chapter, ChapterProgress, Id } from '../../../../../shared/types.ts'
 import type { DbLike } from '../../../../infra/db/types.ts'
 import {
   CHAPTER_PATCH_COLUMNS,
   chapterFromRow,
+  chapterProgressFromRow,
   chapterToInsertParams,
+  type ChapterProgressRow,
   type ChapterRow,
 } from './mappers.ts'
 import type { ChapterListOptions, ChapterRepo, ChapterText, ChapterWithText } from './chapter.repo.ts'
@@ -46,7 +48,59 @@ export interface SqliteChapterRepo extends ChapterRepo {
   getCleanReport(chapterId: Id): Promise<string | null>
   /** 写入本章的清洗报告 JSON */
   setCleanReport(chapterId: Id, json: string | null): Promise<void>
+  /** 单章进度概览（无画本行时各项计数为 0，不是 null） */
+  getProgress(chapterId: Id): Promise<ChapterProgress | null>
+  /** 某书全部章节的进度概览（按 seq 升序） */
+  listProgressByBook(bookId: Id): Promise<ChapterProgress[]>
 }
+
+/**
+ * 进度概览查询。
+ *
+ * ⚠️ **为什么不直接查 `v_chapter_progress` 视图**：那视图**根本跑不起来** ——
+ * 它写着 `SUM(l.char_count)`，而 `canvas_lines` 表**没有 `char_count` 列**（实测：
+ * 任何 `SELECT` 都报 `SQLITE_ERROR: no such column: l.char_count`；视图创建时不校验列名，
+ * 所以迁移阶段不会发现）。它还有第二个缺陷：把 `canvas_lines` 与 `voice_segments`
+ * **连续 LEFT JOIN**，一行有多段录音时该行被复制，`COUNT(l.id)` / `review_count` 会被放大
+ * （`audio_ms` 恰好是对的）。
+ *
+ * 视图建在 `001_init.sql` 里，那是**已发布的迁移**（hash 固定），不能就地改；
+ * 这里用等价子查询把语义写对。视图目前没有任何消费者，两处缺陷已记入 docs/91。
+ * 修视图需要新增 `003_*.sql`（`DROP VIEW` + 正确重建）。
+ *
+ * 各列语义（与视图**意图**一致）：
+ *   · `line_count`       —— 未删除的画本行数
+ *   · `recorded_count`   —— 已录/已对轨的行数
+ *   · `review_count`     —— 待人工确认的行数
+ *   · `unassigned_count` —— 说话人类型是「角色」但还没绑角色的行数
+ *   · `audio_ms`         —— 这些行的全部录音片段时长之和
+ *   · `char_count`       —— 画本行**字数**之和。注意 `canvas_lines` 没有 char_count 列，
+ *                           所以按 `LENGTH(text)` 求和（先例：`v_actor_workload` 视图就是
+ *                           `SUM(LENGTH(l.text))`）。它**不是**章节正文字数 ——
+ *                           正文长度在 `chapters.char_count`，由 `Chapter.charCount` 提供。
+ */
+const PROGRESS_COLS = `
+  c.id    AS chapter_id,
+  c.book_id AS book_id,
+  c.seq   AS seq,
+  c.title AS title,
+  (SELECT COUNT(*) FROM canvas_lines l
+     WHERE l.chapter_id = c.id AND l.deleted_at IS NULL) AS line_count,
+  (SELECT COUNT(*) FROM canvas_lines l
+     WHERE l.chapter_id = c.id AND l.deleted_at IS NULL
+       AND l.state IN ('recorded','aligned')) AS recorded_count,
+  (SELECT COUNT(*) FROM canvas_lines l
+     WHERE l.chapter_id = c.id AND l.deleted_at IS NULL
+       AND l.needs_review = 1) AS review_count,
+  (SELECT COUNT(*) FROM canvas_lines l
+     WHERE l.chapter_id = c.id AND l.deleted_at IS NULL
+       AND l.speaker_type = 'character' AND l.character_id IS NULL) AS unassigned_count,
+  (SELECT COALESCE(SUM(s.duration_ms), 0) FROM voice_segments s
+     JOIN canvas_lines l ON s.line_id = l.id
+     WHERE l.chapter_id = c.id AND l.deleted_at IS NULL) AS audio_ms,
+  (SELECT COALESCE(SUM(LENGTH(l.text)), 0) FROM canvas_lines l
+     WHERE l.chapter_id = c.id AND l.deleted_at IS NULL) AS char_count
+`
 
 /**
  * 章节的「扩展数据」伴随对象：`ChapterWithText` 只带 rawText / text，
@@ -207,11 +261,43 @@ export function createSqliteChapterRepo(db: DbLike): SqliteChapterRepo {
     return r.changes ?? 0
   }
 
+  async function softDeleteByIds(ids: readonly Id[]): Promise<number> {
+    if (ids.length === 0) return 0
+    const now = Date.now()
+    const placeholders = ids.map(() => '?').join(', ')
+    // 只标记还没被删过的行 —— 重复删除不该反复刷新 deleted_at（否则「删除时间」失去意义）
+    const r = db
+      .prepare(
+        `UPDATE chapters SET deleted_at = ?, updated_at = ?
+          WHERE deleted_at IS NULL AND id IN (${placeholders})`,
+      )
+      .run(now, now, ...ids) as { changes?: number }
+    return r.changes ?? 0
+  }
+
   async function nextSeq(bookId: Id): Promise<number> {
     const row = db
       .prepare(`SELECT COALESCE(MAX(seq), 0) AS n FROM chapters WHERE book_id = ?`)
       .get(bookId) as { n: number } | undefined
     return (row?.n ?? 0) + 1
+  }
+
+  async function getProgress(chapterId: Id): Promise<ChapterProgress | null> {
+    const row = db
+      .prepare(`SELECT ${PROGRESS_COLS} FROM chapters c WHERE c.deleted_at IS NULL AND c.id = ?`)
+      .get(chapterId) as ChapterProgressRow | undefined
+    return row ? chapterProgressFromRow(row) : null
+  }
+
+  async function listProgressByBook(bookId: Id): Promise<ChapterProgress[]> {
+    const rows = db
+      .prepare(
+        `SELECT ${PROGRESS_COLS} FROM chapters c
+          WHERE c.deleted_at IS NULL AND c.book_id = ?
+          ORDER BY c.seq ASC`,
+      )
+      .all(bookId) as ChapterProgressRow[]
+    return rows.map(chapterProgressFromRow)
   }
 
   async function getCleanReport(chapterId: Id): Promise<string | null> {
@@ -235,8 +321,11 @@ export function createSqliteChapterRepo(db: DbLike): SqliteChapterRepo {
     updateText,
     deleteByBook,
     deleteByIds,
+    softDeleteByIds,
     nextSeq,
     getCleanReport,
     setCleanReport,
+    getProgress,
+    listProgressByBook,
   }
 }

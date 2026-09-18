@@ -175,7 +175,9 @@ interface PreviewSplitResult {
    * `book:commitImport` 必然被 schema 拒收（真机事故 docs/91 §5.2.6）。
    */
   contentHash: string
-  // ---- 以下为主进程实现的超集字段（目前 main 未回传，缺失时降级，不报错） ----
+  // ---- 以下为 `book:previewSplit` 回传的**摘要**字段（主进程已实现，见 book.service.ts）----
+  // 仍然按可选读：万一跑在旧版主进程上就降级（书名不回填 / 告警不显示 / 字数前端自算），
+  // 而不是让整个预览失败。
   suspicious?: boolean
   totalChars?: number
   title?: string | null

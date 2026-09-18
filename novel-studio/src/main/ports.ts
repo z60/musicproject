@@ -33,6 +33,9 @@ import type { Logger } from './infra/log/index.ts'
 import { createDbPort } from './db.ts'
 import { createBookService, type BookService } from './features/book/import/book.service.ts'
 import { createBookHandlers } from './ipc/handlers/book.ts'
+import { createChapterService } from './features/book/chapter/chapter.service.ts'
+import { createChapterHandlers } from './ipc/handlers/chapter.ts'
+import { createSqliteCanvasLineRepo } from './features/book/canvas/repositories/canvas-line.repo.sqlite.ts'
 import type { RegisteredHandler } from './ipc/handlers/deps.ts'
 import type { AppState } from './app-state.ts'
 
@@ -124,7 +127,41 @@ export function buildHandlerDeps(opts: BuildHandlerDepsOptions): BuiltPorts {
   })
   for (const spec of bookService.taskSpecs()) queue.registerSpec(spec)
 
-  const domainHandlers: RegisteredHandler[] = [...createBookHandlers(bookService)]
+  // ── 章节管理域服务 ───────────────────────────────────────────────────────
+  // 与导入域分开：导入负责「把书变成章节」，章节管理负责「章节之后的一切」
+  // （改标题/重排/合并/拆分/删除/进度）。两者共用同一套仓储与迁移。
+
+  /**
+   * 画本行仓储**按当前 db 现取**：库可能在「从备份恢复」后被换成新连接，
+   * 持有旧连接的仓储会读到已关闭的库。因此每次都现构造（构造本身很轻）。
+   */
+  async function withCanvasRepo<T>(
+    fn: (repo: ReturnType<typeof createSqliteCanvasLineRepo>) => Promise<T>,
+  ): Promise<T> {
+    const db = state.db
+    if (!db) {
+      throw new AppError('DB_NOT_OPEN', { details: { feature: 'chapter', what: 'canvas-lines' } })
+    }
+    return fn(createSqliteCanvasLineRepo(db))
+  }
+
+  const chapterService = createChapterService({
+    getDb: () => state.db,
+    log,
+    // 画本行写入端口：`chapter:inserTitleLine` 往 canvas_lines 插「章首标题念白行」。
+    canvasLines: {
+      countLines: (chapterId) => withCanvasRepo((r) => r.countLines(chapterId)),
+      findTitleLine: (chapterId) => withCanvasRepo((r) => r.findTitleLine(chapterId)),
+      shiftSeqDown: (chapterId) => withCanvasRepo((r) => r.shiftSeqDown(chapterId)),
+      insert: (line) => withCanvasRepo((r) => r.insert(line)),
+      updateText: (lineId, text) => withCanvasRepo((r) => r.updateText(lineId, text)),
+    },
+  })
+
+  const domainHandlers: RegisteredHandler[] = [
+    ...createBookHandlers(bookService),
+    ...createChapterHandlers(chapterService),
+  ]
 
   const dbPort = createDbPort({
     getDb: () => state.db,
