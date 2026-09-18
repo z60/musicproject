@@ -31,7 +31,8 @@ import { useTaskProgress } from '@/shared/lib/task-progress.ts'
 import { sanitizeFileName } from '@/shared/lib/template.ts'
 import { useSessionStore } from '@/app/store/session.store.ts'
 import { useTasksStore } from '@/app/store/tasks.store.ts'
-import { cloneForIpc, useExportStore } from '../stores/export.store.ts'
+import { cloneForIpc } from '@/shared/lib/clone.ts'
+import { useExportStore } from '../stores/export.store.ts'
 import { useQcStore } from '../stores/qc.store.ts'
 
 /** `export:progress` 事件的载荷（唯一来源：src/shared/ipc.ts 的事件契约） */

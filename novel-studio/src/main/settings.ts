@@ -344,25 +344,33 @@ export function createSettingsStore(opts: SettingsStoreOptions): SettingsStore {
   function applyPatch(patch: Record<string, unknown>): string[] {
     const changed: string[] = []
     for (const [key, value] of Object.entries(patch)) {
-      // ── 分支级键**绝不能被 `undefined` / `null` 赋值** ────────────────────
+      // ── `undefined` 一律表示「本次补丁没有提供这一项」，必须跳过 ──────────────
       //
-      // 为什么必须在这里挡（真机事故，docs/91 §5.2.3）：
+      // 为什么必须在这里挡（真机事故，docs/91 §5.2.3 与 §5.2.7）：
       // IPC 校验层（infra/validate/schema.ts 的 `ObjectSchema._parse`）会把 shape 里
-      // **每一个**键都物化进结果 —— 输入里没出现的分支就变成 `undefined`。于是用户在
-      // UI 上只改一个分组（例如「路径」）时，到达这里的补丁其实是
-      // 「12 个分组全在、其中 11 个是 undefined」。
-      // 若照单全收：整支被赋成 undefined → `persist` 里 `JSON.stringify(v ?? null)`
-      // 写成 `null` → 下次启动 `loadFromDb` 用这个 null 覆盖整棵树 →
-      // `ports.ts` 读 `import.maxFileSizeBytes` 抛 TypeError → **启动永久失败**
-      // （坏值在库里，重启重装都无效）。
+      // **每一个**键都物化进结果 —— 输入里没出现的键就变成 `undefined`。
+      //   · 顶层：用户在 UI 上只改一个分组时，补丁其实是「12 个分组全在，其中 11 个 undefined」。
+      //     照单全收 → 整支被赋成 undefined → persist 写成 `null` → 下次启动
+      //     `loadFromDb` 用 null 覆盖整棵树 → ports.ts 读 import.maxFileSizeBytes 抛
+      //     TypeError → **启动永久失败**。
+      //   · 分组内：只改一个分组里的**一项**时，补丁是「该分组所有叶子都在，其中大部分
+      //     undefined」。照单全收 → 同组其它项**全部被清空**（真机现象：选了导出位置后
+      //     再选备份位置，导出位置就没了）。
       //
-      // 语义上「整支 = null」也不是任何 UI 操作能表达的意思：分组只能是对象。
-      if ((value === undefined || value === null) && isPlainObject(getByPath(defaults, key))) continue
+      // 语义上这两层是同一件事：**补丁里没出现的键 = 不改它**。
+      if (value === undefined) continue
+
+      // ── 分组键也不能被 `null` 赋值 ─────────────────────────────────────────
+      // 「整支 = null」不是任何 UI 操作能表达的意思：分组只能是对象。
+      if (value === null && isPlainObject(getByPath(defaults, key))) continue
 
       // 支持两种写法：`{ 'audio.sampleRate': 48000 }` 与 `{ audio: { sampleRate: 48000 } }`
       if (value !== null && typeof value === 'object' && !Array.isArray(value) && key.includes('.') === false) {
         for (const leaf of collectLeafKeys(value, key)) {
           const leafValue = getByPath(value, leaf.slice(key.length + 1))
+          // 分组内同理：**叶子是 `undefined` 就跳过**，否则会把同组其它项清空。
+          // （`null` 不跳过：对叶子而言 null 是有意义的「用默认值」，见 loadFromDb 的注释。）
+          if (leafValue === undefined) continue
           if (setByPath(state.value, leaf, leafValue)) changed.push(leaf)
         }
         continue

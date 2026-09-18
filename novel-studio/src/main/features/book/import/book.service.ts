@@ -361,7 +361,7 @@ export function createBookService(deps: BookServiceDeps): BookService {
     text?: string
     ruleSetId?: string | null
     cleanOptions?: Record<string, boolean>
-  }): Promise<{ drafts: ChapterDraft[]; cleanReport: CleanReportDetail; encoding: string }> {
+  }): Promise<{ drafts: ChapterDraft[]; cleanReport: CleanReportDetail; encoding: string; contentHash: string }> {
     const ruleSet = await resolveRuleSet(input.ruleSetId ?? null)
     const projectId = await ensureProject(null)
 
@@ -391,6 +391,12 @@ export function createBookService(deps: BookServiceDeps): BookService {
       cleanReport: preview.cleanReport,
       // 契约里这个字段是非空 string；未检测到编码（如粘文本）时用 'utf-8' 收敛
       encoding: preview.encoding ?? 'utf-8',
+      // `contentHash` **必须回传**（docs/10 §9 的去重流程在提交之前就要用同一个哈希，
+      // 而 `book:commitImport` 的 `source.contentHash` 是非空必填）。
+      // 踩过的坑：这里原样漏了它可以编译通过 —— 渲染进程那边用 `as PreviewSplitResult`
+      // 断言读可选字段，把契约不一致静默掉了，直到用户点「开始导入」才以
+      // `INVALID_PAYLOAD: source.contentHash 不能为空字符串` 暴露（docs/91 §5.2.6）。
+      contentHash: preview.contentHash,
     }
   }
 

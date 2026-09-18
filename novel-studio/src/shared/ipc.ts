@@ -136,7 +136,12 @@ export interface IpcContract {
   'book:detectEncoding': { req: { filePath: string; sampleBytes?: number }; res: EncodingDetection }
   'book:previewSplit': {
     req: { filePath?: string; text?: string; ruleSetId?: string | null; cleanOptions?: Record<string, boolean> }
-    res: { drafts: ChapterDraft[]; cleanReport: CleanReport; encoding: string }
+    /**
+     * `contentHash` 必须回传（docs/10 §9）：去重要在**提交之前**用同一个哈希查
+     * `book:findDuplicate`，而 `book:commitImport` 的 `source.contentHash` 是**非空**必填。
+     * 少了它，导入到最后一步必然被 schema 拒收（真机事故 docs/91 §5.2.6）。
+     */
+    res: { drafts: ChapterDraft[]; cleanReport: CleanReport; encoding: string; contentHash: string }
   }
   'book:commitImport': {
     req: {

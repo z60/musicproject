@@ -40,6 +40,7 @@ import type {
 } from '@shared/types.ts'
 import type { IpcReq, IpcRes } from '@shared/ipc.ts'
 import { call, callCollecting, callSafe } from '@/shared/lib/ipc.ts'
+import { cloneForIpc } from '@/shared/lib/clone.ts'
 import { reportBatchFailures } from '@/shared/lib/error-bus.ts'
 import {
   DEFAULT_CHAPTER_TITLE_TEMPLATE,
@@ -131,15 +132,6 @@ export const M4B_CHAPTER_WARN_THRESHOLD = EXPORT_DEFAULTS.m4bChapterWarnThreshol
 export const MIX_SUMMARY_SAMPLE_LIMIT = 30
 /** 命名模板预览的条数上限（太多会拖慢第一步的渲染） */
 export const NAME_PREVIEW_LIMIT = 8
-
-/**
- * 交给 IPC 前把响应式对象拍平成普通对象。
- * 为什么必须做：Vue 的 reactive/Proxy 在跨 IPC 结构化克隆时可能抛
- * DataCloneError（且会把 Proxy 的 getter 一并带上），导出参数必须是纯数据。
- */
-export function cloneForIpc<T>(value: T): T {
-  return JSON.parse(JSON.stringify(value)) as T
-}
 
 /** 采样率 → WAV 每秒字节数（24 bit 单声道，docs/15 §5.1 `-c:a pcm_s24le`） */
 function wavBytesPerSecond(sampleRate: number): number {

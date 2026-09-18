@@ -193,6 +193,49 @@ describe('IPC 契约：主进程与渲染进程的引用完整性', () => {
   })
 })
 
+describe('IPC 契约：导入链路两端的字段必须对得上（docs/91 §5.2.6）', () => {
+  /**
+   * 去掉块注释与行注释后再断言。
+   *
+   * **这一步不是洁癖**：本套断言第一版直接匹配源码文本，而契约块里恰好有一条说明
+   * 「`contentHash` 必须回传」的**文档注释** —— 于是把 `contentHash` 从 `res` 里删掉后
+   * 断言**依然通过**（注释里那两个字把它喂饱了）。这就是 docs/91 §5.2.1 记过的
+   * 「断言某字符串出现过 ≠ 断言了正确的行为」。剥掉注释后，断言才真的打在声明上。
+   */
+  function stripComments(src: string): string {
+    return src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^[ \t]*\/\/.*$/gm, '')
+  }
+  const IPC_SRC_NO_COMMENTS = stripComments(IPC_SRC)
+
+  /**
+   * 真机事故：`book:previewSplit` 的 `res` **漏了 `contentHash`**，而
+   * `book:commitImport` 的 `source.contentHash` 是**非空必填**（`v.string()` 默认
+   * `nonEmpty: true`）。于是导入走到最后一步必然报
+   * `INVALID_PAYLOAD: source.contentHash 不能为空字符串` —— 用户点「开始导入」永远失败，
+   * 而且渲染进程那边用 `as PreviewSplitResult` 断言读可选字段，把契约不一致**静默掉了**，
+   * tsc 也拦不住（断言就是用来关掉类型检查的）。
+   *
+   * 因此这里直接读**源码文本**比对两端（与文件其余部分同一套做法，且不依赖 tsc）：
+   * 预览必须声明回传哈希、提交必须声明需要哈希。少任何一端都会在这里红。
+   */
+  it('book:previewSplit 的 res 声明了 contentHash', () => {
+    const resDecl = IPC_SRC_NO_COMMENTS.match(/'book:previewSplit':\s*\{[\s\S]*?\bres:\s*\{([^}]*)\}/)?.[1] ?? ''
+    assert.ok(resDecl.length > 0, '没解析到 book:previewSplit 的 res 声明 —— 解析正则可能已失效')
+    assert.match(
+      resDecl,
+      /(^|[;{\s])contentHash\s*:/,
+      'book:previewSplit 的 res 必须声明 contentHash：提交步骤（book:commitImport）要求它非空，' +
+        '少了它导入永远提交不了（docs/91 §5.2.6）',
+    )
+  })
+
+  it('book:commitImport 的 source 仍然要求 contentHash（两端的约定要一直成立）', () => {
+    const srcDecl = IPC_SRC_NO_COMMENTS.match(/'book:commitImport':\s*\{[\s\S]*?\bsource:\s*\{([^}]*)\}/)?.[1] ?? ''
+    assert.ok(srcDecl.length > 0, '没解析到 book:commitImport 的 source 声明 —— 解析正则可能已失效')
+    assert.match(srcDecl, /(^|[;{\s])contentHash\s*:/, 'book:commitImport 的 source 必须继续要求 contentHash')
+  })
+})
+
 describe('消息表与段号表一致性（错误码编号的根基）', () => {
   const MSG_SRC = readFileSync('src/shared/messages.ts', 'utf8')
 

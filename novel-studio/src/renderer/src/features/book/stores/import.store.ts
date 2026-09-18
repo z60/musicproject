@@ -28,6 +28,7 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { call, callSafe } from '@/shared/lib/ipc.ts'
+import { cloneForIpc } from '@/shared/lib/clone.ts'
 import { AppError } from '@shared/errors.ts'
 import { BUILTIN_RULE_SETS, ENCODING_CANDIDATES, IMPORT_LIMITS, VAD_DEFAULTS } from '@shared/constants.ts'
 import type {
@@ -168,8 +169,13 @@ interface PreviewSplitResult {
   drafts: ChapterDraft[]
   cleanReport: CleanReport
   encoding: string
-  // ---- 以下为主进程实现的超集字段（缺失时降级，不报错） ----
-  contentHash?: string
+  /**
+   * 去重与提交都要用的哈希（docs/10 §9）。
+   * **契约已声明它是必填**（`book:previewSplit` 的 `res`）：它空了就意味着
+   * `book:commitImport` 必然被 schema 拒收（真机事故 docs/91 §5.2.6）。
+   */
+  contentHash: string
+  // ---- 以下为主进程实现的超集字段（目前 main 未回传，缺失时降级，不报错） ----
   suspicious?: boolean
   totalChars?: number
   title?: string | null
@@ -731,7 +737,9 @@ export const useImportStore = defineStore('book/import', () => {
     cleanReportDetail.value = asCleanReportDetail(result.cleanReport ?? null)
     parsedEncoding.value = result.encoding ?? ''
     if (result.encoding && !selectedEncoding.value) selectedEncoding.value = result.encoding
-    // 哈希由后端给出（docs/10 §9）；契约没有该字段时留空，界面明确说明「跳过去重检查」
+    // 哈希由主进程给出（docs/10 §9，契约里是必填）。
+    // 这里仍然做一次类型检查而不是直接赋值：万一跑在**旧版主进程**上（没回传该字段），
+    // 留空会让去重跳过、并让提交以 `INVALID_PAYLOAD` 明确失败 —— 好过把 undefined 塞进载荷。
     contentHash.value = typeof result.contentHash === 'string' ? result.contentHash : ''
     suspiciousSplit.value = result.suspicious === true
     suspiciousSplit.value = suspiciousSplit.value || needsSuspiciousHeuristic(drafts.value)
@@ -1284,11 +1292,18 @@ export const useImportStore = defineStore('book/import', () => {
     duplicateAcknowledged.value = false
   }
 
-  /** 组装 book:commitImport 载荷（含人工干预后的草稿） */
+  /**
+   * 组装 book:commitImport 载荷（含人工干预后的草稿）。
+   *
+   * ⚠️ 返回值必须经 `cloneForIpc`：`drafts.value.filter(...)` 出来的是 Vue 响应式
+   * **Proxy**，而 Proxy 不能被 IPC 的结构化克隆序列化 —— 直接发出去会抛
+   * `DataCloneError: #<Object> could not be cloned.`，用户看到的是兜底码「-」。
+   * 详见 shared/lib/clone.ts 与 docs/91 §5.2.5。
+   */
   function buildCommitPayload(): CommitImportPayload | null {
     if (!projectId.value) return null
     const included = drafts.value.filter(d => d.included)
-    return {
+    return cloneForIpc<CommitImportPayload>({
       projectId: projectId.value,
       bookMeta: {
         title: bookMeta.value.title.trim(),
@@ -1305,7 +1320,7 @@ export const useImportStore = defineStore('book/import', () => {
         contentHash: contentHash.value,
       },
       drafts: included,
-    }
+    })
   }
 
   /**
@@ -1354,9 +1369,17 @@ export const useImportStore = defineStore('book/import', () => {
     return typeof id === 'string' ? id : null
   }
 
-  /** 走任务通道时的选项（主进程 ImportRequest 的字段子集，见 import.service.ts） */
+  /**
+   * 走任务通道时的选项（主进程 ImportRequest 的字段子集，见 import.service.ts）。
+   *
+   * ⚠️ 同样必须经 `cloneForIpc`：`effectiveRuleSet` **本身是普通对象**
+   * （`{ ...set, patterns: … }` 是新构造的字面量），但它内嵌的 `patterns` 是
+   * 「对响应式数组 filter」的结果 —— **元素仍是 Proxy**，而结构化克隆会走遍整个对象图，
+   * 所以整支载荷照样抛 `DataCloneError`。实测层次：
+   *   整支 effectiveRuleSet ❌ / 仅 patterns ❌ / 经 cloneForIpc ✅
+   */
   function buildTaskOptions(duplicatePolicy: 'error' | 'open-existing' | 'copy'): Record<string, unknown> {
-    return {
+    return cloneForIpc<Record<string, unknown>>({
       ruleSet: effectiveRuleSet.value ?? undefined,
       fallback: fallbackStrategy.value === 'none' ? undefined : fallbackStrategy.value,
       cleanOptions: { ...cleanOptions.value },
@@ -1366,7 +1389,7 @@ export const useImportStore = defineStore('book/import', () => {
       language: bookMeta.value.language.trim() || undefined,
       duplicatePolicy,
       persist: true,
-    }
+    })
   }
 
   function markTaskStarted(nextTaskId: string): void {
