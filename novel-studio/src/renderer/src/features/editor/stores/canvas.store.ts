@@ -217,6 +217,15 @@ export const useCanvasStore = defineStore('editor/canvas', () => {
   const issues = ref<QualityIssue[]>([])
   const issuesLoading = ref(false)
   const generateReport = ref<CanvasGenerateReport | null>(null)
+  /**
+   * `generateReport` 是否来自**本次会话里刚刚跑完的那次生成**。
+   *
+   * 为什么要区分：报告里 `embeddingUsed=false` 是「已降级为规则判定」的证据，但**打开一章
+   * 去看历史报告**时它不是新消息 —— 面板里本来就有红条与「语义判定：未启用（规则判定）」。
+   * 早期实现只要报告是降级的就弹一次提示，于是「点开任意一章」都会弹「未启用语义判定」，
+   * 连续看几章就一直弹（真机反馈）。现在只有**用户刚点完生成**才弹。
+   */
+  const reportIsFresh = ref(false)
   const generateTaskId = ref<Id | null>(null)
   const generateProgress = ref<{ stage: string; processed: number; total: number } | null>(null)
 
@@ -305,8 +314,14 @@ export const useCanvasStore = defineStore('editor/canvas', () => {
   /**
    * 加载章节画本行。
    * `force` 用于重新生成之后强制刷新。切章前会先 flush（docs/11 §4.8）。
+   *
+   * `freshReport` 表示「这次加载紧接着一次**本次会话里刚跑完的生成任务**」——
+   * 只有这种报告才值得弹「已降级为规则判定」的提示（见 reportIsFresh）。
    */
-  async function load(targetChapterId?: Id | null, options: { force?: boolean } = {}): Promise<void> {
+  async function load(
+    targetChapterId?: Id | null,
+    options: { force?: boolean; freshReport?: boolean } = {},
+  ): Promise<void> {
     const id = targetChapterId ?? chapterId.value
     if (!id) {
       lines.value = []
@@ -361,6 +376,9 @@ export const useCanvasStore = defineStore('editor/canvas', () => {
     clearPlayback()
 
     await Promise.all([loadIssueList(), loadReport()])
+    // 报告刚读回来就把「是不是刚生成完」记下来：视图的 watch 在刷新后才会跑，
+    // 那时它读到的就是这个值（见 reportIsFresh 的注释）
+    reportIsFresh.value = options.freshReport === true
   }
 
   async function ensureLoaded(id?: Id | null): Promise<void> {
@@ -982,7 +1000,8 @@ export const useCanvasStore = defineStore('editor/canvas', () => {
     () => generateProgressView.isFinished.value,
     async (finished) => {
       if (!finished) return
-      await load(chapterId.value, { force: true })
+      // freshReport：这次刷新出来的报告正是「刚生成」的产物 → 允许弹一次降级提示
+      await load(chapterId.value, { force: true, freshReport: true })
     },
   )
 
@@ -1060,7 +1079,7 @@ export const useCanvasStore = defineStore('editor/canvas', () => {
     // 质检
     issues, issueLineIds, issuesByLineId, issueCounts, issuesLoading, loadIssueList, autoFixIssue,
     // 生成
-    generateReport, generateTaskId, generateProgress, startGenerate, loadReport,
+    generateReport, generateTaskId, generateProgress, reportIsFresh, startGenerate, loadReport,
     subscribeGenerationProgress, recomputeAttribution,
     // 试听
     playbackLineId, playbackUrl, playbackDurationMs, playbackTakeId, playbackError,

@@ -15,6 +15,7 @@
 
 import type { Book, BookSourceType, Id } from '../../../../../shared/types.ts'
 import { AppError } from '../../../../../shared/errors.ts'
+import { dropUndefined } from '../../../../../shared/util/drop-undefined.ts'
 
 // ============================================================================
 // 接口
@@ -121,7 +122,8 @@ export function createMemoryBookRepo(seed: readonly Book[] = []): MemoryBookRepo
     async update(id: Id, patch: Partial<Omit<Book, 'id'>>): Promise<Book> {
       const current = byId.get(id)
       if (!current) throw new AppError('NOT_FOUND', { details: { what: 'book', id } })
-      const next: Book = { ...current, ...patch, id: current.id }
+      // 只应用真正给出的键（`undefined` = 没给）：见 shared/util/drop-undefined.ts
+      const next: Book = { ...current, ...dropUndefined(patch), id: current.id }
       byId.set(id, next)
       return { ...next }
     },

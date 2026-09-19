@@ -41,6 +41,7 @@
     "errors:docs:json": "node --experimental-strip-types scripts/gen-error-docs.ts --json",
     "check:renderer": "node --experimental-strip-types scripts/check-renderer.ts",
     "check:structure": "node --experimental-strip-types scripts/check-structure.ts",
+    "check:setup-order": "node --experimental-strip-types scripts/check-script-setup-order.ts",
     "check:syntax": "node --experimental-strip-types scripts/check-syntax.ts",
     "check:template-types": "node --experimental-strip-types scripts/strip-template-types.ts --check",
     "fix:template-types": "node --experimental-strip-types scripts/strip-template-types.ts --write",
@@ -48,7 +49,7 @@
     "check:coverage:strict": "node --experimental-strip-types scripts/check-coverage.ts --strict",
     "fix:imports": "node --experimental-strip-types scripts/fix-relative-imports.ts --write",
     "fix:imports:check": "node --experimental-strip-types scripts/fix-relative-imports.ts --check",
-    "verify": "npm run check:syntax && npm run check:template-types && npm run check:assets && npm run typecheck && npm run test && npm run errors:docs:check && npm run check:structure && npm run fix:imports:check",
+    "verify": "npm run check:syntax && npm run check:template-types && npm run check:assets && npm run typecheck && npm run test && npm run errors:docs:check && npm run check:structure && npm run check:setup-order && npm run fix:imports:check",
     "dist:win": "npm run build && electron-builder --win --x64",
     "dist:mac": "npm run build && electron-builder --mac",
     "dist:linux": "npm run build && electron-builder --linux"

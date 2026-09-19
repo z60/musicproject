@@ -27,7 +27,7 @@ import { strict as assert } from 'node:assert'
 import { describe, it } from 'node:test'
 import { DatabaseSync } from 'node:sqlite'
 
-import { loadMigrations } from '../../src/main/infra/db/migrations/index.ts'
+import { loadMigrations, latestSchemaVersion } from '../../src/main/infra/db/migrations/index.ts'
 import { currentSchemaVersion, migrate } from '../../src/main/infra/db/migrate.ts'
 import type { DbLike } from '../../src/main/infra/db/types.ts'
 import { SETTINGS_BOOTSTRAP_DDL, createSettingsStore } from '../../src/main/settings.ts'
@@ -99,12 +99,15 @@ describe('settings 引导期建表不得遮蔽迁移（全新库）', () => {
     // 启动第 5 步
     const res = await runAllMigrations(db)
 
-    assert.equal(res.applied, 2, 'init 与 seed 都应被应用')
+    // 断言「全部迁移都应用了」，而不是硬编码 2：每加一个迁移（例如 003）
+    // 这里就会假红一次，而假红会训练出「顺手改数字」的习惯 —— 那就失去了守卫的意义
+    const expected = loadMigrations().length
+    assert.equal(res.applied, expected, '所有迁移都应被应用')
     const tables = tablesOf(db)
     assert.ok(tables.includes('books'), `迁移后必须有 books，实际表：${tables.join(', ')}`)
     assert.ok(tables.includes('projects'))
     assert.ok(tables.includes('meta'))
-    assert.equal(currentSchemaVersion(asDb(db)), 2)
+    assert.equal(currentSchemaVersion(asDb(db)), latestSchemaVersion())
   })
 
   it('迁移后的 settings 表列齐全（is_secret 在位）', async () => {
@@ -139,7 +142,7 @@ describe('settings 引导期建表不得遮蔽迁移（真机残缺库）', () =
 
     // 启动第 5 步：这次必须真的跑通
     const res = await runAllMigrations(db)
-    assert.equal(res.applied, 2)
+    assert.equal(res.applied, loadMigrations().length)
     assert.ok(tablesOf(db).includes('books'), '迁移后必须有 books')
 
     // 补列是 ALTER TABLE ADD COLUMN，原有行与取值必须原样保留

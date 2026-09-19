@@ -21,6 +21,7 @@ import type { CanvasGenerateOptions, CanvasLinePatch, Chapter, ChapterCanvasStat
 import { BUILTIN_RULE_SETS, CANVAS_DEFAULTS, DECIDED_BY_LABELS, LINE_KIND_LABELS } from '@shared/constants.ts'
 import { call } from '@/shared/lib/ipc.ts'
 import { reportByKey } from '@/shared/lib/error-bus.ts'
+import { shouldShowDegradedBadge, shouldWarnEmbeddingDegraded } from '@/shared/lib/embedding-notice.ts'
 import { formatCount, formatDurationLong, formatInt, formatPercent } from '@/shared/lib/format.ts'
 import AutoSaveIndicator from '@/shared/ui/AutoSaveIndicator.vue'
 import ConfirmDialog from '@/shared/ui/ConfirmDialog.vue'
@@ -107,7 +108,12 @@ async function openChapter(row: ChapterRow): Promise<void> {
 
 // ── 中栏：视图 / 筛选 / 选中 ────────────────────────────────────────────────
 /** 顶层解构出来的 ref 在模板里会被自动解包，避免模板里写 `xxx.value` */
-const canvasFilter = useCanvasFilter(canvas.lines)
+/**
+ * 传 **getter** 而不是 `canvas.lines`：Pinia 的 setup store 会把 ref 解包，
+ * `canvas.lines` 拿到的是「调用那一刻的数组对象」，而 `canvas.load()` 是整体重赋值 ——
+ * 传值会让筛选结果永远停在空数组上（真机表现为「当前筛选下没有行」，docs/91 §5.2.27）。
+ */
+const canvasFilter = useCanvasFilter(() => canvas.lines)
 const { filter: filterState, counts: filterCounts, summary: filterSummary, isActive: filterActive, filtered: filteredLines } = canvasFilter
 const showGenerateForm = ref(false)
 const batchTargets = computed(() => (canvas.selectedCount > 0 ? canvas.selectedLines : filteredLines.value))
@@ -255,12 +261,32 @@ watch(() => settings.settings?.canvas, (config) => {
   }
 }, { immediate: true })
 
-/** docs/11 §2.4：降级必须显著提示 —— 报告里的红条 + 一条 error-bus 提示（每章只报一次） */
+/**
+ * docs/11 §2.4：降级必须显著提示。
+ *
+ * ⚠️ 三个条件缺一不可（判断抽到 `shouldWarnEmbeddingDegraded`，有测试钉住）：
+ * 报告确实降级 + 报告来自**本次会话里刚跑完的生成** + 这一章还没提示过。
+ * 早期实现只看 `embeddingUsed`，于是「点开任意一章」都会弹一次
+ * 「未启用语义判定」（真机反馈），连续看几章就一直弹。
+ * 打开章节看到的历史报告不是新消息：面板里有红条，工具条上还有常驻徽标。
+ */
 watch(report, (value) => {
-  if (!value || value.embeddingUsed || warnedChapterId.value === value.chapterId) return
-  warnedChapterId.value = value.chapterId
+  if (!shouldWarnEmbeddingDegraded({
+    report: value,
+    isFresh: canvas.reportIsFresh,
+    warnedChapterId: warnedChapterId.value,
+  })) return
+  warnedChapterId.value = value!.chapterId
   reportByKey('CANVAS_EMBEDDING_UNAVAILABLE')
 })
+
+/** 工具条上的常驻徽标：历史报告是降级的也要显示（一次性的弹窗靠不住） */
+const showDegradedBadge = computed(() => shouldShowDegradedBadge(report.value))
+
+/** 降级徽标点击：与消息表里 `action=open_settings` 同一个落点（设置页的向量判定锚点） */
+function openEmbeddingSettings(): void {
+  window.location.hash = `#/settings?focus=${encodeURIComponent('CANVAS_EMBEDDING_UNAVAILABLE')}`
+}
 
 /** docs/11 §8：本章已有 N 行人工修改时先确认（人工结果永不覆盖，只覆盖其余部分） */
 function askGenerate(): void {
@@ -418,6 +444,18 @@ watch(currentChapterId, async (id) => {
             <el-radio-button value="review">待确认（{{ formatCount(canvas.reviewCount) }}）</el-radio-button>
           </el-radio-group>
           <el-button size="small" @click="canvas.setDensity(canvas.density === 'compact' ? 'standard' : 'compact')">{{ canvas.density === 'compact' ? '标准密度' : '紧凑密度' }}</el-button>
+          <!--
+            常驻的降级徽标：报告里 `embeddingUsed=false` 必须**在编辑时也看得见**（docs/11 §2.4）。
+            引导语是「生成报告里必须显式体现 embeddingUsed=false」——报告面板只在生成面板里显示，
+            所以这里在工具条上再放一个常驻徽标（点它去设置检查模型）。
+          -->
+          <button
+            v-if="showDegradedBadge"
+            type="button"
+            class="ns-editor__badge is-warn"
+            title="本章画本由规则判定生成（未使用语义模型）：准确率明显低于向量判定。点击前往设置检查模型文件，然后对低置信行重算。"
+            @click="openEmbeddingSettings"
+          >语义判定：未启用（规则判定）</button>
           <span class="ns-editor__muted">筛选</span>
           <el-select :model-value="filterState.speaker" size="small" class="ns-editor__filter" @update:model-value="onSpeakerFilterInput">
             <el-option :value="SPEAKER_ANY" label="全部说话人" />
@@ -619,6 +657,9 @@ watch(currentChapterId, async (id) => {
 .ns-editor__banner { margin: 0; padding: 6px 10px; font-size: 12px; line-height: 1.7; }
 .ns-editor__banner.is-notice { background: rgb(64 158 255 / 10%); color: var(--ns-primary, #409eff); } .ns-editor__banner.is-info { background: var(--ns-fill-light, #f5f7fa); color: var(--ns-text-regular, #606266); }
 .ns-editor__banner.is-error { background: rgb(245 108 108 / 12%); color: var(--ns-danger, #f56c6c); } .ns-editor__banner.is-warn { border-radius: 4px; background: rgb(230 162 60 / 14%); color: var(--ns-warning, #e6a23c); }
+/* 工具条上的常驻降级徽标（可点击 → 设置页检查模型） */
+.ns-editor__badge { padding: 2px 8px; border: 1px solid currentcolor; border-radius: 10px; background: transparent; font-size: 11px; line-height: 1.6; cursor: pointer; }
+.ns-editor__badge.is-warn { background: rgb(230 162 60 / 14%); color: var(--ns-warning, #e6a23c); }
 .ns-editor__body { display: grid; grid-template-columns: 244px minmax(0, 1fr) 340px; flex: 1; min-height: 0; } .ns-editor__body.is-collapsed { grid-template-columns: 244px minmax(0, 1fr); }
 .ns-editor__left { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--ns-border-light, #e4e7ed); }
 .ns-editor__left-head { display: flex; align-items: center; justify-content: space-between; gap: 4px; padding: 6px 8px; border-bottom: 1px solid var(--ns-border-light, #e4e7ed); font-size: 12px; font-weight: 600; }

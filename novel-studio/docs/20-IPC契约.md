@@ -90,45 +90,115 @@
 
 ### 4.3 画本（`canvas`）
 
+> **以下表格已与代码契约对齐**（`src/shared/ipc.ts` 的 `IpcContract` 是唯一权威）。
+> 实现状态见表下说明 —— 本文档旧版列了 `snapshotList` / `snapshotRestore` / `importLines`
+> 三个通道，它们**不在契约里**，属于设计期设想，处置见 docs/91。
+
 | 通道 | 模式 | 请求 | 响应 |
 |------|------|------|------|
-| `canvas:generate` | invoke | `{ chapterId, options: { useEmbedding, useLlm, contextWindow, threshold, ruleSetId, overwriteHuman } }` | `{ taskId }` |
-| `canvas:getChapter` | invoke | `{ chapterId, offset?, limit?, filter? }` | `{ lines: CanvasLineDto[], total, report? }` |
-| `canvas:getLine` | invoke | `{ lineId }` | `CanvasLineDto` |
-| `canvas:updateLine` | invoke | `{ lineId, patch, rev? }` | `CanvasLineDto` |
-| `canvas:batchUpdate` | invoke | `{ lineIds: string[], patch, filter? }` | `{ updated: number }` |
+| `canvas:generate` | invoke | `{ chapterId, options: CanvasGenerateOptions }` | `{ taskId }` |
+| `canvas:getChapter` | invoke | `{ chapterId, offset?, limit?, filter? }` | `{ lines: CanvasLine[], total }` |
+| `canvas:getLine` | invoke | `{ lineId }` | `CanvasLine` |
+| `canvas:updateLine` | invoke | `{ lineId, patch, rev? }` | `CanvasLine` |
+| `canvas:batchUpdate` | invoke | `{ lineIds?[], patch, filter? }` | `{ updated: number }` |
 | `canvas:recomputeAttribution` | invoke | `{ chapterId, scope: 'low_confidence'\|'all'\|'selection', lineIds? }` | `{ taskId }` |
 | `canvas:qualityCheck` | invoke | `{ chapterId }` | `QualityIssue[]` |
-| `canvas:snapshotCreate` | invoke | `{ chapterId, label? }` | `{ snapshotId }` |
-| `canvas:snapshotList` | invoke | `{ chapterId }` | `CanvasSnapshot[]` |
-| `canvas:snapshotRestore` | invoke | `{ snapshotId }` | `{ ok }` |
+| `canvas:snapshotCreate` | invoke | `{ chapterId, label?, reason? }` | `{ snapshotId }` |
+| `canvas:insertLines` | invoke | `{ chapterId, afterSeq, text, characterId? }` | `CanvasLine[]` |
+| `canvas:deleteLine` | invoke | `{ lineId }` | `{ ok }` |
+| `canvas:exportText` | invoke | `{ chapterId, format: 'txt'\|'csv'\|'json', outPath? }` | `{ path }` |
 | `canvas:getGenerateReport` | invoke | `{ chapterId }` | `CanvasGenerateReport \| null` |
-| `canvas:exportText` | invoke | `{ chapterId, format: 'txt'\|'csv'\|'json' }` | `{ path }` |
-| `canvas:importLines` | invoke | `{ chapterId, lines: NewLineDto[] }` | `{ inserted }` |
+
+**实现状态（`handlers/canvas.ts`，当前）**
+
+- 上表 **12 个通道全部已实现**。
+- `canvas:getGenerateReport` 的报告落库在 `003_canvas_generate_reports.sql`
+  （`canvas_generate_reports` 表，一章一行）；从未生成过时返回 `null`（契约允许）。
+- `canvas:deleteLine` 是**软删除**（`deleted_at`）；渲染侧另有 `flags: ['deleted']`
+  的一套标记，两者语义不同，别混用（docs/91 有登记）。
+- `canvas:batchUpdate` **必须给 `lineIds`**：契约允许只给 `filter`，但 `filter` 里没有
+  章节维度，照它做等于「按条件更新全库」。
+- `canvas:progress` 是**事件**（主 → 渲染），不是 invoke 通道。
 
 ### 4.4 角色与配音员（`character` / `voiceActor`）
 
+> 表格已与代码契约（`src/shared/ipc.ts`）对齐；本域 **14 个通道全部已实现**
+> （`handlers/character.ts` + `features/book/canvas/character.service.ts`）。
+
 | 通道 | 模式 | 请求 | 响应 |
 |------|------|------|------|
-| `character:list` | invoke | `{ bookId, includeArchived? }` | `CharacterDto[]` |
-| `character:upsert` | invoke | `{ character }` | `CharacterDto` |
-| `character:merge` | invoke | `{ targetId, sourceIds: string[], keepAliases: boolean }` | `{ movedLines, mergedAliases }` |
+| `character:list` | invoke | `{ bookId, includeArchived? }` | `Character[]` |
+| `character:upsert` | invoke | `{ character: { id?, bookId, name, aliases?, gender?, …, sortOrder? } }` | `Character` |
+| `character:merge` | invoke | `{ targetId, sourceIds: string[], keepAliases? }` | `{ movedLines, mergedAliases, conflicts }` |
 | `character:archive` | invoke | `{ characterId, archived }` | `{ ok }` |
 | `character:extract` | invoke | `{ bookId, chapterIds? }` | `CharacterCandidate[]` |
-| `character:stats` | invoke | `{ characterId }` | `{ lines, chars, estimatedDurationMs, recordedMs }` |
+| `character:stats` | invoke | `{ characterId }` | `CharacterStats`（行数/字数/预估时长/已录时长） |
 | `character:rebuildCentroid` | invoke | `{ bookId, characterIds? }` | `{ taskId }` |
-| `voiceActor:list` | invoke | `{ projectId }` | `VoiceActorDto[]` |
-| `voiceActor:upsert` | invoke | `{ actor }` | `VoiceActorDto` |
+| `voiceActor:list` | invoke | `{ projectId }` | `VoiceActor[]` |
+| `voiceActor:upsert` | invoke | `{ actor: { id?, projectId, name, contact?, note?, profile? } }` | `VoiceActor` |
 | `voiceActor:delete` | invoke | `{ actorId }` | `{ ok }` |
-| `voiceActor:bind` | invoke | `{ characterId, actorId, isPrimary }` | `{ ok }` |
-| `voiceActor:workload` | invoke | `{ bookId }` | `Array<{ actorId, name, lines, chars, estimatedDurationMs, progress }>` |
+| `voiceActor:bind` | invoke | `{ characterId, actorId, isPrimary? }` | `{ ok }` |
+| `voiceActor:unbind` | invoke | `{ characterId, actorId }` | `{ ok }` |
+| `voiceActor:workload` | invoke | `{ bookId }` | `ActorWorkload[]` |
+| `voiceActor:bindings` | invoke | `{ bookId }` | `Array<{ characterId, actorId, isPrimary }>` |
 
-### 4.5 录音（`record` / `device` / `take`）
+**实现口径（实现与文档不一致时以这里为准）**
+
+- `character:merge` 的 `conflicts` 是**非阻断的警告消息**（`string[]`）：别名冲突的那个别名
+  不并入，其余照常合并、台词照常迁移。契约里没有 `ok` 字段，UI 把 `conflicts`
+  当提示展示（`characters.store.mergeCharacters` 就是这么用的）。
+- 合并的四个副作用缺一不可：迁移台词（并置 `decidedBy='human'`）、合并别名、
+  **归档**源角色（禁止物理删除，docs/11 §4.6）、**迁移配音员绑定**（否则配音员会
+  随源角色一起被归档到看不见的地方）。
+- `character:upsert` 的 `id` 必须与 `bookId` 一致（拒绝把角色挪到别的书）；
+  `name` 去空白后不能为空。
+- `character:extract` 会**剔除已经存在的角色/别名**（点了也是 no-op），
+  且单次最多读入 200 万字正文（超出截断并记 warn）。
+- `character:stats.recordedMs` 目前恒为 `0`：录音域（takes/voice_segments）还没有写入路径，
+  这里如实返回 0，而不是拿估算时长冒充（docs/91 有登记）。
+- `voiceActor:delete` 是**物理删除**并连带解除绑定（表里没有软删除列）；
+  画本行不受影响 —— 被台词引用的是**角色**，配音员不被内容引用。
+- `voiceActor:workload` 的口径：只统计**台词行**（已归属到角色的行），
+  一个角色绑多个配音员时每个配音员都算全额（备选也要能录），
+  **0 负载的配音员也会出现在结果里**（他才是最该被分配的人）。
+
+### 4.5 录音（`record` / `device` / `take` / `analysis`）
+
+> 表格已与代码契约（`src/shared/ipc.ts`）对齐（`record:reslice` / `take:updateTrim` 这两个
+> 早期草稿名**不在契约里**，已删；对轨域真正用的是 `record:optimizeTrim`）。
+> **实现状态**：`analysis:*`（3）、`device:*`（3）、`take:*`（6）、`record:*`（12）
+> **全部已实现**（`handlers/audio.ts` + `features/audio/*.service.ts`）。
+> 本域已无占位通道，见 docs/91 §5.2.17–§5.2.20。
+
+| 通道 | 模式 | 请求 | 响应 |
+|------|------|------|------|
+| `analysis:metrics` | invoke | `{ path? , segmentId? }`（**二选一必给**） | `AudioMetrics` |
+| `analysis:peaks` | invoke | `{ path? , segmentId?, peaksPerSec, fromMs?, toMs? }` | `{ peaks: number[], channels, totalPeaks }` |
+| `analysis:noiseProfile` | invoke | `{ segmentId, startMs, endMs }` | `{ rmsDb, suggestedNf }` |
+| `device:list` | invoke | — | `{ devices: AudioDeviceInfo[], preferred }` |
+| `device:savePreference` | invoke | `{ deviceId, label }` | `{ ok }` |
+| `device:selfTestResult` | invoke | `{ result: DeviceSelfTestResult }` | `{ ok }` |
+
+**实现口径（`analysis` / `device`）**
+
+- `analysis:*` 当前只支持 **WAV**（录制与导出的中间产物都是 WAV，docs/05 §2）。
+  其它格式明确抛 `INVALID_PAYLOAD`（`reason: 'unsupported-format'`），
+  **不返回一堆 null 假装测过** —— 那会让「电平正常吗」这个问题永远得不到回答。
+- `lufs` / `lra` / `truePeakDb` 需要 ffmpeg 的 `loudnorm` / `ebur128` 两遍法（docs/05 §8）；
+  没接线时为 `null`（不是 0、不是拿峰值冒充）。
+- `analysis:peaks` 的 `peaks` 是 **[-1, 1] 归一化幅度**、每桶两个点（min/max），
+  与渲染侧 `waveform-transform` 的口径一致。
+- `analysis:noiseProfile` 的 `suggestedNf` = 区间 RMS + 6 dB（高于底噪才不会被当成语音）；
+  数字静音的 RMS 夹到 `SILENCE_FLOOR_DB`（-100 dBFS）—— 否则 `-Infinity` 经 JSON 会变成 `null`。
+- `device:list` 返回的是**主进程知道的那部分**（偏好 + label 快照）：
+  设备枚举只能在渲染进程做（未授权时拿不到 label，docs/12 §11），由渲染侧合并。
+  偏好落 `settings.audio.defaultInputDeviceId`，快照落 `settings.audio.deviceLabels`。
+
 
 | 通道 | 模式 | 请求 | 响应 |
 |------|------|------|------|
 | `record:prepare` | invoke | `{ projectId, chapterId, mode, format: { sampleRate, bitDepth, channels }, deviceId? }` | `{ sessionId, warnings: string[] }` |
-| `record:attachPort` | invoke | `{ sessionId }` | `{ port }`（MessagePort 转入 preload 后交给渲染） |
+| `record:attachPort` | invoke | `{ sessionId }` | `{ ok }`（MessagePort 由 preload 经 `record:port` 转移，不在返回值里） |
 | `record:start` | invoke | `{ sessionId }` | `{ ok }` |
 | `record:pause` | invoke | `{ sessionId }` | `{ ok }` |
 | `record:resume` | invoke | `{ sessionId }` | `{ ok }` |
@@ -138,22 +208,40 @@
 | `record:mark` | send | `{ sessionId, kind: 'cut'\|'retake'\|'note', atMs }` | — |
 | `record:meter` | send | `{ sessionId, rmsDb, peakDb, frames }` | — |
 | `record:status` | event | — | `{ sessionId, state, framesWritten, durationMs, droppedFrames, diskFreeBytes }` |
-| `record:slice` | invoke | `{ sessionId, vad: VadOptions }` | `{ slices: SliceDto[] }` |
-| `record:reslice` | invoke | `{ sessionId, vad: VadOptions }` | `{ slices: SliceDto[] }` |
-| `record:matchSlices` | invoke | `{ sessionId, chapterId, slices, useAsr? }` | `{ matches: SliceMatch[], unmatchedSlices, unrecordedLines }` |
+| `record:slice` | invoke | `{ sessionId, vad: VadOptions }` | `{ slices: VadSlice[] }` |
+| `record:matchSlices` | invoke | `{ sessionId, chapterId, slices: VadSlice[], useAsr? }` | `{ matches: SliceMatch[], unmatchedSlices: number[], unrecordedLines: Id[] }` |
 | `record:acceptSlices` | invoke | `{ sessionId, accepted: SliceMatch[] }` | `{ createdTakes, createdSegments }` |
-| `device:list` | invoke | — | `{ devices: AudioDeviceDto[], preferred: string \| null }` |
-| `device:savePreference` | invoke | `{ deviceId, label, config }` | `{ ok }` |
-| `device:selfTestResult` | invoke | `{ result }` | `{ ok }` |
-| `take:listByLine` | invoke | `{ lineId }` | `TakeDto[]` |
-| `take:listByChapter` | invoke | `{ chapterId }` | `TakeDto[]` |
-| `take:setSelected` | invoke | `{ lineId, takeId }` | `{ segment: SegmentDto }` |
+| `record:optimizeTrim` | invoke | `{ takeId, options: TrimOptions }` | `{ trimmedInMs, trimmedOutMs }` |
+| `take:listByLine` | invoke | `{ lineId }` | `Take[]` |
+| `take:listByChapter` | invoke | `{ chapterId }` | `Take[]` |
+| `take:setSelected` | invoke | `{ lineId, takeId }` | `VoiceSegment` |
 | `take:delete` | invoke | `{ takeId, hard?: boolean }` | `{ ok }` |
-| `take:flag` | invoke | `{ takeId, flags: string[] }` | `TakeDto` |
-| `take:updateTrim` | invoke | `{ takeId, trimmedInMs, trimmedOutMs }` | `TakeDto` |
-| `take:combineParts` | invoke | `{ lineId, takeIds: string[] }` | `{ takeId }`（超长行分段合并） |
+| `take:flag` | invoke | `{ takeId, flags: string[] }` | `Take` |
+| `take:combineParts` | invoke | `{ lineId, takeIds: Id[] }` | `{ takeId }`（超长行分段合并） |
+
+**实现口径（`take`）**
+
+- 命名空间以契约为准：take 域**只有 6 个通道**。改裁剪点属于 `record:optimizeTrim`
+  （改的是 take 的 `trimmedInMs/trimmedOutMs`），不存在 `take:updateTrim`。
+- `take:listByLine` / `take:listByChapter` **默认不返回软删除的 take**；`take:delete` 默认
+  **软删除**（置 `deleted_at`、清 `is_selected`、磁盘文件保留），只有 `hard: true` 才先删行再删文件。
+  **没有恢复通道** —— 软删除的 take 目前只能靠 SQL 捞回，UI 不要承诺「可还原」。
+- `take:setSelected` 是**唯一**会把音频写进 `voice_segments` 的入口：
+  复制 take 文件到 `segments/{segmentId}.wav` → 实测峰值/RMS → 按 `line_id` upsert
+  （保留原 `id`/`createdAt`，把 `processed_path`/`preset_hash` 置空 —— 换了源文件，旧的处理结果失效）。
+  跨行选错 take 直接 `INVALID_PAYLOAD`，不做「顺手改行归属」这种猜测。
+- `take:combineParts` 按 **`partIndex` 排序**拼接（用户勾选顺序不算数，docs/12 §3.3），
+  要求至少 2 个不同 `partIndex`；采样率/位深/声道不一致时拒绝（`format-mismatch`）——
+  隐式重采样会让「合并完怎么变声了」无从解释。合并结果保留全部原件。
+- take 文件路径一律以**项目根相对路径**（分隔符统一 `/`）入库，避免同一文件
+  `a\b.wav` 与 `a/b.wav` 被当成两份缓存（docs/91 §5.2.16）。
 
 ### 4.6 对轨（`alignment`）
+
+> **实现状态**：19 个通道**全部已接线**（`handlers/alignment.ts` +
+> `features/audio/alignment.service.ts` + `repositories/arrangement.repo{,.sqlite}.ts`）。
+> 其中 **18 个是真实功能**；`alignment:forcedAlign` 的**能力未实现**（本仓库没有强制对齐
+> 引擎），它不返回 `taskId` 而是抛 `AI_FORCED_ALIGN_UNAVAILABLE` —— 见下面的说明与 docs/91 §5.2.21。
 
 | 通道 | 模式 | 请求 | 响应 |
 |------|------|------|------|
@@ -169,34 +257,131 @@
 | `alignment:validate` | invoke | `{ arrangementId }` | `ArrangementValidation` |
 | `alignment:resolveOverlap` | invoke | `{ arrangementId, itemIdA, itemIdB, strategy }` | `{ items }` |
 | `alignment:resetTrack` / `alignment:resetAll` | invoke | `{ arrangementId, trackId? }` | `{ items }` |
-| `alignment:autoMatchSegments` | invoke | `{ chapterId, useAsr? }` | `{ matches, unmatched }` |
+| `alignment:autoMatchSegments` | invoke | `{ chapterId, useAsr? }` | `{ matches, unmatchedSegments, unrecordedLines }` |
 | `alignment:bindSegment` | invoke | `{ lineId, segmentId, srcInMs?, srcOutMs? }` | `{ ok }` |
 | `alignment:unbindSegment` | invoke | `{ lineId }` | `{ ok }` |
-| `alignment:previewRender` | invoke | `{ arrangementId, mixProjectId, startMs, durationMs }` | `{ taskId }` |
-| `alignment:forcedAlign` | invoke | `{ lineId \| segmentId }` | `AppError('NOT_IMPLEMENTED')` ← 1.0 占位 |
+| `alignment:issueKindLabels` | invoke | — | `Record<AlignIssueKind, string>`（文案唯一来源） |
+| `alignment:previewRender` | invoke | `{ arrangementId, mixProjectId, startMs, durationMs }` | `{ taskId }`（`audio.render`，并发键 `ffmpeg`） |
+| `alignment:forcedAlign` | invoke | `{ lineId \| segmentId }` | 抛 `AI_FORCED_ALIGN_UNAVAILABLE`（**能力未实现**，见下） |
+
+**实现口径（`alignment`）**
+
+- **每章至多一个默认方案**：`is_default` 上没有唯一约束，`setDefault` 在一个事务里先清零同章其它方案；
+  删掉默认方案时**自动**把最早创建的那份设为默认（否则该章会「没有默认」，导出找不到方案）。
+- **`version` 只在整体重排时 +1**（`autoArrange` / 重置）。单条拖动不改它 ——
+  version 是导出 `paramsHash` 的成分，每次拖动都 +1 会让导出缓存永久失效。
+- **几何计算全在 `src/shared/arrange/**`**：主进程只做「读库 → 调纯函数 → 写库」。
+  渲染侧的时间线拖拽用同一份实现，否则会出现「拖的时候在哪、松手后在哪」不一致。
+- `alignment:autoMatchSegments` 只处理**孤儿片段**（当前绑定的行已不在本章：章节被合并/拆分/删行之后
+  最常见），返回三者：`matches` / `unmatchedSegments` / `unrecordedLines`。
+  `useAsr: true` 会被接受但结果是时长对齐（日志记 `alignment.asrUnavailable`），**不伪造识别结果**。
+- `alignment:bindSegment` 拒绝跨章绑定（`INVALID_PAYLOAD`）与「目标行已有片段」（`CONFLICT`）；
+  绑定成功后**清掉该行的过期时间线条目**，否则渲染仍按旧绑定播放。
+- `alignment:unbindSegment` **删除 `voice_segments` 行**：schema 里没有「未绑定的片段」
+  （`line_id NOT NULL UNIQUE`），解绑就是删行；音频文件保留在磁盘上，但这条记录**不可恢复**。
+- `alignment:previewRender` 只渲染**人声总线**（`cache/tmp/preview-*.wav`）：
+  BGM / 音效 / 闪避 / 母带响度属于混音域（`mix:*`，尚未实现）。`mixProjectId` 会被接受并记 warn，
+  不假装支持。
+- `alignment:forcedAlign` 需要强制对齐引擎（ASR 时间戳或 HMM 对齐），**本仓库没有实现**，
+  也不存在可注入的 provider。返回一个「注定失败的任务」比直接说明能力缺失更糟，所以它抛
+  `AI_FORCED_ALIGN_UNAVAILABLE`（消息表里已有的键）并给出替代方案提示。
 
 ### 4.7 处理与素材（`process` / `preset` / `music` / `analysis`）
 
+> **实现状态**：`process:*`（5）、`preset:*`（6）、`music:*`（4）、`analysis:*`（3）、
+> `ffmpeg:capabilities`（1）**全部已实现**（`handlers/processing.ts` / `handlers/music.ts` +
+> `features/audio/{process,preset,music,analysis}.service.ts`，ffmpeg 执行器在 `infra/media/ffmpeg-runner.ts`）。
+> **真实执行 ffmpeg 需要机器上装了 ffmpeg**（启动期探测；未装时 `process:preview` 明确报
+> 「未找到 ffmpeg」，非 WAV 素材探测则报 `ffmpeg-not-found`，都不静默失败）。
+
 | 通道 | 模式 | 请求 | 响应 |
 |------|------|------|------|
-| `process:preview` | invoke | `{ segmentId, chain, durationMs? }` | `{ path }` |
-| `process:apply` | invoke | `{ segmentId, presetId \| chain }` | `{ taskId }` |
-| `process:batchApply` | invoke | `{ scope: 'segments'\|'character'\|'chapter'\|'book', ids, presetId \| chain }` | `{ taskId }` |
-| `process:listApplied` | invoke | `{ segmentIds: string[] }` | `Array<{ segmentId, processedPath, presetHash, appliedAt }>` |
-| `process:revert` | invoke | `{ segmentId }` | `{ ok }` |
-| `preset:list` | invoke | `{ includeBuiltin? }` | `ProcessPresetDto[]` |
-| `preset:create` / `preset:update` / `preset:delete` | invoke | `{ preset }` / `{ id, patch }` / `{ id }` | `ProcessPresetDto` / `{ ok }` |
-| `preset:import` / `preset:export` | invoke | `{ path }` / `{ ids, path }` | `{ imported }` / `{ path }` |
-| `music:import` | invoke | `{ files: string[], kind: 'bgm'\|'sfx' }` | `MusicAssetDto[]` |
-| `music:list` | invoke | `{ projectId, kind? }` | `MusicAssetDto[]` |
-| `music:probe` | invoke | `{ assetId }` | `{ durationMs, sampleRate, channels, peakDb, lufs }` |
+| `process:preview` | invoke | `{ segmentId, chain, durationMs? }` | `{ path }`（项目内相对路径，落 `cache/tmp/`） |
+| `process:apply` | invoke | `{ segmentId, presetId \| chain }` | `{ taskId }`（`audio.process`，并发键 `ffmpeg`） |
+| `process:batchApply` | invoke | `{ scope: 'segment'\|'character'\|'chapter'\|'book', ids, presetId \| chain }` | `{ taskId }` |
+| `process:listApplied` | invoke | `{ segmentIds: string[] }` | `Array<{ segmentId, processedPath, presetHash }>` |
+| `process:revert` | invoke | `{ segmentId }` | `{ ok }`（只解绑，**不删**派生文件） |
+| `preset:list` | invoke | `{ projectId? }` | `ProcessPreset[]`（全局 + 该项目；含内置） |
+| `preset:create` / `preset:update` / `preset:delete` | invoke | `{ preset }` / `{ id, patch }` / `{ id }` | `ProcessPreset` / `ProcessPreset` / `{ ok }` |
+| `preset:import` / `preset:export` | invoke | `{ path }` / `{ ids, path }` | `{ imported, warnings }` / `{ path }` |
+| `music:import` | invoke | `{ projectId, files: string[], kind: 'bgm'\|'sfx' }` | `MusicAsset[]` |
+| `music:list` | invoke | `{ projectId, kind? }` | `MusicAsset[]` |
+| `music:probe` | invoke | `{ assetId }` | `AudioMetrics` |
 | `music:delete` | invoke | `{ assetId }` | `{ ok }` |
-| `analysis:noiseProfile` | invoke | `{ segmentId, startMs, endMs }` | `{ rmsDb, bands?: number[], suggestedNf }` |
-| `analysis:metrics` | invoke | `{ path \| segmentId }` | `{ durationMs, peakDb, rmsDb, lufs, truePeakDb }` |
-| `analysis:peaks` | invoke | `{ path, peaksPerSec, fromMs?, toMs? }` | `{ peaks: Int16Array, channelCount, totalPeaks }`（降采样后传输） |
-| `ffmpeg:capabilities` | invoke | — | `{ version, filters: Record<string, string[]>, missing: string[] }` |
+| `analysis:noiseProfile` | invoke | `{ segmentId, startMs, endMs }` | `{ rmsDb, suggestedNf }` |
+| `analysis:metrics` | invoke | `{ path \| segmentId }` | `AudioMetrics` |
+| `analysis:peaks` | invoke | `{ path \| segmentId, peaksPerSec, fromMs?, toMs? }` | `{ peaks: number[], channels, totalPeaks }`（[-1,1] 归一化） |
+| `ffmpeg:capabilities` | invoke | — | `AppCapabilities['ffmpeg']` |
+
+- `music:import` **复制**源文件到 `music/{kind}/{id}.{ext}`（docs/14 §8 的「托管」）：
+  引用用户原路径的话，一整理素材目录所有 BGM 轨就全哑了。支持
+  `mp3/wav/m4a/aac/flac/ogg/opus`，其余扩展名明确拒绝（不猜）。
+  导入时尽力测量元数据：**WAV 不经过 ffmpeg**（少一个伪依赖），非 WAV 用 ffmpeg 解码成
+  48k 单声道临时 WAV 再测量（口径与 `analysis:*` 一致）；测量失败**不影响导入成功**
+  （文件已托管，指标留空，日志记 `music.metadataFailed`）。
+- `music:probe` 只认 WAV 或「ffmpeg 能解码」的文件；没装 ffmpeg 时明确报
+  `EXPORT_FFMPEG_FAILED(reason=ffmpeg-not-found)`。`truePeakDb`/`lufs`/`lra` 为 `null`
+  （真实峰值与响度需要 ffmpeg 的 ebur128 两遍法，docs/05 §8）——不拿峰值冒充。
+- `music:delete` **先删文件再删行**；被混音轨引用时**拒绝删除**并列出引用的轨道
+  （`mix_tracks` 与 `mix_projects.tracks` 两处都查，因为两种存储同时存在）。
+- 契约里**没有** `music:update`：素材的「重命名 / 标签 / 备注 / 授权说明」目前只在渲染侧
+  会话内编辑（`MusicLibraryPanel.vue` 有说明），主进程不提供偷偷写库的入口。
+
+**实现口径（`process` / `preset`）**
+
+- **内置预设同时存在于两处**（`002_seed.sql` 的 `builtin = 1` 行 + `shared/constants.ts` 的
+  `BUILTIN_PRESETS`）。`preset:list` **以库为准**、常量只补「库里缺失的那条」——
+  直接拼接会让每个内置预设出现两次（本项目被测试当场抓过）。
+- `presetHash = fnv1a64(canonicalChain(chain))[:12]`，决定
+  `processed/{segmentId}.{presetHash}.wav` 的文件名与「跳过重复处理」的判据。
+  `canonicalChain` 用**显式键序**（不是 `JSON.stringify`）：从库里读回来的链键序可能不同，
+  指纹必须只取决于参数内容。
+- 处理**永远基于原始成品**（`voice_segments.file_path`），不基于上一次的处理结果 ——
+  否则「换预设」会变成「在已处理的音频上再处理一遍」（降噪/限幅叠加），
+  而且 `revert` 之后回不到干净状态（docs/03 §6 非破坏）。
+- 批量执行在任务队列里（`audio.process`，并发键 `ffmpeg`）：**失败隔离**
+  （一个片段失败不中断整批，报告里有失败原因与可复制的完整命令）、**幂等**
+  （`processed_path` 与 `preset_hash` 都一致就跳过）、**取消保留已完成结果**。
+
 
 ### 4.8 混音与导出（`mix` / `export`）
+
+> **实现状态**：`mix:*`（7）与 `export:*`（8）**全部已实现**（`handlers/mix.ts` / `handlers/export.ts` +
+> `features/audio/{mix,export}.service.ts` / `export.tasks.ts` + `repositories/*.repo{,.sqlite}.ts`）。
+> **渲染边界**：导出目前只混**人声总线**；混音方案里配了 BGM/音效轨时会**明确拒绝**
+> （`NOT_IMPLEMENTED(reason=music-tracks-not-mixed-yet)`）而不是静默丢掉音乐，见 docs/91 §5.2.25。
+> **响度测量需要 ffmpeg 的 `loudnorm`**：未装时 `mix:measureLoudness` 与 `export:verify`
+> 都明确报 `EXPORT_FFMPEG_FAILED(reason=ffmpeg-not-found)`，解析不出结果也明确报错，
+> **不返回 0 或拿峰值冒充**。
+
+| 通道 | 模式 | 请求 | 响应 |
+|------|------|------|------|
+| `mix:listProjects` | invoke | `{ chapterId }` | `MixProject[]`（默认方案在前） |
+| `mix:get` | invoke | `{ mixProjectId }` | `MixProject` |
+| `mix:save` | invoke | `{ mixProject }`（**整份**） | `MixProject`（`version` +1） |
+| `mix:create` | invoke | `{ chapterId, arrangementId, name }` | `MixProject`（自带一条人声轨） |
+| `mix:duplicate` | invoke | `{ mixProjectId, name }` | `MixProject`（轨道重新生成 id） |
+| `mix:delete` | invoke | `{ mixProjectId }` | `{ ok }` |
+| `mix:measureLoudness` | invoke | `{ path \| segmentId, targetLufs? }` | `LoudnessMeasurement` |
+| `export:preCheck` | invoke | `{ bookId, chapterIds?, mixProjectId, params }` | `QcPreCheckResult`（blockers / warnings / stats） |
+| `export:chapter` | invoke | `{ chapterIds, mixProjectId, params }` | `{ taskId }`（`export.chapter`，并发键 `ffmpeg`） |
+| `export:book` | invoke | `{ bookId, mixProjectId, params, makeM4b }` | `{ taskId }`（`export.book`） |
+| `export:m4b` | invoke | `{ bookId, chapterIds, params }` | `{ taskId }`（`export.book` + `m4bOnly`） |
+| `export:report` | invoke | `{ jobId }` | `ExportReport`（批量行 + 章节行组装） |
+| `export:verify` | invoke | `{ jobId }` | `{ chapters: Array<{ path, measuredLufs, measuredTp }> }` |
+| `export:openFolder` | invoke | `{ jobId }` | `{ ok }`（在文件管理器中定位产物） |
+| `export:vbrPresets` | invoke | — | `Array<{ label, value }>`（`-q:a` 档位 0~9，值不是码率） |
+
+**实现口径（`mix` / `export`）**
+
+- **整份 JSON 存**（`mix_projects.tracks` / `master` / `title_reading`）：契约的 `mix:save`
+  传的就是整份方案（渲染侧防抖 500ms 后提交），拆表只会多出「diff → 增删改」三组 SQL。
+- 保存时**逐条校验引用**，因为这些错误都只会在渲染时才爆：对轨方案必须属于同一章、
+  音乐/音效轨引用的素材必须存在且属于同一项目、轨道 id 不能重复、`presetId` 必须存在。
+- 两条不能被整份提交改写的字段：`isDefault`（只能通过「设为默认」改，否则一次防抖保存
+  就能把默认方案改没）与 `createdAt`。
+- `mix:delete` 删默认方案后**自动**把最早创建的那份设为默认，并清掉 `mix_tracks`
+  里可能残留的行（否则 `music:delete` 的引用检查会读到幽灵行）。
 
 | 通道 | 模式 | 请求 | 响应 |
 |------|------|------|------|
@@ -435,26 +620,41 @@ return res.data
 ```jsonc
 { "chapterId": "uuid", "offset": 0, "limit": 200, "filter": { "needsReview": true } }
 ```
-响应
+
+**两条容易被写错、且错了不报错的语义**（实现见 `handlers/canvas.ts`）：
+
+- **省略 `limit` = 返回全部**（不分页）。待确认队列就是这么调用的
+  （`{ filter: { needsReview: true } }`，不带 limit/offset）；若默认截断，
+  超过该行数的章节会静默丢行。
+- **`total` 是筛选后的条数**，不是本章全部行数。渲染侧用 `collected >= total`
+  判断翻页结束 —— 给错会多翻一页空页或提前停止。
+
+响应（**实际返回契约里的 `CanvasLine[]`**，见 `src/shared/types.ts`）
 ```jsonc
 {
   "total": 482,
   "lines": [
     {
-      "id": "uuid", "seq": 42, "speakerType": "character",
-      "characterId": "uuid", "characterName": "萧炎",
-      "text": "我萧炎，从来不会认输。", "sourceText": "「我萧炎，从来不会认输。」",
-      "kind": "dialogue", "state": "recorded",
+      "id": "uuid", "chapterId": "uuid", "bookId": "uuid", "seq": 42,
+      "speakerType": "character", "characterId": "uuid",
+      "kind": "dialogue", "text": "我萧炎，从来不会认输。", "sourceText": "「我萧炎，从来不会认输。」",
+      "charStart": 1180, "charEnd": 1191,
       "emotion": "愤怒", "emotionIntensity": 4, "speed": "fast",
-      "pauseAfterMs": 600, "pronunciation": null, "note": "情绪爆发点",
-      "confidence": 0.58, "decidedBy": "vector", "needsReview": 1,
+      "gainDb": null, "pauseAfterMs": 600, "pauseInline": null,
+      "pronunciation": null, "note": "情绪爆发点", "state": "recorded",
+      "confidence": 0.58, "decidedBy": "vector", "needsReview": true,
       "candidates": [ { "characterId": "uuid", "name": "萧炎", "score": 0.58 },
                       { "characterId": "uuid", "name": "药老", "score": 0.54 } ],
-      "flags": null, "takeCount": 2, "segmentId": "uuid", "rev": 7
+      "flags": [], "isTitle": false, "rev": 7,
+      "createdAt": 1710000000000, "updatedAt": 1710000001000
     }
   ]
 }
 ```
+
+> 本文档旧版画出的是 `CanvasLineDto`（带 `characterName` / `takeCount` / `segmentId`）。
+> 这些**不在契约类型里**：角色名由渲染侧用角色表自行拼接，`takeCount`/`segmentId`
+> 属于录音域。契约以 `CanvasLine` 为准（docs/91 记了这条差异，避免下游再按旧 DTO 编码）。
 
 ### 6.3 `record:stop`
 

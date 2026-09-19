@@ -25,6 +25,7 @@ import { useRoute } from 'vue-router'
 import { AppError, resolve } from '@shared/errors.ts'
 import type { DisplayableError } from '@shared/errors.ts'
 import { reportError } from '@/shared/lib/error-bus.ts'
+import { staleModuleHint } from '@/shared/lib/stale-module-hint.ts'
 
 const props = withDefaults(defineProps<{
   /** 兜底区最小高度，避免内容过少时页面跳动 */
@@ -39,6 +40,8 @@ const props = withDefaults(defineProps<{
 const route = useRoute()
 const failure = ref<DisplayableError | null>(null)
 const technical = ref<string | null>(null)
+/** 开发期「热更新没同步」提示（见 stale-module-hint.ts；生产构建里恒为 null） */
+const devHint = ref<string | null>(null)
 
 /** 是否开发模式：决定是否展示技术细节 */
 const isDev = import.meta.env.DEV
@@ -57,6 +60,10 @@ onErrorCaptured((err, instance, info) => {
 
   // 1) 统一兑现为可渲染消息（含编号，方便报障）
   failure.value = resolve(appErr, { includeDev: isDev })
+  devHint.value = staleModuleHint({
+    message: err instanceof Error ? err.message : String(err),
+    isDev,
+  })
 
   // 2) 记日志（silent 时只落日志不弹提示）
   //    路由名可能是 symbol（vue-router 允许），拼进事件名必须显式 String()，
@@ -85,11 +92,13 @@ onErrorCaptured((err, instance, info) => {
 watch(() => route.fullPath, () => {
   failure.value = null
   technical.value = null
+  devHint.value = null
 })
 
 function retry(): void {
   failure.value = null
   technical.value = null
+  devHint.value = null
 }
 
 function reload(): void {
@@ -109,6 +118,7 @@ function reload(): void {
 
     <p v-if="failure.detail" class="ns-error-boundary__detail">{{ failure.detail }}</p>
     <p v-if="failure.hint" class="ns-error-boundary__hint">{{ failure.hint }}</p>
+    <p v-if="devHint" class="ns-error-boundary__devhint">{{ devHint }}</p>
 
     <p class="ns-error-boundary__code">
       错误编号：<code>{{ failure.code }}</code>
@@ -166,6 +176,18 @@ function reload(): void {
   margin: 8px 0 0;
   font-size: 12px;
   color: var(--ns-text-secondary, #909399);
+}
+/* 开发期的「热更新没同步」提示：只在 dev 出现，措辞明确写清「刷新即可 / 刷新后仍报才是代码问题」 */
+.ns-error-boundary__devhint {
+  max-width: 620px;
+  margin: 4px 0 0;
+  padding: 8px 12px;
+  border-radius: 4px;
+  background: var(--ns-fill-light, #f5f7fa);
+  color: var(--ns-text-regular, #606266);
+  font-size: 12px;
+  line-height: 1.7;
+  text-align: left;
 }
 .ns-error-boundary__code code {
   padding: 1px 6px;

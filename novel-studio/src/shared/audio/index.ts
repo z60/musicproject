@@ -14,6 +14,7 @@ export * from './vad.ts'
 export * from './trim.ts'
 export * from './loudness.ts'
 export * from './peaks.ts'
+export * from './process.ts'
 
 // 类型需要显式 type 导出（Node 的 --experimental-strip-types 会擦除类型）
 export type { VadFrame, VadSliceRange, VadOptionsExt } from './vad.ts'

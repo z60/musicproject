@@ -19,6 +19,7 @@
 
 import { AppError } from '../../../../../shared/errors.ts'
 import type { Book, Id } from '../../../../../shared/types.ts'
+import { dropUndefined } from '../../../../../shared/util/drop-undefined.ts'
 import type { DbLike } from '../../../../infra/db/types.ts'
 import {
   BOOK_PATCH_COLUMNS,
@@ -138,7 +139,8 @@ export function createSqliteBookRepo(db: DbLike): BookRepo {
 
     const sets: string[] = []
     const params: unknown[] = []
-    for (const [key, value] of Object.entries(patch)) {
+    // 只写真正给出的键（undefined = 没给）：见 shared/util/drop-undefined.ts
+    for (const [key, value] of Object.entries(dropUndefined(patch))) {
       const col = BOOK_PATCH_COLUMNS[key]
       if (!col) continue // 忽略不可改的字段（id/projectId/createdAt…）
       sets.push(`${col} = ?`)

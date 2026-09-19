@@ -116,8 +116,13 @@ function runFileIsolated(file: string): Promise<FileResult> {
     // 传 `file://` 字符串会抛 ERR_WORKER_PATH（要传 URL 对象才行）。
     const worker = new Worker(join(ROOT, 'scripts/test-worker.ts'), {
       workerData: { file },
-      // 让 Worker 能直接跑 .ts（类型剥离）
-      execArgv: ['--experimental-strip-types'],
+      // 让 Worker 能直接跑 .ts（类型剥离）；别名加载器让渲染侧源码（`@shared/`、`@/`）
+      // 也能在 Node 里被 import —— 否则「引用了别名的渲染侧模块」永远无法被单测覆盖
+      execArgv: [
+        '--experimental-strip-types',
+        '--import',
+        pathToFileURL(join(ROOT, 'scripts/test-alias-register.mjs')).href,
+      ],
       // 输出全部交回主线程处理，避免污染本轮输出
       stdout: false,
       stderr: false,

@@ -19,6 +19,7 @@
 
 import { AppError } from '../../../../../shared/errors.ts'
 import type { Chapter, ChapterProgress, Id } from '../../../../../shared/types.ts'
+import { dropUndefined } from '../../../../../shared/util/drop-undefined.ts'
 import type { DbLike } from '../../../../infra/db/types.ts'
 import {
   CHAPTER_PATCH_COLUMNS,
@@ -210,7 +211,11 @@ export function createSqliteChapterRepo(db: DbLike): SqliteChapterRepo {
 
     const sets: string[] = []
     const params: unknown[] = []
-    for (const [key, value] of Object.entries(patch)) {
+    // 只写**真正给出**的键：经 IPC 校验器来的 patch 里，没给的可选键也在
+    // （值是 undefined）。照写会 `SET kind = NULL` —— `kind` 是 NOT NULL，
+    // 于是「只改标题」直接报「未预期的错误」；可空的列则被静默清空。
+    // 规则与 settings.applyPatch 一致（见 shared/util/drop-undefined.ts）。
+    for (const [key, value] of Object.entries(dropUndefined(patch))) {
       const col = CHAPTER_PATCH_COLUMNS[key]
       if (!col) continue
       sets.push(`${col} = ?`)

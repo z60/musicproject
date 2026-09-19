@@ -37,12 +37,29 @@ export interface CharacterCentroidRecord {
 export interface CharacterRepo {
   listByBook(bookId: Id, opts?: { includeArchived?: boolean }): Promise<Character[]>
   get(characterId: Id): Promise<Character | null>
-  /** 插入或更新（按 id） */
+  /**
+   * 插入或更新（按 id）。
+   *
+   * ⚠️ **别名由仓储负责**：`character.aliases` 是领域对象的一部分，
+   * 调用方不该记着「另调一次 replaceAliases」。SQLite 实现里别名以
+   * `character_aliases` 表为权威（见该文件顶部说明），本方法在同一个事务里
+   * 把行的字段与别名集合一起写掉。
+   */
   upsert(character: Character): Promise<Character>
   /** 批量写入（一个事务） */
   upsertMany(characters: Character[]): Promise<number>
   /** 归档/恢复（禁止物理删除，docs/11 §4.6） */
   setArchived(characterId: Id, archived: boolean): Promise<Character>
+
+  /**
+   * 整个书里所有角色的别名（含归档角色）。
+   *
+   * 用途：别名冲突检测（`character:merge` / 新增别名前查重）与「按别名反查角色」。
+   * 为什么要一次取整本书而不是逐角色查：冲突检测天然需要**全量**视图，
+   * 而一本书的角色数量级是几十到几百（docs/03 §5.1 说 5~200），一次查完最省。
+   */
+  listAliases(bookId: Id): Promise<Array<{ characterId: Id; alias: string }>>
+
   /** 记录某角色的原型向量（按 characterId + modelId 唯一） */
   upsertCentroid(record: CharacterCentroidRecord): Promise<void>
   getCentroid(characterId: Id, modelId: string): Promise<CharacterCentroidRecord | null>
@@ -114,6 +131,20 @@ export function createMemoryCharacterRepo(seed?: {
       return cloneCharacter(c)
     },
 
+    /**
+     * 内存实现的别名存在 `Character.aliases` 里（唯一的一份）。
+     * SQLite 实现的别名在 `character_aliases` 表里（也是唯一的一份）——
+     * 两个实现都做到「一个角色只有一份别名数据」，因此语义一致。
+     */
+    async listAliases(bookId) {
+      const out: Array<{ characterId: Id; alias: string }> = []
+      for (const c of characters.values()) {
+        if (c.bookId !== bookId) continue
+        for (const alias of c.aliases) out.push({ characterId: c.id, alias })
+      }
+      return out
+    },
+
     async upsertCentroid(record) {
       const acc = accumulatorFrom(record.sumVector, record.sampleCount)
       const derived = accumulatorCentroid(acc)
@@ -156,7 +187,26 @@ export function createMemoryCharacterRepo(seed?: {
 }
 
 function cloneCharacter(c: Character): Character {
-  return { ...c, aliases: [...c.aliases] }
+  return { ...c, aliases: normalizeAliases(c.aliases) }
+}
+
+/**
+ * 别名集合规范化：去空白、去空串、去重，并**按 `localeCompare` 排序**。
+ *
+ * 两个实现必须给出**完全一样的顺序**，否则「以内存实现为基准」的测试会与真机分叉：
+ *   · 只按输入顺序 → 关系表的 rowid 顺序在「删一个再加一个」之后会与输入顺序不同；
+ *   · 只按 SQL `ORDER BY` → SQLite 是**字节序**比较（小 U+5C0F < 老 U+8001），
+ *     而 JS 的 `localeCompare` 是**拼音序**（老 lao < 小 xiao），中文名结果直接相反。
+ * 排序放这里（两边共用同一个函数），行→对象的映射才有唯一口径。
+ */
+export function normalizeAliases(aliases: readonly string[]): string[] {
+  const out: string[] = []
+  for (const a of aliases) {
+    const key = a.trim()
+    if (key.length === 0 || out.includes(key)) continue
+    out.push(key)
+  }
+  return out.sort((a, b) => a.localeCompare(b))
 }
 
 function cloneCentroid(r: CharacterCentroidRecord): CharacterCentroidRecord {

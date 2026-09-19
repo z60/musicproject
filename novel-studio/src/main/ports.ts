@@ -15,6 +15,10 @@
  *   明确未实现：`diagnostics`（导出诊断包需要 zip 写入实现）、
  *             `provider`（真实连通性测试需要 provider HTTP 调用）
  *
+ *   域 handler 的接线情况见 `domainHandlers`：项目包 / 任务包域（`package:*` 7 个通道）
+ *   本轮接通；其中 `.nsp` 导入**只做解包与项目登记，不合并业务数据**（详见
+ *   `features/book/package/package.tasks.ts` 顶部的「实现边界」）。
+ *
  *   未实现的端口**不返回假数据**：调用即抛 `NOT_IMPLEMENTED` 并带上
  *   `params.feature`，与 `handlers/placeholders.ts` 的约定一致 ——
  *   返回空对象会让 UI 显示「导出成功 / 测试通过」这种真假难辨的状态。
@@ -36,8 +40,55 @@ import { createBookHandlers } from './ipc/handlers/book.ts'
 import { createChapterService } from './features/book/chapter/chapter.service.ts'
 import { createChapterHandlers } from './ipc/handlers/chapter.ts'
 import { createSqliteCanvasLineRepo } from './features/book/canvas/repositories/canvas-line.repo.sqlite.ts'
+import { createSqliteChapterRepo } from './features/book/import/repositories/chapter.repo.sqlite.ts'
+import { createSqliteCanvasRepo } from './features/book/canvas/repositories/canvas.repo.sqlite.ts'
+import { createSqliteCharacterRepo } from './features/book/canvas/repositories/character.repo.sqlite.ts'
+import { createCanvasFeature } from './features/book/canvas/index.ts'
+import { createCanvasTasks } from './features/book/canvas/canvas.tasks.ts'
+import { createCanvasHandlers } from './ipc/handlers/canvas.ts'
+import { createCharacterService } from './features/book/canvas/character.service.ts'
+import { createCharacterHandlers } from './ipc/handlers/character.ts'
+import { createAnalysisService } from './features/audio/analysis.service.ts'
+import { createDeviceService } from './features/audio/device.service.ts'
+import { createAudioProjectScope } from './features/audio/project-scope.ts'
+import { createAlignmentService } from './features/audio/alignment.service.ts'
+import { createAlignmentHandlers } from './ipc/handlers/alignment.ts'
+import { createSqliteArrangementRepo } from './features/audio/repositories/arrangement.repo.sqlite.ts'
+import { createRenderTasks } from './features/audio/render.tasks.ts'
+import { createAlignmentLineQueries, createAlignmentSegmentQueries } from './features/audio/alignment.queries.ts'
+import { createFfmpegRunner } from './infra/media/ffmpeg-runner.ts'
+import { createPresetService } from './features/audio/preset.service.ts'
+import { createProcessService } from './features/audio/process.service.ts'
+import { createProcessTasks } from './features/audio/process.tasks.ts'
+import { createProcessingHandlers } from './ipc/handlers/processing.ts'
+import { createMusicService } from './features/audio/music.service.ts'
+import { createMusicHandlers } from './ipc/handlers/music.ts'
+import { createSqliteMusicAssetRepo } from './features/audio/repositories/music.repo.sqlite.ts'
+import { createMixService } from './features/audio/mix.service.ts'
+import { createMixHandlers } from './ipc/handlers/mix.ts'
+import { createSqliteMixProjectRepo } from './features/audio/repositories/mix.repo.sqlite.ts'
+import { createExportService } from './features/audio/export.service.ts'
+import { createExportHandlers } from './ipc/handlers/export.ts'
+import { createExportTasks } from './features/audio/export.tasks.ts'
+import { createSqliteExportJobRepo } from './features/audio/repositories/export-job.repo.sqlite.ts'
+import { createSqlitePresetRepo } from './features/audio/repositories/preset.repo.sqlite.ts'
+import { createPackageService } from './features/book/package/package.service.ts'
+import { createPackageHandlers } from './ipc/handlers/package.ts'
+import { createPackageTasks } from './features/book/package/package.tasks.ts'
+import { createSqlitePackageRepo } from './features/book/package/repositories/package.repo.sqlite.ts'
+import { createRecordService, type RecordPortLike, type RecordService } from './features/audio/record.service.ts'
+import { createTakeService } from './features/audio/take.service.ts'
+import { createAudioHandlers } from './ipc/handlers/audio.ts'
+import { createSqliteAudioMetricsRepo } from './features/audio/repositories/audio-metrics.repo.ts'
+import { createSqliteRecordingSessionRepo } from './features/audio/repositories/recording-session.repo.sqlite.ts'
+import { createSqliteTakeRepo } from './features/audio/repositories/take.repo.sqlite.ts'
+import { createSqliteVoiceSegmentRepo } from './features/audio/repositories/voice-segment.repo.ts'
+import { createSqliteVoiceActorRepo } from './features/book/canvas/repositories/voice-actor.repo.sqlite.ts'
+import { createSqliteBookRepo } from './features/book/import/repositories/book.repo.sqlite.ts'
+import { CANVAS_DEFAULTS, TRIM_DEFAULTS } from '../shared/constants.ts'
 import type { RegisteredHandler } from './ipc/handlers/deps.ts'
 import type { AppState } from './app-state.ts'
+import type { ProcessChain } from '../shared/types.ts'
 
 export interface BuildHandlerDepsOptions {
   state: AppState
@@ -72,6 +123,15 @@ export interface BuiltPorts {
   domainHandlers: RegisteredHandler[]
   /** 书籍导入域服务（供启动期的「确保默认项目」使用） */
   book: BookService
+  /**
+   * 录音域服务（供 `record:port` 的 MessagePort 接管与退出时的会话收敛使用）。
+   *
+   * 为什么必须从这里暴露：端口是 transferable，只能由主入口在 `ipcMain.on('record:port')`
+   * 里拿到，而端口要交给会话 —— 那是本服务的状态。
+   */
+  record: RecordService
+  /** 把渲染进程送来的采集端口交给录音域（`src/main/index.ts` 调用） */
+  attachRecordPort: (port: RecordPortLike) => void
 }
 
 /**
@@ -145,6 +205,65 @@ export function buildHandlerDeps(opts: BuildHandlerDepsOptions): BuiltPorts {
     return fn(createSqliteCanvasLineRepo(db))
   }
 
+  /** 取当前 db 句柄（拿不到就抛 DB_NOT_OPEN，而不是让各域各自编一段错误） */
+  function requireDbFor(feature: string) {
+    const db = state.db
+    if (!db) throw new AppError('DB_NOT_OPEN', { details: { feature } })
+    return db
+  }
+
+  /**
+   * 画本段设置（质检阈值、默认停顿等）。
+   *
+   * 取值级兜底（`?? CANVAS_DEFAULTS`）不是多余防御：真机事故（docs/91 §5.2.3）
+   * 证明库里可能出现**整段为 null** 的设置行，而 `settings.loadFromDb` 只是
+   * 「不把 null 灌进默认树」——它保证的是「正常情况下是对象」，不是「永远是对象」。
+   * 这里再兜一次，代价是一次 `??`，收益是画本域永远不会因为设置缺项而炸。
+   */
+  function canvasSettings(): AppSettings['canvas'] {
+    return state.requireSettings().current().canvas ?? CANVAS_DEFAULTS
+  }
+
+  // 画本域任务（生成画本 / 重算判定）：与导入域同一套做法 —— 队列先建好，
+  // 再把本域的 TaskSpec 注册进去，然后才能入队。
+  const canvasTasks = createCanvasTasks({
+    getDb: () => state.db,
+    queue,
+    log,
+    limits: {
+      maxLineChars: canvasSettings().maxLineChars,
+      shortLineChars: canvasSettings().shortLineChars,
+      maxNarrationRun: canvasSettings().maxNarrationRun,
+    },
+  })
+  for (const spec of canvasTasks.taskSpecs()) queue.registerSpec(spec)
+
+  // ── 角色与配音员域 ───────────────────────────────────────────────────────
+  // 与画本域同一层层级：角色表既是判定（原型向量）的输入，也是编辑器的角色面板。
+  // 它**不持有**仓储实例：`repo()` 每次调用现取，兼容「从备份恢复」换连接。
+  const characterService = createCharacterService({
+    repo: () => {
+      const db = requireDbFor('character')
+      return {
+        characters: createSqliteCharacterRepo(db),
+        actors: createSqliteVoiceActorRepo(db),
+        canvas: createSqliteCanvasRepo(db),
+      }
+    },
+    chapters: {
+      listByBook: (bookId) => createSqliteChapterRepo(requireDbFor('character')).listByBook(bookId),
+      getText: (chapterId) => createSqliteChapterRepo(requireDbFor('character')).getText(chapterId),
+    },
+    listProjectActors: async (bookId) => {
+      const db = requireDbFor('character')
+      const book = await createSqliteBookRepo(db).findById(bookId)
+      if (!book) return []
+      return createSqliteVoiceActorRepo(db).listByProject(book.projectId)
+    },
+    queue,
+    log,
+  })
+
   const chapterService = createChapterService({
     getDb: () => state.db,
     log,
@@ -158,9 +277,296 @@ export function buildHandlerDeps(opts: BuildHandlerDepsOptions): BuiltPorts {
     },
   })
 
+  // ── 音频域（分析 / 设备 / take / 录音）──────────────────────────────────
+  // 音频文件按「项目根相对路径」落库，读盘时**必须再拼一个 projectId**
+  // （`{projectRoot}/{projectId}/{rel}`，与 ns-media 协议同一口径，见 docs/91 §5.2.19）。
+  // 各服务都不持有仓储实例：db 与项目根都可能被「从备份恢复」换掉。
+  const audioScope = createAudioProjectScope({ getDb: () => state.db })
+
+  /**
+   * 事件端口在 `deps` 里定义（它需要 windowManager），而录音服务要在那之前构造。
+   * 用一个**延迟读取的占位**接上：录音服务只在真正录制时才发 `record:status`，
+   * 那时 `deps` 早已装配完成。直接传 `undefined` 会让状态事件永远发不出去。
+   */
+  let eventsPort: HandlerDeps['events'] | null = null
+
+  /** 画本行的章节 id：写 take / 成品行（`voice_segments.chapter_id`）要用它 */
+  async function lineChapterId(lineId: string): Promise<string | null> {
+    const db = requireDbFor('audio')
+    const row = db
+      .prepare(`SELECT chapter_id FROM canvas_lines WHERE id = ? AND deleted_at IS NULL`)
+      .get(lineId) as { chapter_id: string } | undefined
+    return row?.chapter_id ?? null
+  }
+
+  const analysisService = createAnalysisService({
+    getDb: () => state.db,
+    projectRoot: () => paths.projectRoot,
+    scope: audioScope,
+    metricsRepo: () => createSqliteAudioMetricsRepo(requireDbFor('analysis')),
+    log,
+  })
+  const deviceService = createDeviceService({ settings: () => state.requireSettings(), log })
+  const takeService = createTakeService({
+    projectRoot: () => paths.projectRoot,
+    scope: audioScope,
+    takeRepo: () => createSqliteTakeRepo(requireDbFor('take')),
+    segmentRepo: () => createSqliteVoiceSegmentRepo(requireDbFor('take')),
+    lineChapterId,
+    log,
+  })
+  const recordService = createRecordService({
+    projectRoot: () => paths.projectRoot,
+    scope: audioScope,
+    sessionRepo: () => createSqliteRecordingSessionRepo(requireDbFor('record')),
+    takeRepo: () => createSqliteTakeRepo(requireDbFor('record')),
+    segmentRepo: () => createSqliteVoiceSegmentRepo(requireDbFor('record')),
+    lineChapterId,
+    /** 匹配切片要按行文本长度估算期望时长（docs/05 §4.2 的 charsPerSecond） */
+    lineCharCounts: async (chapterId) => {
+      const db = requireDbFor('record')
+      const rows = db
+        .prepare(
+          `SELECT id AS line_id, LENGTH(COALESCE(text, '')) AS char_count
+             FROM canvas_lines
+            WHERE chapter_id = ? AND deleted_at IS NULL
+            ORDER BY seq ASC`,
+        )
+        .all(chapterId) as Array<{ line_id: string; char_count: number }>
+      return rows.map((r) => ({ lineId: r.line_id, charCount: r.char_count }))
+    },
+    audioSettings: () => {
+      // VAD 参数在 `recording.vad`，修剪参数散在 `audio.*`（docs/21 §12 的设置分组就这样）
+      const settings = state.requireSettings().current()
+      const trim = {
+        enabled: settings.audio?.autoTrim ?? TRIM_DEFAULTS.enabled,
+        thresholdDb: settings.audio?.trimThresholdDb ?? TRIM_DEFAULTS.thresholdDb,
+        headPaddingMs: settings.audio?.trimPaddingMs ?? TRIM_DEFAULTS.headPaddingMs,
+        tailPaddingMs: settings.audio?.trimPaddingMs ?? TRIM_DEFAULTS.tailPaddingMs,
+      }
+      return {
+        trim,
+        ...(settings.recording?.vad ? { vad: settings.recording.vad } : {}),
+      }
+    },
+    events: { emit: (event, payload) => eventsPort?.emit(event as IpcEventName, payload as never) },
+    log,
+  })
+
+  // ── 处理链与预设域（`process:*` / `preset:*`）───────────────────────────
+  // ffmpeg 执行器是唯一真正 spawn 进程的地方；路径来自启动期能力探测
+  // （`capabilities.ffmpeg.path`），未探到时交给 PATH —— 不硬编码绝对路径。
+  const ffmpegRunner = createFfmpegRunner({
+    ffmpegPath: () => state.capabilities?.ffmpeg.path ?? 'ffmpeg',
+    log: { info: log.info.bind(log), warn: log.warn.bind(log) },
+  })
+  const presetService = createPresetService({
+    repo: () => createSqlitePresetRepo(requireDbFor('preset')),
+    log,
+  })
+  /** 预设/显式链 → 具体链（处理任务与试听共用同一条解析路径，避免两处判断不一致） */
+  const resolveProcessChain = async (presetId?: string | null, chain?: ProcessChain | null) => {
+    const resolved = await presetService.resolveChain(presetId ?? null, chain ?? null)
+    return resolved.chain
+  }
+  const processTasks = createProcessTasks({
+    getDb: () => state.db,
+    queue,
+    ffmpeg: ffmpegRunner,
+    projectRoot: () => paths.projectRoot,
+    resolveChain: resolveProcessChain,
+    log,
+  })
+  for (const spec of processTasks.taskSpecs()) queue.registerSpec(spec)
+  const processService = createProcessService({
+    getDb: () => state.db,
+    projectRoot: () => paths.projectRoot,
+    tasks: processTasks,
+    ffmpeg: ffmpegRunner,
+    resolveChain: resolveProcessChain,
+    log,
+  })
+
+  // ── 对轨域（`alignment:*` 19 个通道）────────────────────────────────────
+  // 预览渲染是唯一需要真跑 ffmpeg 的对轨动作（其余都是「读库 → 纯函数 → 写库」）。
+  const renderTasks = createRenderTasks({
+    getDb: () => state.db,
+    queue,
+    ffmpeg: ffmpegRunner,
+    projectRoot: () => paths.projectRoot,
+    log,
+  })
+  for (const spec of renderTasks.taskSpecs()) queue.registerSpec(spec)
+
+  const alignmentService = createAlignmentService({
+    getDb: () => state.db,
+    projectRoot: () => paths.projectRoot,
+    repo: () => createSqliteArrangementRepo(requireDbFor('alignment')),
+    /** 画本行 + 角色轨道 + 留白（对轨的唯一输入来源） */
+    /** 画本行 + 角色轨道 + 留白（对轨的唯一输入来源；SQL 在 alignment.queries.ts） */
+    lines: createAlignmentLineQueries(() => requireDbFor('alignment')),
+    /** 片段查询与绑定（含「目标行已被占用」的判定） */
+    segments: createAlignmentSegmentQueries(() => requireDbFor('alignment')),
+    render: { enqueuePreview: (payload) => renderTasks.enqueuePreview(payload) },
+    audioSettings: () => {
+      const settings = state.requireSettings().current()
+      return settings.recording?.vad ? { vad: settings.recording.vad } : {}
+    },
+    log,
+  })
+
+  // ── 素材域（`music:*` 4 个通道）──────────────────────────────────────────
+  // 导入即托管（复制到 `music/{kind}/`）：引用用户的原路径会让「整理素材目录」变成
+  // 「所有 BGM 轨失效」。探测非 WAV 素材需要 ffmpeg（解码成临时 WAV 再测）。
+  const musicService = createMusicService({
+    getDb: () => state.db,
+    projectRoot: () => paths.projectRoot,
+    repo: () => createSqliteMusicAssetRepo(requireDbFor('music')),
+    projectExists: async (projectId) => {
+      const db = requireDbFor('music')
+      const row = db.prepare(`SELECT id FROM projects WHERE id = ?`).get(projectId)
+      return row !== undefined
+    },
+    ffmpeg: ffmpegRunner,
+    log,
+  })
+
+  // ── 混音域（`mix:*` 7 个通道）────────────────────────────────────────────
+  // 方案整份以 JSON 存（契约的 `mix:save` 传的就是整份），保存时校验引用关系；
+  // 响度测量走 ffmpeg 的 loudnorm 第一遍（唯一能拿到标准 LUFS 的途径）。
+  const mixService = createMixService({
+    getDb: () => state.db,
+    projectRoot: () => paths.projectRoot,
+    repo: () => createSqliteMixProjectRepo(requireDbFor('mix')),
+    scope: audioScope,
+    ffmpeg: ffmpegRunner,
+    arrangementChapterId: async (arrangementId) => {
+      const db = requireDbFor('mix')
+      const row = db.prepare(`SELECT chapter_id FROM arrangements WHERE id = ?`).get(arrangementId) as
+        | { chapter_id: string }
+        | undefined
+      return row?.chapter_id ?? null
+    },
+    log,
+  })
+
+  // ── 导出域（export:*；本轮实现预检 / 报告 / 验收 / 定位 / VBR 档位）──────
+  // 三个渲染任务（chapter/book/m4b）需要完整混音管线，仍在下一轮：它们不在
+  // EXPORT_CHANNELS 里，占位清单会如实列出。
+  const exportTasks = createExportTasks({
+    getDb: () => state.db,
+    queue,
+    ffmpeg: ffmpegRunner,
+    projectRoot: () => paths.projectRoot,
+    repo: () => createSqliteExportJobRepo(requireDbFor('export')),
+    log,
+  })
+  for (const spec of exportTasks.taskSpecs()) queue.registerSpec(spec)
+  const exportService = createExportService({
+    getDb: () => state.db,
+    projectRoot: () => paths.projectRoot,
+    repo: () => createSqliteExportJobRepo(requireDbFor('export')),
+    ffmpeg: ffmpegRunner,
+    showItemInFolder: (path) => opts.showItemInFolder(path),
+    log,
+  })
+
+  // ── 项目包 / 任务包域（`package:*` 7 个通道）─────────────────────────────
+  // 三个长任务（导出 .nsp / .nst、导入 .nsp、回收合并 .nst）都走队列：
+  // 导出可能写几 GB、合并要逐条写音频，卡在 IPC 里会把整个界面拖住。
+  // projectRoot 与 db **按调用现取**（库可能被「从备份恢复」换掉），与 exportTasks 同一做法。
+  const packageTasks = createPackageTasks({
+    getDb: () => state.db,
+    queue,
+    projectRoot: () => paths.projectRoot,
+    // 包默认落在设置里的导出目录；设置里没写就退回启动期算出来的默认值
+    exportDir: () => state.requireSettings().current().paths?.exportDir || paths.exportDir,
+    app: () => ({ name: 'Novel Studio', version: opts.version }),
+    repo: () => createSqlitePackageRepo(requireDbFor('package')),
+    log,
+  })
+  for (const spec of packageTasks.taskSpecs()) queue.registerSpec(spec)
+  const packageService = createPackageService({
+    getDb: () => state.db,
+    repo: () => createSqlitePackageRepo(requireDbFor('package')),
+    tasks: packageTasks,
+    /** 历史列表里的配音员名：查不到给 null（模板串会显示「未知配音员」，不编假名字） */
+    actorName: (actorId) => {
+      const row = requireDbFor('package')
+        .prepare(`SELECT name FROM voice_actors WHERE id = ?`)
+        .get(actorId) as { name: string } | undefined
+      return row?.name ?? null
+    },
+    log,
+  })
+
   const domainHandlers: RegisteredHandler[] = [
     ...createBookHandlers(bookService),
     ...createChapterHandlers(chapterService),
+    ...createCanvasHandlers({
+      // 画本域的上下文**每次调用现取**（理由同 withCanvasRepo：库可能被换掉）
+      ctx: () => {
+        const db = requireDbFor('canvas')
+        const canvasRepo = createSqliteCanvasRepo(db)
+        const characterRepo = createSqliteCharacterRepo(db)
+        return {
+          feature: createCanvasFeature({
+            canvasRepo,
+            characterRepo,
+            // 生产环境**没有** ONNX 推理实现（`capabilities.embedding.available` 恒为 false，
+            // 见 docs/91 §3）。传 null 会走规则判定并给出 `CANVAS_EMBEDDING_UNAVAILABLE` 警告 ——
+            // 这正是 docs/06 §8 的要求：「绝不因为模型缺失就阻断用户」。
+            // 传一个假 provider 才是错的：那会让 `report.embeddingUsed` 说谎。
+            embedProvider: null,
+            llmReviewer: null,
+            log: { info: log.info.bind(log), warn: log.warn.bind(log), error: log.error.bind(log) },
+          }),
+          canvasRepo,
+          chapters: createSqliteChapterRepo(db),
+        }
+      },
+      tasks: canvasTasks,
+      canvasSettings,
+      exportDir: () =>
+        state.requireSettings().current().paths?.exportDir || paths.exportDir,
+      log: { info: log.info.bind(log), warn: log.warn.bind(log) },
+    }),
+    ...createCharacterHandlers({
+      service: characterService,
+      log: { info: log.info.bind(log), warn: log.warn.bind(log) },
+    }),
+    ...createAudioHandlers({
+      analysis: analysisService,
+      device: deviceService,      take: takeService,
+      record: recordService,
+      log: { info: log.info.bind(log), warn: log.warn.bind(log) },
+    }),
+    ...createProcessingHandlers({
+      process: processService,
+      preset: presetService,
+      log: { info: log.info.bind(log), warn: log.warn.bind(log) },
+    }),
+    ...createAlignmentHandlers({
+      alignment: alignmentService,
+      log: { info: log.info.bind(log), warn: log.warn.bind(log) },
+    }),
+    ...createMusicHandlers({
+      music: musicService,
+      log: { info: log.info.bind(log), warn: log.warn.bind(log) },
+    }),
+    ...createMixHandlers({
+      mix: mixService,
+      log: { info: log.info.bind(log), warn: log.warn.bind(log) },
+    }),
+    ...createExportHandlers({
+      export: exportService,
+      tasks: exportTasks,
+      log: { info: log.info.bind(log), warn: log.warn.bind(log) },
+    }),
+    ...createPackageHandlers({
+      pkg: packageService,
+      log: { info: log.info.bind(log), warn: log.warn.bind(log) },
+    }),
   ]
 
   const dbPort = createDbPort({
@@ -205,7 +611,6 @@ export function buildHandlerDeps(opts: BuildHandlerDepsOptions): BuiltPorts {
 
   const deps: HandlerDeps = {
     log,
-
     // ── 应用信息与路径（完整实现）──────────────────────────────────────────
     env: {
       getInfo: () => ({
@@ -340,7 +745,17 @@ export function buildHandlerDeps(opts: BuildHandlerDepsOptions): BuiltPorts {
     },
   }
 
-  return { deps, queue, domainHandlers, book: bookService }
+  // 录音服务的事件端口在这里接上（它构造时 `deps` 还没成型，见上面的说明）
+  eventsPort = deps.events
+
+  return {
+    deps,
+    queue,
+    domainHandlers,
+    book: bookService,
+    record: recordService,
+    attachRecordPort: (port) => recordService.attachIncomingPort(port),
+  }
 }
 
 /** 当前能力快照；未探测时给出「全都不可用」的诚实默认值，而不是假装可用 */

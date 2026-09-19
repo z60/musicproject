@@ -32,7 +32,8 @@ import {
   INNER_CUE_VERBS,
   NON_NAME_TOKENS,
   countReadableChars,
-  guessNameFromWindow,
+  guessNameVariants,
+  looksLikePersonName,
   matchCue,
 } from './attribution.ts'
 
@@ -146,6 +147,9 @@ export function extractCharacterCandidates(
     if (name.length < 2) return
     if (stopwords.has(name)) return
     if (!/^[\u4e00-\u9fa5A-Za-z·]+$/.test(name)) return
+    // 字型检查：窗口规则会把「无奈 / 续开口 / 的丑陋」这种状语、动词碎片当成人名，
+    // 必须在这里挡掉（真机反馈见 docs/91 §5.2.14）
+    if (!looksLikePersonName(name)) return
     const rec = hits.get(name) ?? {
       positions: new Set<string>(),
       viaCue: 0,
@@ -165,19 +169,19 @@ export function extractCharacterCandidates(
   // ---- 信号 1：引导语前 2~6 字窗口的人名 ----
   const cueVerbs = [...CUE_VERBS, ...INNER_CUE_VERBS].sort((a, b) => b.length - a.length)
   const cueRe = new RegExp(
-    `([\\u4e00-\\u9fa5]{1,6}?)(?:${cueVerbs.map(escapeRe).join('|')})(?:道|着|了一声)?\\s*[：:，,。]`,
+    // 窗口里允许间隔号「·」：译名常写成「诺顿·阿兰」，不含它就只能抽到「阿兰」
+    `([\\u4e00-\\u9fa5·]{1,6}?)(?:${cueVerbs.map(escapeRe).join('|')})(?:道|着|了一声)?\\s*[：:，,。]`,
     'g',
   )
   for (const m of text.matchAll(cueRe)) {
     const window = m[1]
     const at = m.index ?? 0
-    const name = guessNameFromWindow(window)
-    // 用字符偏移做去重键：同一处出现的名字被「引导语」和「称谓」两条信号同时命中时只算一次
-    if (name) bump(name, 'cue', `at@${at}`)
-    // 窗口里可能同时出现「药老皱眉」这种带修饰语的形态，做一次最长后缀尝试
-    if (name && window.length > name.length) {
-      const extra = guessNameFromWindow(window.slice(0, window.length - name.length))
-      if (extra && extra !== name) bump(extra, 'cue', `cue-sub@${at}`)
+    // 一个窗口可能同时是「全名」与「带修饰语的名字」：
+    //   `独眼多特冷笑` → 剥掉修饰语后是全名「独眼多特」；`药老皱眉` → 「药老」
+    // 所以把「剥完修饰语的整体」与「末尾 3/2 字」都作为候选提交，
+    // 再由后面的片段收敛按**出现位置是否被长者覆盖**决定留谁（子串关系不足以判断）。
+    for (const candidate of guessNameVariants(window)) {
+      bump(candidate, 'cue', `at@${at}`)
     }
   }
 
@@ -188,9 +192,19 @@ export function extractCharacterCandidates(
       const word = pattern.build(m as unknown as RegExpExecArray)
       if (pattern.stop.includes(word)) continue
       if (stopwords.has(word)) continue
-      // 「老X / 小X」后面跟着动词/助词时几乎都不是人名（老抚须笑道 → 老抚）
+    // 「老X / 小X」后面跟着动词/助词时几乎都不是人名（老抚须笑道 → 老抚）
       if (pattern.id === 'lao' || pattern.id === 'xiao') {
         if (NON_NAME_FOLLOWING.has(m[1])) continue
+      }
+      /**
+       * 「X儿 / X兄」当**后缀词**用时极易命中长词的一部分：`员工兄弟` → 「工兄」、
+       * `一会儿` → 「会儿」。判据：捕获到的词若紧跟在另一个汉字后面，就是长词的一部分，
+       * 不是独立称谓（`炎儿，你来了` / 换行后的 `张兄` 前面不是汉字，照常保留）。
+       * 只对「单字核心 + 后缀」这两个模式生效 —— `老X / 小X / X长老` 是前缀式，不受此限。
+       */
+      if (pattern.id === 'er' || pattern.id === 'xiong') {
+        const before = (m.index ?? 0) > 0 ? text[(m.index ?? 0) - 1] : ''
+        if (before && /[\u4e00-\u9fa5]/.test(before)) continue
       }
       appellations.set(word, (appellations.get(word) ?? 0) + 1)
       bump(word, 'appellation', `at@${m.index ?? 0}`)
@@ -245,20 +259,207 @@ export function extractCharacterCandidates(
   }
 
   // ---- 过滤与排序 ----
-  const out: CharacterCandidate[] = []
+  /**
+   * 一次扫描建立「候选名 → 出现位置」索引。
+   *
+   * ⚠️ 性能：整本书抽取时正文可达一两百万字、候选上千个。
+   * 每个候选各扫一遍全文（`indexOf` 循环）是 O(候选 × 正文)，
+   * 后面的「覆盖率」判定又是候选两两比较 —— 实测会让整本书抽取**跑几分钟**（超时）。
+   * 所以这里做一次 O(正文) 的扫描，之后所有统计与两两判定都只在位置数组上做。
+   */
+  const names = [...hits.keys()]
+  const positions = indexOccurrences(text, names)
+
+  const observations: Array<{ name: string; rec: (typeof hits) extends Map<string, infer V> ? V : never; pos: number[] }> = []
   for (const [name, rec] of hits) {
-    const count = rec.positions.size
-    // 只出现一次且不是引导语里出现的，大概率是噪声
-    if (count < minOccurrences && rec.viaCue === 0) continue
-    out.push({
-      name,
-      aliases: [...rec.aliases],
-      occurrences: count,
-      firstChapterTitle: opts?.chapterTitle ?? null,
-    })
+    observations.push({ name, rec, pos: positions.get(name) ?? [] })
   }
+
+  // 先按「语料里的实际出现次数」筛一遍（便宜），再做贵的片段收敛 —— 顺序很重要
+  const strict = minOccurrences >= 2
+  const survived = observations.filter((o) => {
+    if (o.pos.length < minOccurrences) return false
+    /**
+     * 严格模式（默认）再加一条：它必须在正文里**至少有一次不紧跟言语引导语**的出现。
+     *
+     * 为什么必须有这条：单字引导语（道/说/问）会命中复合词 —— `知道，` `下水道，` `难道，`
+     * 于是「要知 / 不知 / 下水」都会被抽出来，而它们**每一次**出现都是复合词的一部分。
+     * 真角色则相反：叙述里到处都在提他的名字（`叶海摊摊手` `苏哲点点头`）。
+     * 宽松模式（minOccurrences=1）刻意关掉这条，保留「宁可多给也不漏」的行为。
+     */
+    if (strict && !o.pos.some((p) => isStandaloneAt(text, p, o.name.length))) return false
+    return true
+  })
+
+  // 片段收敛：把「只是某个更长候选的一部分」的碎片去掉（拉希 ⊂ 拉希德、眼多特 ⊂ 独眼多特）
+  const collapsed = collapseCoveredFragments(text, survived)
+
+  /**
+   * 简称并入全名：`阿兰` 的绝大多数出现都落在 `诺顿·阿兰` 里 → 它是**别名**而不是另一个角色。
+   *
+   * 阈值取 0.8 而不是 1.0：简称偶尔会独立出现（`阿兰道：`），
+   * 而 1.0 会让它作为独立候选留在列表里，让用户误以为抽出了两个角色。
+   * 两个**真正不同**的角色（`林轩` 与 `林轩宇`）覆盖率会明显偏低（各有一半独立出现），不会被并入。
+   */
+  const merged = mergeShortFormsIntoFullNames(text, collapsed)
+
+  const out: CharacterCandidate[] = merged
+    .filter((m) => !isPrefixFragmentOfFrequent(m, merged))
+    .map((m) => ({
+      name: m.name,
+      aliases: [...m.rec.aliases],
+      occurrences: m.pos.length,
+      firstChapterTitle: opts?.chapterTitle ?? null,
+    }))
+  // 出现越多越可能是主要角色 → 降序；同次数按名字稳定排序（结果可复现）
   out.sort((a, b) => b.occurrences - a.occurrences || a.name.localeCompare(b.name))
   return out.slice(0, maxCandidates)
+}
+
+/** 候选（名字 + 信号记录 + 出现位置） */
+interface Observation {
+  name: string
+  rec: { positions: Set<string>; viaCue: number; viaAppellation: number; viaNer: number; aliases: Set<string> }
+  pos: number[]
+}
+
+/** 引导语动词的**首字**集合（判断「名字后面是不是紧跟着言语引导语」用） */
+const CUE_VERB_HEADS = new Set(
+  [...CUE_VERBS, ...INNER_CUE_VERBS].filter((v) => v.length > 0).map((v) => v[0]!),
+)
+
+/** 位置 `pos` 处的 `len` 字是否**不紧跟**言语引导语（`不知道` 里的「不知」紧跟「道」） */
+function isStandaloneAt(text: string, pos: number, len: number): boolean {
+  return !CUE_VERB_HEADS.has(text[pos + len] ?? '')
+}
+
+/**
+ * 一次扫描建立「候选名 → 全部出现位置」。
+ *
+ * 做法：先按**首字**把候评分桶，然后扫一遍正文，只在首字命中时才做 `startsWith` 比较。
+ * 候选上千、正文一两百万字时这仍是可行量级（首字命中是小概率事件）。
+ */
+function indexOccurrences(text: string, names: readonly string[]): Map<string, number[]> {
+  const byFirst = new Map<string, string[]>()
+  for (const name of names) {
+    const first = name[0]!
+    const list = byFirst.get(first)
+    if (list) list.push(name)
+    else byFirst.set(first, [name])
+  }
+  const out = new Map<string, number[]>()
+  for (const name of names) out.set(name, [])
+  for (let i = 0; i < text.length; i++) {
+    const cands = byFirst.get(text[i]!)
+    if (!cands) continue
+    for (const name of cands) {
+      if (text.startsWith(name, i)) out.get(name)!.push(i)
+    }
+  }
+  return out
+}
+
+/**
+ * 去掉「完全被更长候选覆盖」的片段。
+ *
+ * 判据：若候选 X 的**每一次出现**都落在某个更长候选 Y 的出现区间内，
+ * 那 X 就不是一个独立的名字，只是 Y 的一部分 → 丢掉 X。
+ *
+ * 为什么不能简单地「短名是长名子串就丢」：`林轩` 与 `林轩宇` 可能是**两个不同角色**
+ * （林轩有 5 次是独立出现的），这种必须都留下。所以要看**出现位置**，不看字符串包含关系。
+ */
+function collapseCoveredFragments(text: string, candidates: Observation[]): Observation[] {
+  void text
+  // 长者优先判定（同长度时保留出现次数多的）
+  const ordered = [...candidates].sort(
+    (a, b) => b.name.length - a.name.length || b.pos.length - a.pos.length || a.name.localeCompare(b.name),
+  )
+  const kept: Observation[] = []
+  for (const cand of ordered) {
+    const covered = kept.some((longer) => isFullyCoveredBy(cand, longer))
+    if (!covered) kept.push(cand)
+  }
+  return kept
+}
+
+/** 短名的每一次出现是否都落在长名的某个出现区间内 */
+function isFullyCoveredBy(short: Observation, long: Observation): boolean {
+  return coverageRatio(short, long) >= 1
+}
+
+/**
+ * 短名的出现里有多大比例落在长名的出现区间内（0~1）。
+ *
+ * 用途见 `mergeShortFormsIntoFullNames`：覆盖率高（≥0.8）说明短名基本只是长名的一部分，
+ * 应当作为别名并入；覆盖率低（两个真角色各有一半独立出现）则必须都保留。
+ *
+ * 实现走**位置数组 + 二分**，不再扫正文（整本书抽取时正文可达百万字，逐个扫会超时）。
+ */
+function coverageRatio(short: Observation, long: Observation): number {
+  if (short.name === long.name || short.name.length >= long.name.length) return 0
+  if (short.pos.length === 0 || long.pos.length === 0) return 0
+  let inside = 0
+  for (const p of short.pos) {
+    // 找最后一个「起点 ≤ p」的长名出现
+    let lo = 0
+    let hi = long.pos.length - 1
+    let best = -1
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1
+      if (long.pos[mid]! <= p) {
+        best = mid
+        lo = mid + 1
+      } else {
+        hi = mid - 1
+      }
+    }
+    // 覆盖它的那次出现必须延伸到短名之后（`阿兰` 落在 `诺顿·阿兰` 内）
+    if (best >= 0 && long.pos[best]! + long.name.length >= p + short.name.length) inside++
+  }
+  return inside / short.pos.length
+}
+
+/**
+ * 把「简称」并入更长的全名（`阿兰` → `诺顿·阿兰` 的别名），返回并入后的候选列表。
+ *
+ * 判据：短名的出现有 ≥80% 落在某个更长候选的出现区间内。
+ * 这样既能收掉「同一个人出现两个候选」，又不会把两个真正不同的角色（`林轩` / `林轩宇`）并掉。
+ */
+function mergeShortFormsIntoFullNames(text: string, candidates: Observation[]): Observation[] {
+  void text
+  const byLengthDesc = [...candidates].sort(
+    (a, b) => b.name.length - a.name.length || b.pos.length - a.pos.length || a.name.localeCompare(b.name),
+  )
+  const out: Observation[] = []
+  for (const cand of byLengthDesc) {
+    const owner = out.find(
+      (longer) => longer.name.length > cand.name.length && coverageRatio(cand, longer) >= 0.8,
+    )
+    if (!owner) {
+      out.push(cand)
+      continue
+    }
+    // 并入别名（去重；别名本身也不再作为独立候选）
+    if (!owner.rec.aliases.has(cand.name)) owner.rec.aliases.add(cand.name)
+  }
+  return out
+}
+
+/**
+ * 丢掉「真名的前缀碎片」：`叶海微`（来自 `叶海微笑道`）之于 `叶海`。
+ *
+ * 判据：X 比 Y 长、Y 是 X 的前缀、且 Y 的出现次数是 X 的 **10 倍以上**。
+ * 10 倍这个量级是刻意的：真名在语料里压倒性地多（叶海 9342 : 叶海微 238 ≈ 39 倍），
+ * 而两个**真正不同**的角色（`林轩` 10 次 / `林轩宇` 5 次）差值很小，绝不会被误删。
+ */
+function isPrefixFragmentOfFrequent(cand: Observation, all: readonly Observation[]): boolean {
+  return all.some(
+    (other) =>
+      other !== cand &&
+      other.name.length < cand.name.length &&
+      cand.name.startsWith(other.name) &&
+      other.pos.length >= cand.pos.length * 10,
+  )
 }
 
 function escapeRe(s: string): string {

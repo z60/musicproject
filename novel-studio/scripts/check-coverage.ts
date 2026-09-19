@@ -132,8 +132,12 @@ const mainText = mainSrcFiles.map(f => fileText.get(rel(f)) ?? '').join('\n')
  *   · 对象字面量：`channel: 'app:getInfo' as IpcChannel`
  *   · h() 工厂：  `h('app:getInfo', ...)` / `h(\n  'app:getInfo',`（多行实参）
  * 这是「显式声明实现了」的最强信号。
+ *
+ * ⚠️ 通道名里**可以带数字**（`export:m4b` 就是），所以字符类必须含 `0-9`。
+ * 旧写法 `[a-zA-Z]+:[a-zA-Z]+` 会把它判成「未实现」—— 判据过窄会让统计**偏低**，
+ * 而这与虚报一样是错误的方法（本文件第 118 行的同一原则）。
  */
-const CHANNEL_LITERAL = String.raw`'[a-zA-Z]+:[a-zA-Z]+'`
+const CHANNEL_LITERAL = String.raw`'[a-zA-Z][a-zA-Z0-9]*:[a-zA-Z][a-zA-Z0-9]*'`
 const DECLARED_PATTERNS = [
   new RegExp(String.raw`channel:\s*(${CHANNEL_LITERAL})`, 'g'),
   // h( 之后允许空白与换行（多行调用很常见）

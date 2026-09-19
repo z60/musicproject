@@ -925,6 +925,21 @@ export const MESSAGES = {
     severity: 'warning', action: 'dismiss',
     params: ['count'],
   },
+  /**
+   * 队列端口没有注入（启动期装配缺项 / 无库的降级路径）。
+   *
+   * 为什么单独一条而不是复用 `TASK_FAILED`：这类失败**不是任务失败**（任务根本没入队），
+   * 用户的下一步动作也不同（重试没用，要看装配/启动日志）。
+   * 之前 `canvas.tasks` / 导入域已经用这个 key 抛错，但它不在消息表里 →
+   * 用户看到的是「内部错误」，把「环境问题」伪装成了「程序 bug」（docs/91 §5.2.20 记了这一条）。
+   */
+  TASK_QUEUE_UNAVAILABLE: {
+    title: '后台任务队列不可用',
+    detail: '当前无法提交后台任务，本次操作没有执行。',
+    hint: '请重启应用；若持续出现，请导出诊断包（启动日志里会有装配失败的原因）。',
+    severity: 'error', action: 'dismiss',
+    dev: 'HandlerDeps 里没有 TaskQueue：多为启动期装配缺项，或运行在无库/测试的降级路径。',
+  },
   TASK_NOT_FOUND: {
     title: '任务不存在或已结束',
     severity: 'info', action: 'dismiss',
@@ -1083,7 +1098,8 @@ const SEGMENTS: ReadonlyArray<{ segment: number; label: string; keys: readonly M
   },
   {
     segment: 8, label: 'TASK',
-    keys: ['TASK_FAILED', 'TASK_INTERRUPTED', 'TASK_QUEUE_FULL', 'TASK_NOT_FOUND'],
+    // 追加在段末尾（docs/91 的纪律：发布后只能在末尾追加，否则历史日志里的编号会指向别的错误）
+    keys: ['TASK_FAILED', 'TASK_INTERRUPTED', 'TASK_QUEUE_FULL', 'TASK_NOT_FOUND', 'TASK_QUEUE_UNAVAILABLE'],
   },
   {
     segment: 9, label: 'APP',

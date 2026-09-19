@@ -164,6 +164,141 @@ describe('角色抽取：三种信号（docs/11 §4.6）', () => {
 })
 
 // ---------------------------------------------------------------------------
+// 精度：真机反馈的「抽出一堆短语碎片」
+// ---------------------------------------------------------------------------
+
+/**
+ * 用户真机反馈（原样）：整本书抽取抽出 7 个候选，全是短语碎片 ——
+ * 的丑陋 / 毫无疑 / 骂咧咧 / 模样不 / 丧尸星 / 嫌弃的 / 一通。
+ *
+ * 根因：`guessNameFromWindow` 的规则是「取引导语前窗口的末尾 2~4 字」，
+ * 对 `萧炎沉声道：` 它是对的，但对 `无奈道：` `继续开口说道：` 它就给出状语/动词碎片。
+ */
+describe('角色抽取：短语碎片必须被挡住（真机回归）', () => {
+  /** 用户截图里那 7 个候选，写成一句包含它们来源的正文 */
+  const REAL_JUNK_TEXT = [
+    '他看着自己那丑陋的模样，不禁毫无疑心。',
+    '「你他娘的骂咧咧个什么？」',
+    '她一脸嫌弃的看了他一眼。',
+    '他模样不像好人，却挨了一通骂。',
+    '丧尸星上，他握紧了手里的枪。',
+  ].join('\n')
+
+  it('真机那 7 个碎片不出现在候选里', () => {
+    const names = extractCharacterCandidates(REAL_JUNK_TEXT, { minOccurrences: 1 }).map((c) => c.name)
+    for (const junk of ['的丑陋', '毫无疑', '骂咧咧', '模样不', '嫌弃的', '一通']) {
+      assert.ok(!names.includes(junk), `不应抽出「${junk}」：${JSON.stringify(names)}`)
+    }
+  })
+
+  it('状语/动词碎片不算候选：无奈道 / 笑着道 / 继续开口道 / 耸耸肩道', () => {
+    // 注意：真角色必须同时出现在**叙述**里（`叶海走了`），否则严格模式会认为它不是角色 ——
+    // 真小说正是这样（叙述里到处都在提名字），这也是过滤复合词碎片的依据
+    const text = [
+      '叶海说道：“我试过了。”',
+      '叶海摇了摇头。',
+      '哈维尔笑着说道：“你不懂。”',
+      '哈维尔走了。',
+      '罗安继续开口说道：“我们走。”',
+      '罗安挥手。',
+      '舍沙耸耸肩道：“随便你。”',
+      '舍沙沉默。',
+      '叶海点点头，无奈道：“好吧。”',
+      '哈维尔笑着道：“真的。”',
+    ].join('\n')
+    const names = extractCharacterCandidates(text, { minOccurrences: 2 }).map((c) => c.name)
+    for (const junk of ['无奈', '笑着', '继续', '耸耸肩', '开口', '笑']) {
+      assert.ok(!names.includes(junk), `不应抽出「${junk}」：${JSON.stringify(names)}`)
+    }
+    assert.ok(names.includes('叶海'), `真角色要留下：${JSON.stringify(names)}`)
+    assert.ok(names.includes('哈维尔'), `真角色要留下：${JSON.stringify(names)}`)
+    assert.ok(names.includes('罗安'), `真角色要留下：${JSON.stringify(names)}`)
+    assert.ok(names.includes('舍沙'), `真角色要留下：${JSON.stringify(names)}`)
+  })
+
+  it('复合词里的假引导语不算：「不知道 / 人行道」切出的碎片被过滤', () => {
+    // `人行道，` 里的「人行」通过了所有**字型**检查（三个正常汉字、没有功能字），
+    // 唯一能挡住它的是「必须在叙述里单独出现过」这条 ——
+    // 它每次出现都紧跟引导语动词「道」（`人行道，`），从没在叙述里单独出现过
+    const text = [
+      '叶海不知道该怎么办。',
+      '叶海说道：“等等。”',
+      '地下通道，漆黑一片。',
+      '人行道，全是积水。',
+      '又一条人行道，狭窄得很。',
+      '叶海摇了摇头。',
+      '叶海不知道要不要说。',
+    ].join('\n')
+    const names = extractCharacterCandidates(text, { minOccurrences: 2 }).map((c) => c.name)
+    for (const junk of ['不知', '地下通', '人行', '叶海不']) {
+      assert.ok(!names.includes(junk), `不应抽出「${junk}」：${JSON.stringify(names)}`)
+    }
+    assert.ok(names.includes('叶海'), `真角色要留下：${JSON.stringify(names)}`)
+  })
+
+  it('真名的前缀碎片被收敛掉：叶海微 → 叶海', () => {
+    // 大量「叶海」（含叙述）+ 少量「叶海微微一笑道」（窗口会切出「叶海微」）
+    const text = [
+      ...Array.from({ length: 200 }, () => '叶海走了。'),
+      ...Array.from({ length: 20 }, () => '叶海微微一笑道：“好。”'),
+    ].join('\n')
+    const names = extractCharacterCandidates(text, { minOccurrences: 2 }).map((c) => c.name)
+    assert.ok(names.includes('叶海'), JSON.stringify(names))
+    assert.ok(!names.includes('叶海微'), `真名的前缀碎片应被收敛：${JSON.stringify(names)}`)
+  })
+
+  it('简称并入全名（阿兰 → 诺顿·阿兰），而两个相近的真名不会被并掉', () => {
+    const text = [
+      ...Array.from({ length: 30 }, () => '诺顿·阿兰说道：“嗯。”'),
+      ...Array.from({ length: 30 }, () => '诺顿·阿兰走了。'),
+      ...Array.from({ length: 8 }, () => '阿兰说道：“好。”'),
+      ...Array.from({ length: 10 }, () => '林轩站了起来。'),
+      ...Array.from({ length: 10 }, () => '林轩说道：“走。”'),
+      ...Array.from({ length: 5 }, () => '林轩宇走了过来。'),
+      ...Array.from({ length: 5 }, () => '林轩宇说道：“我也去。”'),
+    ].join('\n')
+    const cands = extractCharacterCandidates(text, { minOccurrences: 2 })
+    const byName = new Map(cands.map((c) => [c.name, c]))
+    assert.ok(byName.has('诺顿·阿兰'), JSON.stringify(cands.map((c) => c.name)))
+    assert.ok(
+      byName.get('诺顿·阿兰')?.aliases.includes('阿兰'),
+      `简称应作为别名并入：${JSON.stringify(byName.get('诺顿·阿兰'))}`,
+    )
+    assert.ok(!byName.has('阿兰'), '并入后不应再作为独立候选')
+    // 两个真名各有一半独立出现 → 必须都留下
+    assert.ok(byName.has('林轩'), `相近真名不能被吞掉：${JSON.stringify(cands.map((c) => c.name))}`)
+    assert.ok(byName.has('林轩宇'), `相近真名不能被吞掉：${JSON.stringify(cands.map((c) => c.name))}`)
+  })
+
+  it('occurrences 是「语料里的真实出现次数」，不是信号命中次数', () => {
+    // 只出现在引导语里一次，但在正文里被提到 5 次
+    const text = ['叶海说道：“走。”', '叶海走了。', '叶海停下。', '叶海回头。', '叶海笑了。'].join('\n')
+    const [top] = extractCharacterCandidates(text, { minOccurrences: 2 })
+    assert.ok(top)
+    assert.equal(top.name, '叶海')
+    assert.equal(top.occurrences, 5, 'UI 上显示的「出现 N 次」应当是正文里的真实次数')
+  })
+
+  it('整本书量级的性能：十万字以上正文下抽取仍是亚秒级（不得 O(候选×正文)）', () => {
+    // 造 50 个角色 × 3000 轮（每轮一句对白 + 一句叙述）≈ 20 万字
+    const names = Array.from({ length: 50 }, (_, i) => `角色${String.fromCharCode(0x4e00 + i)}甲`)
+    const paragraphs: string[] = []
+    for (let p = 0; p < 4000; p++) {
+      const who = names[p % names.length]!
+      paragraphs.push(`${who}沉声道：“这是第${p}段。”`)
+      paragraphs.push(`${who}${['点了点头', '摇了摇头', '叹了口气', '笑而不语'][p % 4]}。`)
+    }
+    const text = paragraphs.join('\n')
+    assert.ok(text.length > 100_000, `语料要够大才测得出性能，实际 ${text.length}`)
+    const started = Date.now()
+    const cands = extractCharacterCandidates(text, { minOccurrences: 2 })
+    const elapsed = Date.now() - started
+    assert.ok(cands.length > 0, '至少要抽出角色')
+    assert.ok(elapsed < 3000, `抽取耗时 ${elapsed}ms —— 疑似退化成 O(候选 × 正文)`)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // 别名与查询
 // ---------------------------------------------------------------------------
 

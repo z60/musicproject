@@ -414,14 +414,23 @@ export function createCanvasService(deps: CanvasServiceDeps): CanvasService {
     async updateLine(req) {
       const patch: CanvasLinePatch = { ...req.patch }
       // 改过说话人/文本 → 自动置人工确认（docs/11 §4.4「强制标记」）
+      //
+      // ⚠️ 判断必须看**值**而不是 `'text' in patch`：经 IPC 校验器来的 patch
+      // 里每个可选键都在（值为 undefined），用 `in` 会让「只改停顿」也被记成
+      // 人工确认、并顺手作废该行向量（见 shared/util/drop-undefined.ts）。
+      // `characterId: null`（清空说话人）是**真正改过**，所以要按 `!== undefined` 判。
+      const textChanged = patch.text !== undefined
       if (patch.decidedBy == null) {
         const touched =
-          'characterId' in patch || 'speakerType' in patch || 'text' in patch || 'kind' in patch
+          patch.characterId !== undefined ||
+          patch.speakerType !== undefined ||
+          textChanged ||
+          patch.kind !== undefined
         if (touched) patch.decidedBy = 'human'
       }
       const updated = await deps.canvasRepo.updateLine(req.lineId, patch, req.rev)
       // 文本改了 → 该行向量作废（docs/06 §5.5：content_hash 变化 → 仅重算该行）
-      if ('text' in patch) await deps.canvasRepo.deleteEmbedding(req.lineId)
+      if (textChanged) await deps.canvasRepo.deleteEmbedding(req.lineId)
       return updated
     },
 

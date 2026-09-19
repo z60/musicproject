@@ -57,6 +57,24 @@ export const MIGRATION_ENTRIES: readonly MigrationEntry[] = [
     hash: 'sha256:f6b9f4fafa05d8d83927ed0a7d812e5908da389f133af58f32b4fa6c7721c90c',
     file: '002_seed.sql',
   },
+  {
+    version: 3,
+    name: 'canvas_generate_reports',
+    hash: 'sha256:6ace9c5c1b384b371f1803fe8baed5f4e6340608a9ba6f466a8d8e7d8e275027',
+    file: '003_canvas_generate_reports.sql',
+  },
+  {
+    version: 4,
+    name: 'takes_soft_delete',
+    hash: 'sha256:5e3b202a73603019ef742e1a19400904a58f69747591c387effb1241a851b1f1',
+    file: '004_takes_soft_delete.sql',
+  },
+  {
+    version: 5,
+    name: 'export_jobs_duration',
+    hash: 'sha256:e69d256a534585e6572639e91ebb7cd5593f8e3133914a9544a122ae6e18d810',
+    file: '005_export_jobs_duration.sql',
+  },
 ]
 
 const migrationsDir = dirname(fileURLToPath(import.meta.url))

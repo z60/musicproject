@@ -150,6 +150,22 @@ export function float32ToFloat32LE(src: Float32Array): Buffer {
   return out
 }
 
+/**
+ * 32-bit float PCM（LE）→ Float32Array —— `float32ToFloat32LE` 的逆运算。
+ *
+ * 为什么需要它：本项目推荐 `bitDepth: 32` 录音（32-bit float WAV），
+ * 而读盘做测量/切片时需要把这个格式解回来。缺了它，`analysis:*` 遇到 32-bit
+ * 文件只能报「不支持」——而它恰恰是最常见的录音格式。
+ *
+ * 尾部不足 4 字节的残片直接丢弃（半截样本没有意义，且会让 `readFloatLE` 越界）。
+ */
+export function float32LEToFloat32(buf: Buffer): Float32Array {
+  const n = Math.floor(buf.length / 4)
+  const out = new Float32Array(n)
+  for (let i = 0; i < n; i++) out[i] = buf.readFloatLE(i * 4)
+  return out
+}
+
 // ============================================================================
 // 声道交织 / 解交织
 // ============================================================================

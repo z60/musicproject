@@ -129,6 +129,9 @@ export function buildDefaultSettings(opts: {
       trimThresholdDb: -45,
       trimPaddingMs: 100,
       echoCancellation: false,
+      // 设备 label 快照与最近一次自检结果：主进程侧持久化（渲染进程枚举设备，见 docs/12 §11）
+      deviceLabels: {},
+      lastSelfTest: null,
     },
     recording: {
       defaultMode: 'line_by_line',

@@ -189,7 +189,17 @@ function syncFields(): void {
   flagDraft.value = ''
 }
 
-watch(() => props.line?.id, syncFields, { immediate: true })
+/**
+ * 切行时同步各字段。
+ *
+ * ⚠️ **这个 watch 必须放在 setup 的最后**（见文件末尾）：`immediate: true` 会在
+ * **setup 期间立刻执行一次**回调 —— 也就是 `syncFields()` 会在那一刻运行，
+ * 而它要写 `playing` / `metrics` / `playbackHint` / `flagDraft` 这几个 ref。
+ * 若把 watch 写在它们的声明之前，`const` 的暂时性死区（TDZ）会让 setup 直接抛
+ * `ReferenceError: Cannot access 'playing' before initialization` ——
+ * 表现是「点开画本编辑就整页报错」（ErrorBoundary 兜住）。
+ * 静态检查见 `scripts/check-script-setup-order.ts`（`npm run check:setup-order`）。
+ */
 
 // Ctrl+S：store 自增 flushSignal，把防抖中的文本/备注也冲掉（docs/11 §4.8）
 watch(() => canvas.flushSignal, () => {
@@ -361,6 +371,13 @@ const saveErrorText = computed(() => {
 function kindLabel(kind: LineKind): string {
   return LINE_KIND_LABELS[kind] ?? kind
 }
+
+// ---------------------------------------------------------------------------
+// 切行同步（**放在最后**：immediate 会在 setup 期间立刻跑一次 syncFields，
+// 而它要写上面那些 ref —— 提前注册就会踩到 TDZ，见 syncFields 上方的说明）
+// ---------------------------------------------------------------------------
+
+watch(() => props.line?.id, syncFields, { immediate: true })
 </script>
 
 <template>

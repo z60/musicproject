@@ -213,7 +213,16 @@ export class TaskQueue {
     this.waitTimeoutMs = opts.waitTimeoutMs ?? 30_000
     this.makeIdFn = opts.makeId ?? (() => randomBytes(12).toString('hex'))
     this.makeTempDirFn = opts.makeTempDir ?? (async (taskId) => {
-      const { mkdtemp } = await import('node:fs/promises')
+      const { mkdir, mkdtemp } = await import('node:fs/promises')
+      // **必须先确保临时根目录存在**（幂等）。
+      //
+      // 真机后果（实测复现）：`tempRoot` 是 `cacheDir/tasks`，而启动流程里
+      // **没有任何一步创建过它**（`cacheDir` 本身也可能不存在）。
+      // `mkdtemp` 遇到不存在的父目录直接抛 ENOENT，被错误体系翻成
+      // `FILE_NOT_FOUND · 文件不存在` —— 于是**每一个任务**（导入、生成画本…）
+      // 都以一句毫无指向性的「文件不存在」失败。
+      // 这一层是 tempRoot 的拥有者，所以在这里兜底最合适：调用方不需要记得建目录。
+      await mkdir(this.tempRoot, { recursive: true })
       return mkdtemp(join(this.tempRoot, `task-${taskId.slice(0, 8)}-`))
     })
     this.removeTempDirFn = opts.removeTempDir ?? (async (dir) => {

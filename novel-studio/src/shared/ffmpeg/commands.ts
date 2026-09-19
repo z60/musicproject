@@ -330,6 +330,61 @@ export function buildM4bProbeCommand(input: { file: string; ffprobePath?: string
 }
 
 // ============================================================================
+// 处理链命令（docs/14 §2/§3，`process:*`）
+// ============================================================================
+
+export interface ProcessCommandInput {
+  input: string
+  output: string
+  /** 处理链产出的滤镜串（`buildChainFilter`）；空串 = 只做格式统一 */
+  filter: string
+  sampleRate?: 44100 | 48000
+  channels?: 1 | 2
+  /** 输出位深（处理结果默认 24 位，docs/05 §2.5） */
+  bitDepth?: 16 | 24
+  /**
+   * 只处理源文件的 `[0, 前 N 毫秒]`（试听用，docs/14 §10「试听 10 秒」）。
+   * 不传 = 处理全长。
+   */
+  previewMs?: number
+  overwrite?: boolean
+  ffmpegPath?: string
+}
+
+/**
+ * 处理链命令（`process:apply` / `process:preview` 的实际执行方案）。
+ *
+ * ★ 三个必须写死的参数（漏了就会出真问题）：
+ *   · `-map_metadata -1`：**丢掉源文件的元数据**。中间产物的元数据会随
+ *     concat/amix 带进最终音频，导致「听众看到的是上一次导出的标题」。
+ *   · `-vn`：源里若带了封面/图片流，不加会被当成视频流处理失败。
+ *   · `-c:a pcm_s16le|pcm_s24le` + `-f wav`：处理产物必须是**无损中间格式**，
+ *     否则「处理 → 对轨 → 导出」会经历两次有损编码（docs/14 §2.2）。
+ *
+ * `filter` 为空串时命令退化为「格式统一」（仅修剪预设就是这种，docs/14 §13）。
+ *
+ * @throws 不抛异常；参数越界按默认值处理
+ */
+export function buildProcessCommand(input: ProcessCommandInput): string[] {
+  const cmd = base(input.ffmpegPath)
+  cmd.push('-loglevel', 'error', '-nostats')
+  if (input.overwrite !== false) cmd.push('-y')
+  // ★ previewMs 用 `-t`（限制**输入**读取时长）而不是 `-ss`：试听要的是「前 N 毫秒」，
+  //   放在 -i 之前是最省的写法（ffmpeg 读到 N 毫秒就停止拉流）
+  if (input.previewMs && input.previewMs > 0) cmd.push('-t', fmtNum(input.previewMs / 1000, 3))
+  cmd.push('-i', input.input)
+  cmd.push('-vn')
+  if (input.filter) cmd.push('-af', input.filter)
+  cmd.push('-ar', String(input.sampleRate ?? 48000))
+  cmd.push('-ac', String(input.channels ?? 1))
+  cmd.push('-c:a', (input.bitDepth ?? 24) === 16 ? 'pcm_s16le' : 'pcm_s24le')
+  cmd.push('-f', 'wav')
+  cmd.push('-map_metadata', '-1')
+  cmd.push(input.output)
+  return cmd
+}
+
+// ============================================================================
 // 混音渲染命令（docs/15 §3）
 // ============================================================================
 

@@ -103,6 +103,44 @@ export const ARRANGE_DEFAULTS = {
   defaultFadeMs: 5,
 } as const
 
+/**
+ * 对轨问题类型的中文标签（`alignment:issueKindLabels` 的唯一文案来源）。
+ *
+ * 为什么放在主进程而不是渲染侧：同一个 issue 会在**时间线、校验面板、导出预检**
+ * 三处出现，文案分散就意味着三处叫法不同（「缺录」/「未录音」/「没有音频」），
+ * 用户会以为是三种问题。渲染侧有兜底表（`ISSUE_KIND_FALLBACK_LABELS`），
+ * 但它只在主进程不可用时生效。
+ */
+export const ALIGN_ISSUE_LABELS: Record<
+  | 'missing_line'
+  | 'orphan_segment'
+  | 'same_track_overlap'
+  | 'cross_track_overlap_warn'
+  | 'long_gap'
+  | 'short_segment'
+  | 'long_segment'
+  | 'silent_segment'
+  | 'clipped_segment'
+  | 'file_missing'
+  | 'wrong_order',
+  string
+> = {
+  missing_line: '缺录（画本行没有录音）',
+  orphan_segment: '孤儿片段（画本行已删除）',
+  same_track_overlap: '同轨重叠（必须消解）',
+  cross_track_overlap_warn: '跨轨重叠过大',
+  long_gap: '过长静音（可能缺录一行）',
+  short_segment: '片段过短',
+  long_segment: '片段过长',
+  silent_segment: '片段是静音',
+  clipped_segment: '片段削波',
+  file_missing: '音频文件丢失',
+  wrong_order: '顺序颠倒（疑似错绑）',
+}
+
+/** 阻断项（必须处理才能导出）—— 与 `shared/arrange/validate.ts` 的 `isBlockingIssue` 一致 */
+export const ALIGN_BLOCKING_ISSUES = ['missing_line', 'same_track_overlap', 'file_missing'] as const
+
 /** 停顿推断表（docs/11 §2.3） */
 export const PAUSE_RULES: Array<{ label: string; match: string; pauseMs: number }> = [
   { label: '句号结尾', match: '。', pauseMs: 500 },
@@ -230,6 +268,20 @@ export const EXPORT_DEFAULTS = {
   /** M4B 单文件时长上限（小时） */
   m4bMaxHours: 24,
 } as const
+
+/** MP3 VBR 质量档（export:vbrPresets 的数据源；value 是 -q:a 的档位，不是码率） */
+export const VBR_PRESETS = [
+  { label: 'V0 最高（约 245 kbps）', value: 0 },
+  { label: 'V1 高（约 225 kbps）', value: 1 },
+  { label: 'V2 推荐（约 190 kbps）', value: 2 },
+  { label: 'V3 中（约 175 kbps）', value: 3 },
+  { label: 'V4 较小（约 165 kbps）', value: 4 },
+  { label: 'V5 小（约 130 kbps）', value: 5 },
+  { label: 'V6 很小（约 115 kbps）', value: 6 },
+  { label: 'V7 最小（约 100 kbps）', value: 7 },
+  { label: 'V8 极低（约 85 kbps）', value: 8 },
+  { label: 'V9 最低（约 65 kbps）', value: 9 },
+] as const
 
 /** 响度验收阈值（docs/15 §6.2） */
 export const QC_THRESHOLDS = {
@@ -595,6 +647,8 @@ export const SEVERITY_LABELS: Record<string, string> = {
 export const TASK_KIND_LABELS: Record<string, string> = {
   'book.import': '导入书籍',
   'canvas.generate': '生成画本',
+  'canvas.recompute': '重算说话人判定',
+  'character.centroid': '重建角色音色原型',
   'embedding.batch': '语义向量化',
   'asr.transcribe': '语音识别',
   'audio.process': '音频处理',

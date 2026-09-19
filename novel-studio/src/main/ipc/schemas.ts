@@ -44,6 +44,18 @@ const OptString = v.optional(v.string())
  * 由渲染进程归一到 `null`（不让 `''` 进入设置树）。
  */
 const OptNullableString = v.optional(v.nullable(v.string().allowEmpty()))
+
+/**
+ * 可空的可选整数/数字。
+ *
+ * ⚠️ 为什么「可空」必须显式写出来：领域类型里 `string | null` / `number | null` 的字段，
+ * 界面上「清空」这个动作发的就是 `null`（先例：`CharacterPanel.vue` 的
+ * `description: form.description || null`、`LineEditorDrawer.vue` 的 `{ note: null }`）。
+ * 若 schema 只写 `v.optional(v.string())`，清空一个备注就会得到 `INVALID_PAYLOAD` ——
+ * 用户看到的是「参数不对」，而真正的原因是他清空了一个可空字段。
+ * 规则：**领域类型可空 ⇒ schema 必须可空**（docs/91 §5.2.11）。
+ */
+const OptNullableInt = v.optional(v.nullable(v.number().int()))
 // （已移除：StringOrNull 未被使用）
 const StrArray = v.array(v.string().allowEmpty(), { max: 10_000 })
 const OptBool = v.optional(v.boolean())
@@ -67,6 +79,8 @@ const TaskStatus = v.enum(['queued', 'waiting', 'running', 'succeeded', 'failed'
 const TaskKind = v.enum([
   'book.import',
   'canvas.generate',
+  'canvas.recompute',
+  'character.centroid',
   'embedding.batch',
   'asr.transcribe',
   'audio.process',
@@ -175,14 +189,15 @@ const CanvasLinePatchShape = v.object({
   speakerType: v.optional(SpeakerType),
   characterId: OptId,
   kind: v.optional(LineKind),
-  emotion: OptString,
+  // 情绪 / 注音 / 备注在领域类型里是 `string | null`，UI 清空时发的就是 null（见 OptNullableInt 注释）
+  emotion: OptNullableString,
   emotionIntensity: v.optional(v.nullable(v.number({ int: true, min: 1, max: 5 }))),
   speed: v.optional(v.nullable(SpeedMark)),
   gainDb: v.optional(v.nullable(v.number({ min: -60, max: 60 }))),
   pauseAfterMs: OptInt,
   pauseInline: v.optional(v.nullable(v.array(v.number({ int: true, min: 0 }), { max: 1000 }))),
-  pronunciation: OptString,
-  note: OptString,
+  pronunciation: OptNullableString,
+  note: OptNullableString,
   needsReview: OptBool,
   decidedBy: v.optional(DecidedBy),
   flags: v.optional(v.array(v.string().max(64), { max: 64 })),
@@ -602,13 +617,16 @@ export const IPC_REQ_SCHEMAS = {
       aliases: v.optional(StrArray),
       gender: v.optional(v.nullable(v.enum(['male', 'female', 'other', 'unknown']))),
       ageGroup: v.optional(v.nullable(v.enum(['child', 'teen', 'young', 'middle', 'elder', 'unknown']))),
-      description: OptString,
-      note: OptString,
-      color: OptString,
+      // 以下四项在领域类型里可空，而 CharacterPanel.vue 清空输入框时发的就是 null
+      // （`description: form.description || null`）—— 新建角色时描述通常为空，
+      // 若这里不可空，**连「新建角色」都会失败**（docs/91 §5.2.11 真机堵点）
+      description: OptNullableString,
+      note: OptNullableString,
+      color: OptNullableString,
       defaultSpeed: v.optional(v.nullable(SpeedMark)),
-      defaultEmotion: OptString,
+      defaultEmotion: OptNullableString,
       defaultGainDb: v.optional(v.nullable(v.number({ min: -60, max: 60 }))),
-      defaultPauseMs: OptInt,
+      defaultPauseMs: OptNullableInt,
       isArchived: OptBool,
       sortOrder: OptInt,
     }),
@@ -625,8 +643,9 @@ export const IPC_REQ_SCHEMAS = {
       id: OptId,
       projectId: Id,
       name: v.string().max(200),
-      contact: OptString,
-      note: OptString,
+      // 可空字段一律 nullable：界面上「清空」发的是 null（见 OptNullableInt 注释）
+      contact: OptNullableString,
+      note: OptNullableString,
       profile: v.optional(
         v.nullable(
           v.object({

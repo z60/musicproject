@@ -92,20 +92,47 @@ function createFilter(): CanvasFilter {
 }
 
 /**
- * @param source 行数据。三种形态都接受，内部统一归一成 `ComputedRef`：
- *   · `Ref<CanvasLine[]>` / `ComputedRef<CanvasLine[]>` —— 直接传（调用方自己持有响应式源）
- *   · 普通 `CanvasLine[]` —— 从 Pinia store 取 `store.lines` 时**常常已经是解包后的数组**
- *     （store 会把 getter 当属性访问，拿到的不是 Ref），此时用 `computed(() => source)` 包一层，
- *     依然能跟随 store 变化响应式更新。
- * 早期签名只收 Ref，调用方传数组会报
- * TS2345「Type 'CanvasLine[]' is not assignable to parameter of type 'ComputedRef<CanvasLine[]> | Ref<...>'」。
+ * 行数据的来源。**推荐传 getter**（`() => canvas.lines`）。
+ *
+ * ⚠️ 这里曾经只收「Ref 或普通数组」，并用 `computed(() => Array.isArray(source) ? source : source.value)`
+ * 归一 —— 这条写法有个**静默的致命缺陷**（真机事故，docs/91 §5.2.27）：
+ * Pinia 的 setup store 会把 `ref` 解包，所以 `canvas.lines` 拿到的是**当时的那个数组对象**。
+ * `computed(() => source)` 的求值体**不读任何响应式属性**，因此它永远不会重新求值；
+ * 而 `canvas.load()` 是 `lines.value = collected`（**整体重赋值**），旧数组对象永远是空的。
+ * 结果：表格恒显示「当前筛选下没有行」，而库里 85 行都在。
+ *
+ * 现在的规则：
+ *   · `() => CanvasLine[]`（推荐）—— 每次求值都重新读 store，**跟随重赋值与增删**；
+ *   · `Ref` / `ComputedRef` —— 正常工作；
+ *   · 普通数组 —— 只是**一次性快照**（无法响应式），开发期给一条 warn 指明正确写法。
  */
-export function useCanvasFilter(
-  source: Ref<CanvasLine[]> | ComputedRef<CanvasLine[]> | CanvasLine[],
-): UseCanvasFilter {
-  const lines = computed<CanvasLine[]>(() =>
-    Array.isArray(source) ? source : source.value,
-  )
+export type CanvasLineSource =
+  | Ref<CanvasLine[]>
+  | ComputedRef<CanvasLine[]>
+  | (() => CanvasLine[])
+  | CanvasLine[]
+
+let warnedPlainArray = false
+
+/**
+ * @param source 行数据来源，见 {@link CanvasLineSource}。内部统一归一成 `ComputedRef`。
+ */
+export function useCanvasFilter(source: CanvasLineSource): UseCanvasFilter {
+  const lines = computed<CanvasLine[]>(() => {
+    if (typeof source === 'function') return source()
+    if (Array.isArray(source)) {
+      // 普通数组没有响应式能力：只在开发期提示一次，不静默地给出「永远是空的」视图
+      if (!warnedPlainArray && typeof import.meta !== 'undefined' && (import.meta as { env?: { DEV?: boolean } }).env?.DEV) {
+        warnedPlainArray = true
+        console.warn(
+          '[useCanvasFilter] 传入的是普通数组，它只是快照、不会跟随 store 更新。' +
+            '请改传 getter：useCanvasFilter(() => canvas.lines)',
+        )
+      }
+      return source
+    }
+    return source.value
+  })
   const filter = ref<CanvasFilter>(createFilter())
 
   const kindOptions = (Object.keys(LINE_KIND_LABELS) as LineKind[]).map(value => ({

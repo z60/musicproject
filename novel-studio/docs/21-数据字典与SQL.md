@@ -149,7 +149,7 @@ CREATE TABLE IF NOT EXISTS characters (
   id               TEXT PRIMARY KEY,
   book_id          TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
   name             TEXT NOT NULL,
-  aliases          TEXT,                    -- JSON 数组：["炎帝","小炎子"]
+  aliases          TEXT,                    -- JSON 数组：**历史列**，不参与读取（权威见 character_aliases）
   gender           TEXT CHECK (gender IN ('male','female','other','unknown')),
   age_group        TEXT CHECK (age_group IN ('child','teen','young','middle','elder','unknown')),
   description      TEXT,                    -- 性格描述（参与原型向量构造）
@@ -166,6 +166,12 @@ CREATE TABLE IF NOT EXISTS characters (
 );
 CREATE INDEX IF NOT EXISTS idx_characters_book ON characters(book_id, is_archived);
 
+-- 别名权威表：`characters.aliases`（JSON 列）是**历史遗留**，不参与读取。
+-- 两处都能存别名就必须指定唯一权威，否则迟早分叉：
+--   · 这里能按别名反查（idx_alias_text）与保证同一角色内别名唯一（UNIQUE）
+--   · JSON 列两件事都做不到
+-- 读路径（listByBook/get）一律查这张表；`characters.aliases` 只写镜像值，
+-- 方便用 SQL 手工看库的人，**不是**真相来源（详见 docs/91 §5.2.10）。
 CREATE TABLE IF NOT EXISTS character_aliases (
   id           TEXT PRIMARY KEY,
   character_id TEXT NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
@@ -195,6 +201,13 @@ CREATE TABLE IF NOT EXISTS character_voice_bindings (
   UNIQUE (character_id, actor_id)
 );
 CREATE INDEX IF NOT EXISTS idx_binding_actor ON character_voice_bindings(actor_id);
+
+-- 语义（docs/11 §6.1，实现见 voice-actor.repo.sqlite.ts）：
+--   · 一个角色**至多一个主配音员**（is_primary=1），其余为备选。
+--     表上没有这条约束，所以由实现负责：新的主绑定会把旧的降级。
+--   · `voiceActor:delete` 是物理删除（配音员不被内容引用；角色才被台词引用），
+--     绑定随 ON DELETE CASCADE 一起消失，画本行不受影响。
+--   · 角色合并时绑定会迁到目标角色（否则会随源角色一起被归档，界面上等于"消失"）。
 
 -- 角色原型向量：支持增量更新（sum_vector + sample_count）与快照（centroid）
 CREATE TABLE IF NOT EXISTS character_centroids (
@@ -277,6 +290,26 @@ CREATE TABLE IF NOT EXISTS canvas_snapshots (
   created_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_snapshots_chapter ON canvas_snapshots(chapter_id, created_at);
+
+-- 生成报告（docs/11 §2.4「本章是怎么切出来的」）——由 **003 迁移**追加，
+-- 不属于 001 的建库 SQL（001/002 已发布、hash 被钉住，结构变更只能靠新迁移）
+--
+-- 一章一行：契约是 `canvas:getGenerateReport { chapterId } → 报告 | null`，
+-- 没有 id、没有历史；生成会替换整章画本行，UI 要看的只是「本次」的结果。
+-- `payload`（JSON）是读取的唯一天真来源；其余标量列在同一条 INSERT 里一起写入，
+-- 只服务统计/排查类查询，不参与 DTO 重建，因此不会与 payload 分叉。
+CREATE TABLE IF NOT EXISTS canvas_generate_reports (
+  chapter_id     TEXT PRIMARY KEY REFERENCES chapters(id) ON DELETE CASCADE,
+  total_lines    INTEGER NOT NULL DEFAULT 0,
+  low_confidence INTEGER NOT NULL DEFAULT 0,
+  embedding_used INTEGER NOT NULL DEFAULT 0,   -- 0/1（与 needs_review 等列同风格）
+  llm_used       INTEGER NOT NULL DEFAULT 0,
+  elapsed_ms     INTEGER NOT NULL DEFAULT 0,
+  payload        TEXT    NOT NULL,             -- CanvasGenerateReport 的 JSON
+  generated_at   INTEGER NOT NULL,
+  updated_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_generate_reports_time ON canvas_generate_reports(generated_at DESC);
 
 CREATE TABLE IF NOT EXISTS ai_cache (
   cache_key   TEXT PRIMARY KEY,
@@ -773,8 +806,14 @@ src/main/infra/db/migrations/
 ├── index.ts                迁移清单（版本、名称、哈希、SQL 或函数）
 ├── 001_init.sql            上述全部建表 + 视图
 ├── 002_seed.sql            内置分章规则集、内置处理预设、默认设置
+├── 003_canvas_generate_reports.sql  画本生成报告表（一章一行）
 └── 00X_*.sql               后续增量
 ```
+
+> **实际清单**以 `MIGRATION_ENTRIES` 为准（上面是骨架示意）：
+> 当前为 1 init / 2 seed / 3 canvas_generate_reports。
+> 纪律：**已发布的迁移不可改**（hash 在 `loadMigrations()` 里校验，不一致直接 `DB_MIGRATION_FAILED`），
+> 需要改结构就新增更高版本的迁移，并在 `MIGRATION_ENTRIES` 里登记 `file` 与 `hash`。
 
 ```ts
 // infra/db/migrations/index.ts

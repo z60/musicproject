@@ -25,7 +25,7 @@
  */
 
 import { strict as assert } from 'node:assert'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
@@ -37,7 +37,20 @@ import { BOOK_PATCH_COLUMNS, CHAPTER_PATCH_COLUMNS } from '../../src/main/featur
 import type { DbLike, StatementLike } from '../../src/main/infra/db/types.ts'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
-const DDL = readFileSync(join(ROOT, 'src', 'main', 'infra', 'db', 'migrations', '001_init.sql'), 'utf8')
+const MIGRATIONS_DIR = join(ROOT, 'src', 'main', 'infra', 'db', 'migrations')
+
+/**
+ * DDL 来源 = **全部**迁移脚本（001 + 002 + 003 …）。
+ *
+ * 以前只读 `001_init.sql`：一旦后续迁移新增表（例如 003 的
+ * `canvas_generate_reports`），那张表的列就不在检查集合里，
+ * 新代码里的列名笔误会被**当成合法**放过去 —— 守卫静默失效。
+ */
+const DDL = readdirSync(MIGRATIONS_DIR)
+  .filter((f) => f.endsWith('.sql'))
+  .sort()
+  .map((f) => readFileSync(join(MIGRATIONS_DIR, f), 'utf8'))
+  .join('\n')
 
 // ---------------------------------------------------------------------------
 // 从 DDL 抽取表结构
@@ -205,8 +218,33 @@ CREATE TABLE IF NOT EXISTS demo (
       'src/main/features/book/import/repositories/book.repo.sqlite.ts',
       'src/main/features/book/import/repositories/chapter.repo.sqlite.ts',
       'src/main/features/book/import/repositories/project.repo.ts',
+      // 画本行仓储：29 列手写 INSERT + 子查询，是最需要这类守卫的地方
+      'src/main/features/book/canvas/repositories/canvas.repo.sqlite.ts',
+      'src/main/features/book/canvas/repositories/canvas-line.repo.sqlite.ts',
+      'src/main/features/book/canvas/repositories/character.repo.sqlite.ts',
+      // 配音员与绑定：`profile` 是 JSON 列、绑定表有 UNIQUE(character_id, actor_id)
+      'src/main/features/book/canvas/repositories/voice-actor.repo.sqlite.ts',
     ]
-    const TYPED_TABLES = ['books', 'chapters', 'projects', 'canvas_lines', 'voice_segments', 'takes']
+    const TYPED_TABLES = [
+      'books',
+      'chapters',
+      'projects',
+      'canvas_lines',
+      'voice_segments',
+      'takes',
+      // 画本域另外两张表：向量的 BLOB 与快照的 gzip payload 都在这两张表里，
+      // 列名写错同样只在运行期报错
+      'line_embeddings',
+      'canvas_snapshots',
+      // 角色域（画本生成要用：说话人判定、原型向量、配音员绑定）
+      'characters',
+      'character_aliases',
+      'character_centroids',
+      'voice_actors',
+      'character_voice_bindings',
+      // 003 迁移新增：生成报告（一章一行）
+      'canvas_generate_reports',
+    ]
     const tableCols = new Map<string, Set<string>>(TYPED_TABLES.map((t) => [t, parseDdlColumns(DDL, t)]))
     const allCols = new Set<string>()
     for (const cols of tableCols.values()) for (const c of cols) allCols.add(c)
@@ -222,6 +260,10 @@ CREATE TABLE IF NOT EXISTS demo (
       // 别名限定列里会用到的 SQL 函数（`SUM(LENGTH(l.text))` 等）
       'length', 'sum', 'coalesce', 'case', 'when', 'then', 'else', 'end', 'in', 'join', 'left', 'inner', 'group',
       'true', 'false', 'max', 'min', 'abs', 'replace', 'exists',
+      // 错误详情里的**实体名**（`details: { entity: 'canvas_line' }`），不是列名。
+      // 它之所以会出现在 SQL 扫描块里，是因为块是按「反引号配对」切的，
+      // 而注释里的反引号会把相邻代码一起圈进来。
+      'canvas_line',
     ])
     // 表名本身不是列名，别让它们被裸标识符检查误报（新增表时自动生效，不必手工维护）
     for (const t of TYPED_TABLES) allowed.add(t)
@@ -244,17 +286,26 @@ CREATE TABLE IF NOT EXISTS demo (
       const sqlChunks = [...src.matchAll(/`([^`]*?(?:SELECT|INSERT|UPDATE|DELETE)[^`]*?)`/gis)].map((m) => m[1]!)
       for (const chunk of sqlChunks) {
         // ① 别名（或表名）限定列：`l.char_count` → 必须是 canvas_lines 的列
-        for (const m of chunk.matchAll(/\b([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)\b/g)) {
-          const qualifier = m[1]!
-          const col = m[2]!
-          const table = aliasToTable.get(qualifier) ?? (tableCols.has(qualifier) ? qualifier : null)
-          if (!table) continue
-          assert.ok(
-            tableCols.get(table)!.has(col),
-            `${rel} 的 SQL 里出现 '${qualifier}.${col}'，但 **${table} 表没有 '${col}' 列**。\n` +
-              `  这类缺陷数据库要到真正 prepare/执行时才报 'no such column'，` +
-              `而并集式检查会把它放过去 —— 所以这里按别名解析到具体表再查。`,
-          )
+        //
+        // ⚠️ 只看**含 SQL 关键字的行**：块是按「反引号配对」切的，注释里的反引号会把
+        // 相邻的 TS 代码一起圈进来（例如 `const msg = e instanceof Error ? e.message : …`
+        // 里的 `e.message`，而 `e` 恰好是 `line_embeddings` 的别名）→ 假阳性。
+        // SQL 一行里必然出现 SELECT/FROM/WHERE/SET/VALUES/ON 之类关键字，用它筛掉代码行。
+        const SQL_LINE = /\b(select|insert|update|delete|from|join|where|and|or|on|set|values|as|group|order|by|limit|offset|conflict|excluded|returning)\b/i
+        for (const rawLine of chunk.split('\n')) {
+          if (!SQL_LINE.test(rawLine)) continue
+          for (const m of rawLine.matchAll(/\b([a-z][a-z0-9_]*)\.([a-z][a-z0-9_]*)\b/g)) {
+            const qualifier = m[1]!
+            const col = m[2]!
+            const table = aliasToTable.get(qualifier) ?? (tableCols.has(qualifier) ? qualifier : null)
+            if (!table) continue
+            assert.ok(
+              tableCols.get(table)!.has(col),
+              `${rel} 的 SQL 里出现 '${qualifier}.${col}'，但 **${table} 表没有 '${col}' 列**。\n` +
+                `  这类缺陷数据库要到真正 prepare/执行时才报 'no such column'，` +
+                `而并集式检查会把它放过去 —— 所以这里按别名解析到具体表再查。`,
+            )
+          }
         }
 
         // ② 裸标识符（原有检查，并集）

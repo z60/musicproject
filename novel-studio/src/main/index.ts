@@ -244,6 +244,47 @@ async function main(): Promise<void> {
       })
     }
 
+    // ── 录音的 MessagePort 接管（`record:attachPort` 只声明归属，端口在这里到）─────
+    // 端口是 transferable：`ipcRenderer.postMessage('record:port', null, [port])`
+    // 送来的端口只在 `event.ports` 里，invoke 的返回值带不了（docs/01 §4.3）。
+    // 不做这一步的后果：录音时电平条会动、进度会走，但**文件永远是空的**
+    // —— 采集块没有任何人去写盘，而且没有任何报错。
+    electron.ipcMain.on?.('record:port', (eventRaw: unknown) => {
+      const event = eventRaw as { ports?: unknown[] }
+      const port = event.ports?.[0] as
+        | { on(event: 'message', listener: (e: { data: unknown }) => void): void; close?(): void }
+        | undefined
+      if (!port) {
+        state.log().warn('record.portMissing', {
+          event: 'record.portMissing',
+          note: '收到 record:port 但 event.ports 为空：preload 没有转移 MessagePort',
+        })
+        return
+      }
+      built.attachRecordPort(port)
+      state.log().info('record.portAttached', { event: 'record.portAttached' })
+    })
+
+    // 渲染 → 主的单向通道（电平与标记）：都不回包，失败只记日志
+    built.deps.sends?.on('record:mark', (payload) => {
+      void built.record.onMark(payload).catch((e: unknown) => {
+        state.log().warn('record.markFailed', {
+          event: 'record.markFailed',
+          reason: e instanceof Error ? e.message : String(e),
+        })
+      })
+    })
+    built.deps.sends?.on('record:meter', (payload) => {
+      void built.record.onMeter(payload).catch(() => {
+        /* 电平是高频通道：任何异常都不该冒出来打断渲染进程 */
+      })
+    })
+
+    // 退出前收敛所有活跃会话（关闭文件句柄；未定稿的头部由下次启动的 recovery 修复）
+    electron.app.on?.('before-quit', () => {
+      built.record.closeAll('before-quit')
+    })
+
     return { implemented: result.implemented, placeholders: result.placeholders }
   }
 

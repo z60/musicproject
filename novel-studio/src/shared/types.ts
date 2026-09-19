@@ -853,6 +853,22 @@ export interface LoudnessMeasurement {
 export type TaskKind =
   | 'book.import'
   | 'canvas.generate'
+  /**
+   * 重算说话人判定（`canvas:recomputeAttribution`）。
+   *
+   * 为什么单独一个 kind 而不是复用 `canvas.generate`：两者在任务中心里是**不同的事**
+   * ——生成是「从正文造出画本行」，重算是「对已有行重新判定归属」。共用一个 kind
+   * 会让用户看到「生成画本」却发生了重算，也让失败重试的语义含混。
+   */
+  | 'canvas.recompute'
+  /**
+   * 重建角色原型向量（`character:rebuildCentroid`）。
+   *
+   * 为什么单独一个 kind：它是**纯维护性**任务（把已判定行的向量重新汇总成角色原型），
+   * 既不产出用户可见的新内容，也不改画本行 —— 和「生成 / 重算」混在一起会让
+   * 任务中心的列表分不清「刚才那次跑了什么」。
+   */
+  | 'character.centroid'
   | 'embedding.batch'
   | 'asr.transcribe'
   | 'audio.process'
@@ -1044,6 +1060,16 @@ export interface AppSettings {
     trimThresholdDb: number
     trimPaddingMs: number
     echoCancellation: boolean
+    /**
+     * 录音设备 id → label 快照。
+     *
+     * 为什么主进程要存这个：`navigator.mediaDevices.enumerateDevices()` 只能在渲染进程调用，
+     * 且**未授权时拿不到 label**（docs/12 §11）。主进程把用户见过的 label 存下来，
+     * 这样「已拔掉但仍在偏好里」的设备在设置页里也能显示成人话，而不是一串 id。
+     */
+    deviceLabels: Record<string, string>
+    /** 最近一次「录 5 秒并回放」自检结果（docs/12 §11：自检结果存主进程） */
+    lastSelfTest: DeviceSelfTestResult | null
   }
   recording: {
     defaultMode: RecordingMode

@@ -16,6 +16,7 @@
 
 import type { Book, Chapter, Id } from '../../../../../shared/types.ts'
 import { AppError } from '../../../../../shared/errors.ts'
+import { dropUndefined } from '../../../../../shared/util/drop-undefined.ts'
 import type { BookRepo } from './book.repo.ts'
 import { createMemoryBookRepo } from './book.repo.ts'
 
@@ -165,7 +166,15 @@ export function createMemoryChapterRepo(seed: readonly ChapterWithText[] = []): 
     async update(id: Id, patch: Partial<Omit<Chapter, 'id' | 'bookId'>>): Promise<Chapter> {
       const item = alive(id) ? byId.get(id) : undefined
       if (!item) throw new AppError('NOT_FOUND', { details: { what: 'chapter', id } })
-      const next: Chapter = { ...item.chapter, ...patch, id: item.chapter.id, bookId: item.chapter.bookId }
+      // 只应用**真正给出**的键（`undefined` = 没给）。直接 spread 会把没给的可选字段
+      // 静默写成 undefined —— 内存实现没有 NOT NULL 约束，错得比 SQLite 更隐蔽
+      // （SQLite 那边会直接报错，见 chapter.repo.sqlite.ts 的同款注释）
+      const next: Chapter = {
+        ...item.chapter,
+        ...dropUndefined(patch),
+        id: item.chapter.id,
+        bookId: item.chapter.bookId,
+      }
       byId.set(id, { ...item, chapter: next })
       return { ...next }
     },
