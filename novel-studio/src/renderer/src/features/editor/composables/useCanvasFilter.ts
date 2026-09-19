@@ -16,6 +16,7 @@ import { computed, ref } from 'vue'
 import type { ComputedRef, Ref } from 'vue'
 import type { CanvasLine, Id, LineKind, LineState } from '@shared/types.ts'
 import { EMOTIONS, LINE_KIND_LABELS, LINE_STATE_LABELS } from '@shared/constants.ts'
+import { useReactiveList } from '@/shared/lib/reactive-list.ts'
 import { CANVAS_FLAG_LABELS } from '../stores/canvas.store.ts'
 
 /** 说话人维度的特殊取值（除角色 id 之外） */
@@ -112,27 +113,13 @@ export type CanvasLineSource =
   | (() => CanvasLine[])
   | CanvasLine[]
 
-let warnedPlainArray = false
-
 /**
  * @param source 行数据来源，见 {@link CanvasLineSource}。内部统一归一成 `ComputedRef`。
  */
 export function useCanvasFilter(source: CanvasLineSource): UseCanvasFilter {
-  const lines = computed<CanvasLine[]>(() => {
-    if (typeof source === 'function') return source()
-    if (Array.isArray(source)) {
-      // 普通数组没有响应式能力：只在开发期提示一次，不静默地给出「永远是空的」视图
-      if (!warnedPlainArray && typeof import.meta !== 'undefined' && (import.meta as { env?: { DEV?: boolean } }).env?.DEV) {
-        warnedPlainArray = true
-        console.warn(
-          '[useCanvasFilter] 传入的是普通数组，它只是快照、不会跟随 store 更新。' +
-            '请改传 getter：useCanvasFilter(() => canvas.lines)',
-        )
-      }
-      return source
-    }
-    return source.value
-  })
+  // 归一逻辑放在 `shared/lib/reactive-list.ts`（纯逻辑、无路径别名）：
+  // 那里能被 Node 单测直接覆盖，这个事故才可能被钉住（见该文件头与 docs/91 §5.2.27）
+  const lines = useReactiveList(source)
   const filter = ref<CanvasFilter>(createFilter())
 
   const kindOptions = (Object.keys(LINE_KIND_LABELS) as LineKind[]).map(value => ({
