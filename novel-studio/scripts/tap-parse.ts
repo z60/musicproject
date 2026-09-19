@@ -6,9 +6,12 @@
  *   Worker 引导脚本在模块顶层读 `workerData`，无法在普通进程里 import，
  *   因此把纯函数拆到这里，由 `tests/main/tap-parse.test.ts` 覆盖。
  *
- * ### 为什么不用 TAP 汇总行（`# pass N`）
- *   在本项目的运行环境里，汇总行**抓不到**：它不经过被替换的 `process.stdout.write`
- *   （实测等到 1 秒静默、或等到进程该退出，捕获文本里依然没有 `# pass`）。
+ * ### 为什么不用 TAP 汇总行来数用例，但**要用它来判断「跑完了」**
+ *   数用例仍然逐行分类（见下）：汇总行的 `# pass N` 在本环境里**抓得到**，
+ *   但早期误判成「抓不到」，于是收工条件只能靠「静默」，连踩两个坑
+ *   （先偶发「测试结果为空」，后**静默少算用例**，见 docs/91 §5.2.31 / §5.2.34）。
+ *   现在：`sawSummary` 是「这个文件真的跑完了」的判据，缺了它整轮判失败（宁可响，不可静默少算）。
+ *
  *   而 `node --test` 需要 fork 子进程（`spawn EPERM`），`run()` 不带参会把仓库里
  *   所有测试文件都 spawn 一遍（实测 42 个 `test:fail`，全是 `spawn EPERM`）。
  *
@@ -48,7 +51,7 @@ export interface TapParseResult {
   entries: TapEntry[]
   /** 无法判断是用例还是套件的原始行（非空即代表计数不可信） */
   unclassified: string[]
-  /** 文本里是否出现汇总行（本环境通常为 false；仅作诊断信息） */
+  /** 文本里是否出现汇总行（`# pass N` / `# tests N`）—— 出现即代表这个文件跑完了 */
   sawSummary: boolean
   /** 判定为套件（describe）的条数 */
   suites: number
@@ -136,7 +139,7 @@ export function parseTap(text: string): TapParseResult {
   return {
     entries,
     unclassified,
-    sawSummary: /# pass \d+/.test(text),
+    sawSummary: /^#\s*(?:pass|fail|tests)\s+\d+\s*$/m.test(text),
     suites,
     tests,
     skipped,

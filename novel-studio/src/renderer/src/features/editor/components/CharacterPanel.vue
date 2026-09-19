@@ -4,7 +4,9 @@
   功能清单（逐条对应文档表格）：
     增删改        名称、别名（多标签）、性别、年龄段、性格描述、备注、颜色、默认表演参数
     别名管理      别名参与判定（拼进原型文本），所以改名/增删别名后必须提示重算归属
-    自动抽取      从文本提取候选角色名 → 一键添加（CharacterCandidate）
+    自动抽取      从文本提取候选角色名 → 一键添加（CharacterCandidate）；
+                  范围优先取当前章，**本章抽不到时自动扩大到全书**并给一句明确回执
+                  （角色表是整本书的产物，只在一章里找会得到「点了没反应」，docs/91 §5.2.30）
     合并          多选 → CharacterMergeDialog（别名冲突 + 将影响 N 行）
     归档          不物理删除（保留引用），只标 archived，可恢复
     配音员绑定    角色 → 配音员（主 / 备）；一个配音员可多角色
@@ -15,6 +17,14 @@
     · 改名或删别名后弹出「需要重算归属」提示条，给「仅低置信 / 全量」两个按钮
       （docs/11 §4.6 + ATTRIBUTION_RECOMPUTE_REQUIRED：不重算的话判定结果会与角色表脱节）。
     · 合并前一定先看冲突清单，不让人盲合。
+
+  列表长度（docs/91 §5.2.33）：
+    自动抽取一次能塞进几十个角色（真机实测 122 万字的书抽完 65 个），每个角色一张详情卡
+    （别名 + 描述 + 4 项统计 + 配音员绑定）≈ 120px —— 面板原来既没有滚动区，
+    也不受侧栏高度约束，于是「角色名一多，角色栏就被撑得很长」。现在：
+      · 工具行固定在面板顶部，其余内容在**面板内部**滚动；
+      · 默认「紧凑」：一行一个角色（行数 · 字数 · 配音员），点这一行展开详情；
+      · 候选列表自带 max-height（一次几十个候选不该把角色列表挤到屏幕外）。
 -->
 
 <script setup lang="ts">
@@ -33,7 +43,7 @@ import { useCharactersStore } from '../stores/characters.store.ts'
 const props = withDefaults(defineProps<{
   /** 只读（任务包模式） */
   readonly?: boolean
-  /** 当前章节 id（抽取候选时作为范围提示） */
+  /** 当前章节 id：抽取候选时的**优先**范围（本章抽不到会自动扩大到全书） */
   chapterId?: Id | null
 }>(), {
   readonly: false,
@@ -354,6 +364,50 @@ function actorName(actorId: Id): string {
   return characters.actorById.get(actorId)?.name ?? '未知配音员'
 }
 
+// ---------------------------------------------------------------------------
+// 列表长度控制（真机反馈：角色一多，整个角色栏被撑得很长）
+// ---------------------------------------------------------------------------
+//
+// 一次自动抽取就能往角色表里塞几十个角色（真机实测：122 万字的书抽完 65 个），
+// 每个角色一张「详情卡」（别名 + 描述 + 4 项统计 + 配音员绑定）≈ 120px，
+// 60 个就是 7000px —— 面板既没有滚动区，也永远不会比窗口短。
+//
+// 做法两条（都不隐藏信息，只是默认收起 + 让面板自己滚）：
+//   ① 面板占满侧栏高度，列表在**面板内部**滚动（不再把页面/侧栏撑长）
+//   ② 默认「紧凑」：一行一个角色（行数/字数 + 配音员），点这一行展开详情；
+//      工具行的开关可整体切回「详细」
+
+/** 紧凑模式（默认开：角色多的时候一眼能扫完） */
+const compact = ref(true)
+/** 紧凑模式下被单独展开的角色 */
+const expandedIds = ref<Set<Id>>(new Set())
+
+function detailsVisible(character: Character): boolean {
+  return !compact.value || expandedIds.value.has(character.id)
+}
+
+function toggleDetails(characterId: Id): void {
+  const next = new Set(expandedIds.value)
+  if (next.has(characterId)) next.delete(characterId)
+  else next.add(characterId)
+  expandedIds.value = next
+}
+
+/** 「紧凑」开关（el-switch）：载荷为 boolean | string | number */
+function onCompactInput(value: boolean | string | number): void {
+  compact.value = Boolean(value)
+  // 切到「详细」时逐行展开状态就没意义了，清掉避免用户切回来时记住一堆展开项
+  if (!compact.value) expandedIds.value = new Set()
+}
+
+/** 紧凑模式那一行右侧的摘要：行数 · 字数 · 配音员 */
+function summaryOf(character: Character): string {
+  const stats = characters.statsOf(character.id)
+  const bindings = characters.bindingsByCharacter.get(character.id) ?? []
+  const actors = bindings.map(b => actorName(b.actorId)).join('、') || '未绑定配音员'
+  return `${formatInt(stats?.lines ?? null)} 行 · ${formatCount(stats?.chars ?? null)} · ${actors}`
+}
+
 onMounted(async () => {
   await characters.loadAllStats()
 })
@@ -361,7 +415,7 @@ onMounted(async () => {
 
 <template>
   <div class="ns-chars">
-    <!-- 工具行 -->
+    <!-- 工具行（固定在面板顶部，不随列表滚动） -->
     <header class="ns-chars__head">
       <el-input v-model="keyword" size="small" placeholder="搜索角色或别名" clearable class="ns-chars__search" />
       <el-switch
@@ -370,10 +424,27 @@ onMounted(async () => {
         active-text="含归档"
         @update:model-value="onIncludeArchivedInput"
       />
+      <el-switch
+        :model-value="compact"
+        size="small"
+        active-text="紧凑"
+        title="一行一个角色；点角色那一行可展开详情，关掉此开关则全部展开"
+        @update:model-value="onCompactInput"
+      />
       <el-button size="small" :disabled="readonly" @click="openCreate">新增角色</el-button>
-      <el-button size="small" :loading="characters.extracting" @click="runExtract">自动抽取</el-button>
+      <el-button
+        size="small"
+        :loading="characters.extracting"
+        title="先抽本章；本章抽不到候选角色时自动扩大到全书"
+        @click="runExtract"
+      >
+        自动抽取
+      </el-button>
       <el-button size="small" :disabled="readonly" @click="rebuildCentroid">重建原型向量</el-button>
     </header>
+
+    <!-- 抽取回执：抽不到也要有明确交代，否则按钮看起来是坏的（docs/91 §5.2.30） -->
+    <p v-if="characters.extractNote" class="ns-chars__extract-note">{{ characters.extractNote }}</p>
 
     <!-- 重算归属提示（改名 / 别名改动后） -->
     <div v-if="characters.attributionDirty" class="ns-chars__notice">
@@ -385,6 +456,8 @@ onMounted(async () => {
       </span>
     </div>
 
+    <!-- 主体：面板内部滚动（角色再多也不会把侧栏撑长） -->
+    <div class="ns-chars__body">
     <!-- 原型向量重建任务进度 -->
     <TaskProgressCard
       v-if="characters.centroidTaskId"
@@ -427,10 +500,21 @@ onMounted(async () => {
 
     <!-- 角色列表 -->
     <ul v-if="filtered.length" class="ns-chars__list">
-      <li v-for="character in filtered" :key="character.id" class="ns-chars__row" :class="{ 'is-archived': character.isArchived }">
-        <div class="ns-chars__row-head">
+      <li
+        v-for="character in filtered"
+        :key="character.id"
+        class="ns-chars__row"
+        :class="{ 'is-archived': character.isArchived, 'is-compact': !detailsVisible(character) }"
+      >
+        <!-- 单击这一行 = 展开/收起详情（只在紧凑模式下有意义；按钮各自 stop 掉冒泡） -->
+        <div
+          class="ns-chars__row-head"
+          :title="compact ? (detailsVisible(character) ? '收起详情' : '展开详情') : ''"
+          @click="compact && toggleDetails(character.id)"
+        >
           <el-checkbox
             :model-value="mergeSelection.has(character.id)"
+            @click.stop
             @update:model-value="onMergeSelectionInput(character.id)"
           />
           <i class="ns-chars__dot" :style="{ background: character.color ?? characters.colorOf(character.id) }" />
@@ -441,75 +525,80 @@ onMounted(async () => {
 
           <span class="ns-chars__grow" />
 
-          <el-button size="small" text @click="emit('focus-character', character.id)">看台词</el-button>
-          <el-button size="small" text :disabled="readonly" @click="openEdit(character)">编辑</el-button>
-          <el-button size="small" text :disabled="readonly" @click="askArchive(character)">
+          <!-- 紧凑模式：把「行数 · 字数 · 配音员」压在这一行里 -->
+          <span v-if="!detailsVisible(character)" class="ns-chars__summary">{{ summaryOf(character) }}</span>
+
+          <el-button size="small" text @click.stop="emit('focus-character', character.id)">看台词</el-button>
+          <el-button size="small" text :disabled="readonly" @click.stop="openEdit(character)">编辑</el-button>
+          <el-button size="small" text :disabled="readonly" @click.stop="askArchive(character)">
             {{ character.isArchived ? '恢复' : '归档' }}
           </el-button>
         </div>
 
-        <div v-if="character.aliases.length" class="ns-chars__aliases">
-          <el-tag v-for="alias in character.aliases" :key="alias" size="small" type="warning" effect="plain">
-            {{ alias }}
-          </el-tag>
-        </div>
-
-        <p v-if="character.description" class="ns-chars__desc">{{ character.description }}</p>
-
-        <div class="ns-chars__stats">
-          <span>行数 {{ formatInt(characters.statsOf(character.id)?.lines ?? null) }}</span>
-          <span>字数 {{ formatCount(characters.statsOf(character.id)?.chars ?? null) }}</span>
-          <span>预估 {{ formatDuration(characters.statsOf(character.id)?.estimatedDurationMs ?? null) }}</span>
-          <span>已录 {{ formatDuration(characters.statsOf(character.id)?.recordedMs ?? null) }}</span>
-          <span class="ns-chars__muted">
-            默认：{{ character.defaultEmotion ?? '情绪未设' }} / {{ character.defaultSpeed ?? '语速未设' }} / 停顿 {{ character.defaultPauseMs ?? '未设' }} ms
-          </span>
-          <el-button size="small" text @click="refreshStats(character.id)">刷新统计</el-button>
-        </div>
-
-        <div class="ns-chars__bindings">
-          <span class="ns-chars__muted">配音员：</span>
-          <template v-if="(characters.bindingsByCharacter.get(character.id) ?? []).length">
-            <el-tag
-              v-for="binding in characters.bindingsByCharacter.get(character.id) ?? []"
-              :key="binding.actorId"
-              size="small"
-              :type="binding.isPrimary ? 'success' : 'info'"
-              closable
-              @close="unbindActor(character.id, binding.actorId)"
-            >
-              {{ actorName(binding.actorId) }}{{ binding.isPrimary ? '（主）' : '（备）' }}
+        <template v-if="detailsVisible(character)">
+          <div v-if="character.aliases.length" class="ns-chars__aliases">
+            <el-tag v-for="alias in character.aliases" :key="alias" size="small" type="warning" effect="plain">
+              {{ alias }}
             </el-tag>
-          </template>
-          <span v-else class="ns-chars__muted">未绑定</span>
+          </div>
 
-          <el-select
-            :model-value="bindActorId[character.id] ?? ''"
-            size="small"
-            placeholder="选择配音员"
-            class="ns-chars__actor-select"
-            :disabled="readonly"
-            @update:model-value="onBindActorInput(character.id)"
-          >
-            <el-option v-for="actor in characters.actors" :key="actor.id" :label="actor.name" :value="actor.id" />
-          </el-select>
-          <el-checkbox
-            :model-value="bindPrimary[character.id] ?? false"
-            size="small"
-            :disabled="readonly"
-            @update:model-value="onBindPrimaryInput(character.id)"
-          >
-            主
-          </el-checkbox>
-          <el-button size="small" text :disabled="readonly || !bindActorId[character.id]" @click="bindActor(character.id)">绑定</el-button>
-        </div>
+          <p v-if="character.description" class="ns-chars__desc">{{ character.description }}</p>
+
+          <div class="ns-chars__stats">
+            <span>行数 {{ formatInt(characters.statsOf(character.id)?.lines ?? null) }}</span>
+            <span>字数 {{ formatCount(characters.statsOf(character.id)?.chars ?? null) }}</span>
+            <span>预估 {{ formatDuration(characters.statsOf(character.id)?.estimatedDurationMs ?? null) }}</span>
+            <span>已录 {{ formatDuration(characters.statsOf(character.id)?.recordedMs ?? null) }}</span>
+            <span class="ns-chars__muted">
+              默认：{{ character.defaultEmotion ?? '情绪未设' }} / {{ character.defaultSpeed ?? '语速未设' }} / 停顿 {{ character.defaultPauseMs ?? '未设' }} ms
+            </span>
+            <el-button size="small" text @click.stop="refreshStats(character.id)">刷新统计</el-button>
+          </div>
+
+          <div class="ns-chars__bindings">
+            <span class="ns-chars__muted">配音员：</span>
+            <template v-if="(characters.bindingsByCharacter.get(character.id) ?? []).length">
+              <el-tag
+                v-for="binding in characters.bindingsByCharacter.get(character.id) ?? []"
+                :key="binding.actorId"
+                size="small"
+                :type="binding.isPrimary ? 'success' : 'info'"
+                closable
+                @close="unbindActor(character.id, binding.actorId)"
+              >
+                {{ actorName(binding.actorId) }}{{ binding.isPrimary ? '（主）' : '（备）' }}
+              </el-tag>
+            </template>
+            <span v-else class="ns-chars__muted">未绑定</span>
+
+            <el-select
+              :model-value="bindActorId[character.id] ?? ''"
+              size="small"
+              placeholder="选择配音员"
+              class="ns-chars__actor-select"
+              :disabled="readonly"
+              @update:model-value="onBindActorInput(character.id)"
+            >
+              <el-option v-for="actor in characters.actors" :key="actor.id" :label="actor.name" :value="actor.id" />
+            </el-select>
+            <el-checkbox
+              :model-value="bindPrimary[character.id] ?? false"
+              size="small"
+              :disabled="readonly"
+              @update:model-value="onBindPrimaryInput(character.id)"
+            >
+              主
+            </el-checkbox>
+            <el-button size="small" text :disabled="readonly || !bindActorId[character.id]" @click.stop="bindActor(character.id)">绑定</el-button>
+          </div>
+        </template>
       </li>
     </ul>
 
     <EmptyState
       v-else
       title="还没有角色"
-      description="可以点「自动抽取」从正文里提取候选角色名（引导语主语 / 高频称谓），再一键添加。"
+      description="可以点「自动抽取」从正文里提取候选角色名（引导语主语 / 剧本体「名字：」/ 高频称谓），再一键添加。"
       icon="🎭"
       :bordered="false"
     />
@@ -530,6 +619,7 @@ onMounted(async () => {
       </ul>
       <p v-else-if="showWorkload" class="ns-chars__muted">还没有配音员，或尚未绑定任何角色。</p>
     </section>
+    </div>
 
     <!-- 编辑对话框 -->
     <el-dialog
@@ -658,6 +748,19 @@ onMounted(async () => {
   gap: 10px;
   padding: 8px;
   font-size: 13px;
+  /* 占满侧栏剩余高度：工具行固定，主体自己滚（否则角色一多就把整个侧栏撑长） */
+  flex: 1;
+  min-height: 0;
+}
+.ns-chars__body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  /* 滚动条不要贴着卡片 */
+  padding-right: 2px;
 }
 .ns-chars__head {
   display: flex;
@@ -683,6 +786,12 @@ onMounted(async () => {
   display: inline-flex;
   gap: 4px;
 }
+.ns-chars__extract-note {
+  margin: 0;
+  color: var(--ns-text-secondary, #909399);
+  font-size: 12px;
+  line-height: 1.6;
+}
 .ns-chars__candidates {
   padding: 8px;
   border: 1px dashed var(--ns-border, #dcdfe6);
@@ -702,6 +811,9 @@ onMounted(async () => {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  /* 一次抽取可能有几十个候选：给它自己的滚动区，别把角色列表挤到屏幕外 */
+  max-height: 220px;
+  overflow-y: auto;
 }
 .ns-chars__candidate {
   display: flex;
@@ -738,6 +850,9 @@ onMounted(async () => {
   border: 1px solid var(--ns-border-light, #e4e7ed);
   border-radius: 6px;
 }
+.ns-chars__row.is-compact {
+  padding: 4px 8px;
+}
 .ns-chars__row.is-archived {
   opacity: 0.6;
 }
@@ -745,6 +860,18 @@ onMounted(async () => {
   display: flex;
   align-items: center;
   gap: 6px;
+  /* 可点：展开/收起这一行的详情 */
+  cursor: pointer;
+  flex-wrap: wrap;
+}
+.ns-chars__row-head button {
+  /* 按钮自己处理点击（模板里已 stop 冒泡），别让鼠标显示成「展开」 */
+  cursor: pointer;
+}
+.ns-chars__summary {
+  color: var(--ns-text-secondary, #909399);
+  font-size: 11px;
+  white-space: nowrap;
 }
 .ns-chars__dot {
   width: 10px;

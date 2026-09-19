@@ -99,10 +99,15 @@ describe('TAP 解析：把套件与用例分开', () => {
     assert.deepEqual(r.unclassified, [], '每条结果都有 type 字段，不该有未分类项')
   })
 
-  it('识别汇总行（本环境抓不到，但拿到时必须认出来）', () => {
+  it('识别汇总行（收工与「是否跑完」都靠它）', () => {
     const r = parseTap(SAMPLE)
     assert.equal(r.sawSummary, true)
-    assert.equal(parseTap(SAMPLE.replace(/# pass \d+/, '# pass X')).sawSummary, false)
+    // 整块汇总行（`# tests/# suites/# pass/# fail`）都没了 = 这个文件没跑完
+    const noSummary = SAMPLE.replace(/^#\s*(?:pass|fail|tests|suites)\s+\d+\s*$/gm, '')
+    assert.equal(parseTap(noSummary).sawSummary, false)
+    // `# tests N` 单独出现也算（真机抓到的汇总块里它排在 `# pass` 前面）
+    assert.equal(parseTap('# tests 20\n').sawSummary, true)
+    assert.equal(parseTap("ok 1 - 甲\n  ---\n  type: 'test'\n  ...\n").sawSummary, false, '没有汇总行 = 没跑完')
   })
 
   it('嵌套 describe 的多层套件全部排除', () => {

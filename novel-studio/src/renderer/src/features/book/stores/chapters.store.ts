@@ -162,6 +162,20 @@ export const useChaptersStore = defineStore('book/chapters', () => {
   // ---------------------------------------------------------------------------
 
   async function load(nextBookId: string): Promise<ChapterRow[]> {
+    /**
+     * 换书时先丢掉上一本书的**界面级状态**（真机反馈：docs/91 §5.2.35）。
+     *
+     * `canvasTasks` 的键是 chapterId —— 上一本书提交的「生成画本」任务如果不清理，
+     * 切到另一本书后「章节管理」还会继续显示那些进度卡；而 `chapterTitleOf` 在新书里
+     * 找不到那些章节，只能回退成 uuid，于是界面上出现「生成画本：1925adee-…」这种
+     * **非本书的提示**。`workloads`（配音员分工）同理，它也是上一本书的数据。
+     *
+     * 任务本身没有消失：任务中心（`/tasks`）仍然能看到与取消它。
+     */
+    if (bookId.value !== null && bookId.value !== nextBookId) {
+      canvasTasks.value = {}
+      workloads.value = []
+    }
     bookId.value = nextBookId
     loading.value = true
     try {

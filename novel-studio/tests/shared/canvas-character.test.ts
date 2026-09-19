@@ -279,6 +279,193 @@ describe('角色抽取：短语碎片必须被挡住（真机回归）', () => {
     assert.equal(top.occurrences, 5, 'UI 上显示的「出现 N 次」应当是正文里的真实次数')
   })
 
+  /**
+   * 信号 1b：剧本体（`名字：”台词“`）。
+   *
+   * 真机事故（docs/91 §5.2.30）：《我陪魔神历劫》第 2 章 726 字通篇是这种写法，
+   * 一个言语引导语动词都没有，抽取结果 0 个候选 —— 用户点「自动抽取」，界面上什么都不出现。
+   */
+  it('信号 1b：剧本体「名字：「台词」」的行首主语能抽出来', () => {
+    const text = [
+      '无畏翻了个白眼：“你瞎啊，看不到岩浆地下那个黑团子吗？”',
+      '我仔细瞅瞅，还真有个黑团子，我转头看向无畏：“那什么玩意？”',
+      '无畏一脸的悲悯：“三界的灾难啊。”',
+      '琉璃：“是这个道理。”',
+      '琉璃点了点头。',
+      '无畏转头看向我：“告诉你们，别打我的主意。”',
+    ].join('\n')
+    const names = extractCharacterCandidates(text, { minOccurrences: 2 }).map((c) => c.name)
+    assert.ok(names.includes('无畏'), `剧本体的说话人要能抽出来：${JSON.stringify(names)}`)
+    assert.ok(names.includes('琉璃'))
+  })
+
+  it('信号 1b：章节标题行（第1节：三神会晤）不会被当成角色', () => {
+    const text = ['第1节：三神会晤', '第2节：来到异世', '琉璃：“是这个道理。”', '琉璃笑了笑。'].join('\n')
+    const names = extractCharacterCandidates(text, { minOccurrences: 1 }).map((c) => c.name)
+    for (const junk of ['第1节', '第2节', '三神会晤', '来到异世']) {
+      assert.ok(!names.includes(junk), `标题不该成候选：${JSON.stringify(names)}`)
+    }
+  })
+
+  it('信号 1b：4 字名（纳兰嫣然：）整段取，不退化成前缀', () => {
+    const text = [
+      '纳兰嫣然：“悔婚之事，我纳兰家族从不后悔。”',
+      '纳兰嫣然傲然道：“我说过的话，从不收回。”',
+      '纳兰嫣然转过身去。',
+    ].join('\n')
+    const names = extractCharacterCandidates(text, { minOccurrences: 2 }).map((c) => c.name)
+    assert.ok(names.includes('纳兰嫣然'), JSON.stringify(names))
+    for (const fragment of ['纳兰', '纳兰嫣']) {
+      assert.ok(!names.includes(fragment), `不该留下前缀碎片「${fragment}」：${JSON.stringify(names)}`)
+    }
+  })
+
+  it('信号 1b：带引导语动词的窗口交给信号 1，不重复抽（避免「萧炎沉」这种碎片）', () => {
+    const text = [
+      ...Array.from({ length: 10 }, () => '萧炎沉声道：“我必去。”'),
+      // 真角色必须在叙述里单独出现过（严格模式的判据，见本文件「复合词里的假引导语」一条）
+      '萧炎走了。',
+    ].join('\n')
+    const names = extractCharacterCandidates(text, { minOccurrences: 2 }).map((c) => c.name)
+    assert.ok(names.includes('萧炎'), JSON.stringify(names))
+    assert.ok(!names.includes('萧炎沉'), `引导语窗口不该另抽一份：${JSON.stringify(names)}`)
+  })
+
+  /**
+   * 人名形态证据（docs/91 §5.2.32）。
+   *
+   * 真机事故：用户的原话是「抽取到 7 个候选角色 的丑陋/毫无疑/骂咧咧/模样不/丧尸星/嫌弃的/一通」——
+   * 这 7 个**全是错误对象**。而在 94 章 / 122 万字那本书上，抽取结果更夸张：
+   * 231 个候选里 `开始(355) / 上面(354) / 尽管(245) / 第二(153) / 躬身(106) / 随口(74)`
+   * 全都排在真角色中间 —— 它们的「出现次数」比一半真角色都高，
+   * 所以**任何按出现次数/位置的过滤都拦不住，只有人名形态能拦**。
+   */
+  const REAL_STYLE = [
+    // ① 引导语窗口的切片错误：短语紧跟标点后被当成「名字 + 引导语」（真机垃圾词的来源）
+    '他停了一下，随口问道：“几时动身？”',
+    '她想了想，随口问道：“去哪里？”',
+    '他随口一说，众人都笑了。',
+    '沈绪停下脚步，躬身道：“弟子遵命。”',
+    '段青站在门外，躬身道：“是。”',
+    '他微微躬身，退了出去。',
+    '他愣了一下，随后轻轻说道：“走吧。”',
+    '她抬起眼，随后轻轻说道：“好。”',
+    '他随后就走了。',
+    '他愣了一下，开始说道：“那便试试。”',
+    '她顿了一顿，开始说道：“也好。”',
+    '他开始发烧，晏灵修守了一夜。',
+    // ② 真角色：姓氏开头（引导语 + 叙述各一次，严格模式要求叙述里单独出现过）
+    '姜练沉声道：“退下。”',
+    '姜练站在窗前。',
+    '晏灵修沉声道：“不妥。”',
+    '晏灵修一直没有说话。',
+    '沈绪说道：“弟子遵命。”',
+    '沈绪退了出去。',
+    '景琼说道：“好。”',
+    '景琼站在门外。',
+    '段青说道：“是。”',
+    '段青站在一旁。',
+    '顾安沉声道：“安静。”',
+    '顾安祖师点了点头。',
+    '顾安祖师又说了一句。',
+    // ③ 真角色：行首说话人位置（剧本体）
+    '白言书：“在下白言书。”',
+    '白言书拂了拂袖子。',
+    '无畏翻了个白眼：“你瞎啊？”',
+    '无畏转身就走。',
+    '琉璃：“是这个道理。”',
+    '琉璃转过身去。',
+    '小丧：“喵。”',
+    '小丧跳上了桌子。',
+    // ④ 角色称谓：`掌教/师尊` 是要分配声音的角色，`拜见师尊` 是称呼语切片（必须丢掉）
+    '掌教沉声道：“都退下。”',
+    '那人赶紧拜见掌教。',
+    '师尊沉声道：“都退下。”',
+    '那人赶紧拜见师尊。',
+    '荒老沉声道：“慢慢来。”',
+    '荒老坐在上首。',
+  ].join('\n')
+
+  it('形态证据：常用词碎片不进候选（随口/躬身/随后/开始）', () => {
+    const names = extractCharacterCandidates(REAL_STYLE, { minOccurrences: 2 }).map((c) => c.name)
+    for (const junk of ['随口', '躬身', '随后', '开始', '随后轻轻']) {
+      assert.ok(!names.includes(junk), `常用词不该成候选：${JSON.stringify(names)}`)
+    }
+  })
+  it('形态证据：真角色一个都不能少（姓氏 / 称谓 / 说话人位置）', () => {
+    const names = extractCharacterCandidates(REAL_STYLE, { minOccurrences: 2 }).map((c) => c.name)
+    for (const real of ['姜练', '晏灵修', '沈绪', '景琼', '段青', '顾安', '白言书', '无畏', '琉璃', '小丧', '掌教', '师尊', '荒老']) {
+      assert.ok(names.includes(real), `真角色「${real}」被误杀：${JSON.stringify(names)}`)
+    }
+  })
+
+  it('「名字 + 尊称」并成别名，而不是留下切片：顾安祖师 → 顾安', () => {
+    const cands = extractCharacterCandidates(REAL_STYLE, { minOccurrences: 2 })
+    const byName = new Map(cands.map((c) => [c.name, c]))
+    assert.ok(byName.has('顾安'), JSON.stringify(cands.map((c) => c.name)))
+    assert.ok(byName.get('顾安')!.aliases.includes('顾安祖师'), '尊称写法应并成别名')
+    assert.ok(!byName.has('顾安祖师'), '并成别名后不该再作为独立候选')
+  })
+
+  it('动词短语不会被挂到角色名下（拜见师尊）', () => {
+    const cands = extractCharacterCandidates(REAL_STYLE, { minOccurrences: 1 })
+    const shizun = cands.find((c) => c.name === '师尊')
+    assert.ok(shizun, JSON.stringify(cands.map((c) => c.name)))
+    assert.deepEqual(shizun.aliases, [], `师尊 名下不该有动词短语：${JSON.stringify(shizun.aliases)}`)
+    assert.ok(!cands.some((c) => c.name.includes('拜见')), '「拜见师尊」这类切片不该成为候选')
+  })
+
+  it('requirePersonEvidence=false 回到旧行为（证明是这道门在挡垃圾）', () => {
+    const loose = extractCharacterCandidates(REAL_STYLE, {
+      minOccurrences: 2,
+      requirePersonEvidence: false,
+    }).map((c) => c.name)
+    assert.ok(loose.includes('随口'), `关掉门时「随口」应当出现：${JSON.stringify(loose)}`)
+    assert.ok(loose.includes('躬身'))
+  })
+
+  it('被挡掉的词通过 onReject 交出来（「候选变少了」必须有解释）', () => {
+    const rejected: Array<{ name: string; occurrences: number; reason: string }> = []
+    extractCharacterCandidates(REAL_STYLE, {
+      minOccurrences: 2,
+      onReject: (list) => rejected.push(...list),
+    })
+    const names = rejected.map((r) => r.name)
+    assert.ok(names.includes('随口'), JSON.stringify(names))
+    assert.ok(names.includes('躬身'))
+    assert.ok(rejected.every((r) => r.reason === 'not-person-like'))
+  })
+
+  it('形态证据之外还要位置证据：句首从未出现过的「姓氏形」常用词也要挡掉', () => {
+    // `高兴` 以姓氏字「高」开头（形态证据成立），但它每次都在句中：
+    // 真人名会反复做主语（真机实测 17%~61% 的出现在句首），这是区分「形似人名」与「就是人名」的判据
+    const text = [
+      '他愣了一下，高兴说道：“好。”',
+      '她想了想，高兴说道：“行。”',
+      '沈绪高兴得跳了起来。',
+      '姜练沉声道：“退下。”',
+      '姜练站在窗前。',
+    ].join('\n')
+    const names = extractCharacterCandidates(text, { minOccurrences: 2 }).map((c) => c.name)
+    assert.ok(!names.includes('高兴'), `句首 0 次的「高兴」应当被位置证据挡掉：${JSON.stringify(names)}`)
+    assert.ok(names.includes('姜练'), `真角色要留下：${JSON.stringify(names)}`)
+  })
+
+  it('异体姓氏归并：沉破天 并进 沈破天（同一本书里两种写法）', () => {
+    const text = [
+      ...Array.from({ length: 10 }, () => '沈破天沉声道：“谁？”'),
+      '沈破天站在门口。',
+      ...Array.from({ length: 8 }, () => '沉破天说道：“谁？”'),
+      '沉破天站在原地。',
+      ...Array.from({ length: 6 }, () => '晏灵修站在一旁。'),
+    ].join('\n')
+    const cands = extractCharacterCandidates(text, { minOccurrences: 2 })
+    const byName = new Map(cands.map((c) => [c.name, c]))
+    assert.ok(byName.has('沈破天'), JSON.stringify(cands.map((c) => c.name)))
+    assert.ok(byName.get('沈破天')!.aliases.includes('沉破天'), '异体写法应并成别名')
+    assert.ok(!byName.has('沉破天'), '异体写法不该作为独立角色')
+  })
+
   it('整本书量级的性能：十万字以上正文下抽取仍是亚秒级（不得 O(候选×正文)）', () => {
     // 造 50 个角色 × 3000 轮（每轮一句对白 + 一句叙述）≈ 20 万字
     const names = Array.from({ length: 50 }, (_, i) => `角色${String.fromCharCode(0x4e00 + i)}甲`)

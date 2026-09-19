@@ -293,11 +293,24 @@ async function onGenerateCanvas(ids: string[]): Promise<void> {
   }
 }
 
-/** 画本任务面板：chapterId → taskId（只展示最近提交的 6 个，避免把页面撑长） */
-const canvasTaskEntries = computed(() => Object.entries(chapters.canvasTasks).slice(-6))
+/**
+ * 画本任务面板：chapterId → taskId。
+ *
+ * 两道过滤（真机反馈：docs/91 §5.2.35）：
+ *   · `chapterIdOf` 只认**当前这本书里真实存在的章节** —— 上一本书的任务登记
+ *     （切换书籍时 store 会清掉，但 `load` 还没回来、或章节已被删除时仍可能出现）
+ *     不该在「章节管理」里冒充本书的提示；
+ *   · 再取最近 6 个，避免把页面撑长。
+ */
+const canvasTaskEntries = computed(() =>
+  Object.entries(chapters.canvasTasks)
+    .filter(([chapterId]) => chapters.getById(chapterId) !== null)
+    .slice(-6),
+)
 
+/** 面板标题里的章节名：找不到就给「未知章节」，**绝不把 uuid 显示给用户** */
 function chapterTitleOf(chapterId: string): string {
-  return chapters.getById(chapterId)?.title ?? chapterId
+  return chapters.getById(chapterId)?.title ?? '未知章节'
 }
 
 /** 重试：先清掉旧任务登记，再用同一章的选项重新提交（canvas:generate 的载荷是单章） */

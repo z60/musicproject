@@ -160,6 +160,15 @@ export const PAUSE_INLINE_MIN_CHARS = 16
 /** 句内停顿的最小间隔（字符） */
 export const PAUSE_INLINE_MIN_SPACING = 8
 
+/**
+ * 行内短引号的最大字数：`一颗脑袋混着血浆“嘭”的一声在我跟前炸了` 里的「嘭」是拟声强调，
+ * 不是有人在说话。引号内 ≤ 该字数、且**前后都还有叙述文字**时，整句按旁白处理（引号里的字照读）。
+ *
+ * 反例（不该走这条）：`疑惑的看向无畏：“什么意思？”` —— 引号在句末，前面只有引导语，
+ * 那就是一句台词 + 一句旁白（docs/11 §2.2）。
+ */
+export const INLINE_QUOTE_MAX_CHARS = 4
+
 /** 情绪/语速词表（L1 优先；命中则**不调** LLM，docs/06 §7.2「本地优先」） */
 export const EMOTION_LEXICON: ReadonlyArray<{
   emotion: string
@@ -255,9 +264,10 @@ export const NON_NAME_TOKENS: readonly string[] = [
  *
  * 抽取时用它挡掉「的丑陋 / 嫌弃的 / 笑着 / 毫无疑」这类碎片 ——
  * 真机实测（用户反馈）：一章 8900 字能抽出 70+ 个候选，绝大多数是这种短语碎片。
+ * 「者」是后加的：`老者轻`（`老者轻轻说道` 的切片）就是靠它挡掉的（docs/91 §5.2.32）。
  */
 const NAME_IMPOSSIBLE_CHARS = new Set(
-  '的地得着了过吗呢吧啊呀哦嗯嘛呗啦之乎矣焉也都很太更最就还又便却才只没哼唉咦唔噢哎哟嘿咳噗嗤'.split(''),
+  '的地得着了过吗呢吧啊呀哦嗯嘛呗啦之乎矣焉也都很太更最就还又便却才只没哼唉咦唔噢哎哟嘿咳噗嗤者兮哉'.split(''),
 )
 
 /**
@@ -273,6 +283,15 @@ const NAME_EDGE_REJECT_CHARS = new Set(
     // 动词/介词开头：`到叶海说道` 的「到叶海」、`看叶海说道` 的「看叶海」都是切片错误
     .concat('到跟看听想走去回起坐站喊叫笑哭问答来抓拉推拿'.split('')),
 )
+
+/**
+ * **只用于尾字**的拒绝字表（真机切片残渣的尾字）。
+ *
+ * `符篆上`（`符篆上的…`）、`白猫感`（`大白猫感…`）、`老者感`、`厉声` 这类都是切片错误，
+ * 它们的共同点是**尾巴粘着量词/名词性字**。之所以单列一张「只看尾字」的表而并进上面那张：
+ * `上` 是复姓「上官」的首字，并进去会把 `上官云` 一起误杀。
+ */
+const NAME_TAIL_REJECT_CHARS = new Set('上感声色面等个种样'.split(''))
 
 /**
  * 判断一个字符串**像不像人名**（抽取候选的公共过滤器）。
@@ -306,6 +325,7 @@ export function looksLikePersonName(token: string): boolean {
   const first = t[0]!
   const last = t[t.length - 1]!
   if (NAME_EDGE_REJECT_CHARS.has(first) || NAME_EDGE_REJECT_CHARS.has(last)) return false
+  if (NAME_TAIL_REJECT_CHARS.has(last)) return false
   // 叠词：AAB（耸耸肩 / 撇撇嘴）与 ABB（后两字相同）
   if (t.length >= 3 && (t[0] === t[1] || t[t.length - 1] === t[t.length - 2])) return false
   if (t.length === 2 && t[0] === t[1]) return false
@@ -746,6 +766,19 @@ export interface KindClassification {
   dashDialogue: boolean
   /** 命中的规则标识，便于 UI「为什么这么判」 */
   matched: string[]
+  /**
+   * 引号**外面**的文字（docs/11 §2.2）：它们也必须成行（kind='narration'），不能丢。
+   *
+   * 真机事故（docs/91 §5.2.29）：`疑惑的看向无畏：“什么意思，今年桃花宴换地方了？”`
+   * 以前只产出一行台词「什么意思，今年桃花宴换地方了？」，前半句叙述直接消失 ——
+   * 用户看到的画本「只有双引号里面的内容」。
+   *
+   * 唯一的例外是**纯说话人标签**（`萧炎说道：` / `我：`）：它已经写进行归属（`cue`），
+   * 朗读出来只会变成噪音，所以不进这个数组。
+   *
+   * `start`/`end` 是相对**本次入参文本（已 trim）**的偏移；调用方加上该行的 charStart 即可还原原文偏移。
+   */
+  narrations: Array<{ position: 'before' | 'after'; text: string; start: number; end: number }>
 }
 
 export interface ClassifyOptions {
@@ -791,6 +824,7 @@ export function classifyKind(
         unbalanced: false,
         dashDialogue: false,
         matched,
+        narrations: [],
       }
     }
   }
@@ -799,7 +833,7 @@ export function classifyKind(
   const spans = findTopLevelQuoteSpans(text)
   const unbalanced = depth.unclosed > 0 || depth.orphanCloses > 0
 
-  // 2) 引号包裹 → dialogue
+  // 2) 引号包裹 → dialogue（引号**外**的文字另交 narrations，docs/11 §2.2）
   if (spans.length > 0) {
     const first = spans[0]
     const pair = QUOTE_PAIRS.find(([o]) => o === text[first.outerStart])
@@ -810,6 +844,35 @@ export function classifyKind(
       matchCue(leading, 'before', opts) ??
       matchCue(trailing, 'after', opts) ??
       (spans.length > 1 ? matchCue(text.slice(spans[0].outerEnd, spans[1].outerStart), 'middle', opts) : null)
+
+    /**
+     * 行内短引号：`一颗脑袋混着血浆“嘭”的一声，在我跟前炸了`
+     *
+     * 判据三条同时成立：引号内很短（≤ INLINE_QUOTE_MAX_CHARS）、**前后都有**叙述文字、
+     * 且两侧都不是说话人标签。此时整句按旁白处理（引号内的字照读），
+     * 不切成「旁白碎片 + 一行只有一个字的台词」——那既不是台词也不是可用的旁白。
+     */
+    if (
+      countReadableChars(inner) <= INLINE_QUOTE_MAX_CHARS &&
+      leading.trim().length > 0 &&
+      trailing.trim().length > 0 &&
+      !isSpeakerLabel(leading) &&
+      !isSpeakerLabel(trailing)
+    ) {
+      matched.push('quote_pair', 'inline_quote')
+      if (unbalanced) matched.push('quote_unmatched')
+      return {
+        kind: 'narration',
+        text,
+        quoteStyle: null,
+        cue: null,
+        unbalanced,
+        dashDialogue: false,
+        matched,
+        narrations: [],
+      }
+    }
+
     matched.push('quote_pair')
     if (cue) matched.push('cue')
     if (unbalanced) matched.push('quote_unmatched')
@@ -822,6 +885,10 @@ export function classifyKind(
       unbalanced,
       dashDialogue: false,
       matched,
+      narrations: [
+        ...narrationsOf(text, 0, first.outerStart, 'before'),
+        ...narrationsOf(text, spans[spans.length - 1].outerEnd, text.length, 'after'),
+      ],
     }
   }
 
@@ -837,6 +904,7 @@ export function classifyKind(
       unbalanced,
       dashDialogue: true,
       matched,
+      narrations: [],
     }
   }
 
@@ -855,6 +923,7 @@ export function classifyKind(
       unbalanced,
       dashDialogue: false,
       matched,
+      narrations: [],
     }
   }
 
@@ -868,7 +937,49 @@ export function classifyKind(
     unbalanced,
     dashDialogue: false,
     matched,
+    narrations: [],
   }
+}
+
+/**
+ * 引号外的一段文字 → 旁白片段（**纯说话人标签返回空数组**，它已经写进行归属字段）。
+ *
+ * `start`/`end` 是相对入参文本的原始偏移（未 trim），trim 后同步修正，保证能切回原文。
+ */
+function narrationsOf(
+  text: string,
+  start: number,
+  end: number,
+  position: 'before' | 'after',
+): KindClassification['narrations'] {
+  const raw = text.slice(start, end)
+  const lead = /^\s*/.exec(raw)?.[0].length ?? 0
+  const trail = /\s*$/.exec(raw)?.[0].length ?? 0
+  const body = raw.slice(lead, raw.length - trail)
+  if (body.length === 0) return []
+  if (isSpeakerLabel(body)) return []
+  return [{ position, text: body, start: start + lead, end: end - trail }]
+}
+
+/**
+ * 这段文字是不是**纯说话人标签**（`萧炎说道：` / `无畏：` / `我：`）？
+ *
+ * 为什么要把它们和叙述区分开：标签已经写进行归属（`cue` / `character_id`），
+ * 再落一行旁白就会被念出来（「无畏冒号」），既难听又多余；
+ * 而 `疑惑的看向无畏：` 这种带动作的描述必须念 —— 它是有声书正文的一部分。
+ *
+ * 判据（任一成立即标签）：
+ *   1. 去掉结尾标点后只剩代词/泛称（`我：` `他：` `众人：`）
+ *   2. 以言语引导语结尾（`萧炎沉声道：` `他说道。`）
+ *   3. 本身就是一个人名，且没有动作/修饰尾巴（`无畏：` `纳兰嫣然：`；
+ *      而 `苏哲点头：` 会被判成叙述 —— 它带了动作，是要念出来的）
+ */
+function isSpeakerLabel(plain: string): boolean {
+  const core = plain.trim().replace(/[：:，,。.；;！!？?…—\s]+$/u, '').trim()
+  if (core.length === 0) return true
+  if (core.length <= 2 && NON_NAME_TOKENS.includes(core)) return true
+  if (matchCue(core, 'before') !== null) return true
+  return looksLikePersonName(core) && stripCueModifiers(core) === core
 }
 
 /**
@@ -1387,6 +1498,28 @@ export function applyRulePostProcess(
   /** 上一行**最终**指派的角色（仅当上一行是台词/内心行时才对「连续对白」有效） */
   let lastAssigned: LastSpeaker | null = null
 
+  /**
+   * 「同一句原文切出的旁白碎片」（见 generateCanvas Step 2）：这类旁白行的字符区间
+   * **包含在**相邻台词/内心行的区间里 —— 它们和那句台词出自同一句原文
+   * （`“我乃炼药师。”他站在原地。`）。它们不应该打断「连续对白」链，
+   * 也不应该清掉上一说话人：否则下一行无引导语的台词会白白丢掉这个强信号。
+   *
+   * 注意：插入式对白（`“我……”他顿了顿，“……不去了。”`）切出的片段是**互不重叠**的区间，
+   * 不在这个判定里 —— 它们中间确实换了叙述对象，打断链条是对的。
+   */
+  const splitFragment: boolean[] = lines.map((line, i) => {
+    if (line.kind !== 'narration') return false
+    if (line.charEnd <= line.charStart) return false
+    const neighbors = [i > 0 ? lines[i - 1] : null, i + 1 < lines.length ? lines[i + 1] : null]
+    return neighbors.some(
+      (nb) =>
+        nb != null &&
+        (nb.kind === 'dialogue' || nb.kind === 'inner') &&
+        nb.charStart <= line.charStart &&
+        nb.charEnd >= line.charEnd,
+    )
+  })
+
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]
     const base = results[i] ?? emptyDecision(line)
@@ -1397,9 +1530,11 @@ export function applyRulePostProcess(
       sceneCharacters = new Set<Id>()
     }
 
-    // 「上一说话人」只在上一行确实是台词/内心行时成立（docs/06 §5.1 Step 6：上一行是角色 A 的台词）
+    // 「上一说话人」只在上一行确实是台词/内心行时成立（docs/06 §5.1 Step 6：上一行是角色 A 的台词）；
+    // 例外是上面那种「同一句原文切出的旁白碎片」—— 它后面紧跟的台词仍然算「接在台词之后」
     const prevLine = i > 0 ? lines[i - 1] : null
-    const prevIsSpeakerLine = prevLine != null && (prevLine.kind === 'dialogue' || prevLine.kind === 'inner')
+    const prevIsSpeakerLine =
+      prevLine != null && (prevLine.kind === 'dialogue' || prevLine.kind === 'inner' || splitFragment[i - 1] === true)
     // 取「上一说话人」时必须**显式断言**类型：`lastAssigned` 的初始值是 null，
     // TS 的控制流分析在循环内会认为它永远是 null（实际会被循环体后半段改写），
     // 于是 `prevCharacter` 被收窄成 never，后面所有字段访问都报 TS2339。
@@ -1550,7 +1685,8 @@ export function applyRulePostProcess(
     if (clone.characterId && clone.speakerType === 'character') {
       sceneCharacters.add(clone.characterId)
       lastAssigned = { characterId: clone.characterId, name: clone.name ?? '' }
-    } else {
+    } else if (splitFragment[i] !== true) {
+      // 同一句原文切出的旁白碎片不清「上一说话人」（见上方 splitFragment 的注释）
       lastAssigned = null
     }
 
@@ -2029,30 +2165,74 @@ export async function generateCanvas(input: CanvasGenerateInput): Promise<Canvas
   let sceneLineCount = 0
   for (const d of drafts) {
     const cls = classifyKind(d.text)
-    const cueSpeaker = cls.cue ? resolveSpeakerHint(characters, cls.cue)?.character ?? null : null
     if (d.startsParagraph && (sceneLineCount >= 3 || sceneIndex < 0)) {
       sceneIndex++
       sceneLineCount = 0
     }
-    sceneLineCount++
-    lines.push({
-      id: idOf(seq),
-      seq,
+
+    /**
+     * 一句原文可能切出多行：引号外的叙述（cls.narrations）在台词前后各成一行旁白，
+     * 台词行夹在中间（docs/11 §2.2）。这样「只有双引号里面的内容」不再发生。
+     */
+    const pieces: Array<{
+      kind: LineKind
+      text: string
+      sourceText: string
+      cue: CueInfo | null
+      charStart: number
+      charEnd: number
+      /** 这块文字是不是从**同一句原文**里切出来的（判定层的「连续对白」链要跳过它） */
+      splitFragment: boolean
+    }> = []
+
+    const pushNarration = (n: KindClassification['narrations'][number]): void => {
+      const sub = classifyKind(n.text)
+      pieces.push({
+        // 片段里没有顶层引号（引号已被切走），所以不会是台词；但破折号对白/音效/内心仍按规则走
+        kind: sub.kind,
+        text: sub.kind === 'dialogue' ? sub.text : n.text,
+        sourceText: n.text,
+        cue: sub.cue,
+        charStart: d.charStart + n.start,
+        charEnd: d.charStart + n.end,
+        splitFragment: true,
+      })
+    }
+
+    for (const n of cls.narrations) if (n.position === 'before') pushNarration(n)
+    pieces.push({
       kind: cls.kind,
       text: cls.text,
       sourceText: d.text,
       cue: cls.cue,
-      cueSpeaker,
       charStart: d.charStart,
       charEnd: d.charEnd,
-      paragraphIndex: d.paragraphIndex,
-      sceneIndex: Math.max(0, sceneIndex),
-      startsParagraph: d.startsParagraph,
-      endsParagraph: d.endsParagraph,
-      quoteUnmatched: d.quoteUnmatched || cls.unbalanced,
-      tooLong: d.tooLong,
+      splitFragment: false,
     })
-    seq++
+    for (const n of cls.narrations) if (n.position === 'after') pushNarration(n)
+
+    pieces.forEach((p, idx) => {
+      lines.push({
+        id: idOf(seq),
+        seq,
+        kind: p.kind,
+        text: p.text,
+        sourceText: p.sourceText,
+        cue: p.cue,
+        cueSpeaker: p.cue ? resolveSpeakerHint(characters, p.cue)?.character ?? null : null,
+        charStart: p.charStart,
+        charEnd: p.charEnd,
+        paragraphIndex: d.paragraphIndex,
+        sceneIndex: Math.max(0, sceneIndex),
+        // 段落首/末标记只给这一组的第一行/最后一行（与 splitToLines 的口径一致）
+        startsParagraph: d.startsParagraph && idx === 0,
+        endsParagraph: d.endsParagraph && idx === pieces.length - 1,
+        quoteUnmatched: p.splitFragment ? false : d.quoteUnmatched || cls.unbalanced,
+        tooLong: p.splitFragment ? countReadableChars(p.text) > limits.maxLineChars : d.tooLong,
+      })
+      seq++
+      sceneLineCount++
+    })
   }
 
   // ---- Step 3：角色表 ----

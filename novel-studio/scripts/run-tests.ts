@@ -27,6 +27,8 @@ import { join, relative } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { Worker } from 'node:worker_threads'
 
+import { parseTap } from './tap-parse.ts'
+
 const ROOT = process.cwd()
 const VERBOSE = process.argv.includes('--verbose')
 const NO_ISOLATION = process.argv.includes('--no-isolation')
@@ -35,6 +37,15 @@ const FILTER = filterIdx >= 0 ? process.argv[filterIdx + 1] : undefined
 
 /** 单个文件的墙钟超时（防止某个死循环挂住整轮） */
 const FILE_TIMEOUT_MS = 120_000
+
+/**
+ * TAP 汇总行（`# pass N` / `# tests N`）—— 报告器把它写在**根套件跑完之后**，
+ * 所以「看到它」就等于「这个文件跑完了」。它只走 Worker 的真实 stdout（fd 1），
+ * 走不到被替换的 `process.stdout.write`，因此必须由父线程收流才能看到（见 test-worker.ts）。
+ */
+const TAP_SUMMARY = /^#\s*(?:pass|fail|tests)\s+\d+\s*$/m
+/** 看到汇总行后再等一小会儿，让尾部文本（`# suites N` 等）落定 */
+const QUIET_AFTER_SUMMARY_MS = 120
 
 // ---------------------------------------------------------------------------
 // 收集
@@ -85,29 +96,74 @@ interface FileResult {
   summaryFound: boolean
 }
 
-interface WorkerMessage {
-  passed: number
-  failed: number
-  skipped: number
-  failures: string[]
-  loadError: string | null
-  summaryFound?: boolean
-}
-
 // ---------------------------------------------------------------------------
 // 隔离执行：一个文件一个 Worker
 // ---------------------------------------------------------------------------
 
+/**
+ * 隔离执行：一个文件一个 Worker。
+ *
+ * ### 谁来判断「跑完了 / 跑了多少」
+ * Worker 只负责 `import` 那个文件；**TAP 文本由本函数收**（`stdout: true` / `stderr: true`
+ * 把 Worker 的输出接成流，而不是让它直接污染本轮输出）。
+ *
+ * 这样做的原因见 `test-worker.ts` 顶部的三次踩坑记录 —— 一句话：
+ * **TAP 汇总行（`# pass N`）不经过被替换的 `process.stdout.write`**，
+ * 所以只有在「父线程收流」这条路上才拿得到它；而它正是「这个文件真的跑完了」的权威标记。
+ *
+ * 收工顺序：
+ *   ① 流里出现汇总行 → 再等 `QUIET_AFTER_SUMMARY_MS` 让尾部文本落定 → 解析并收工；
+ *   ② Worker 自然退出（测试跑完、事件循环空转）→ 用已收到的文本解析；
+ *   ③ 超时 → 报「文件超时」，绝不静默当作通过。
+ */
 function runFileIsolated(file: string): Promise<FileResult> {
   const rel = relative(ROOT, file).replace(/\\/g, '/')
   const started = Date.now()
 
   return new Promise<FileResult>(resolve => {
     let settled = false
+    /** 该文件从 Worker 收到的全部 stdout/stderr 文本 */
+    let text = ''
+    let summaryTimer: NodeJS.Timeout | null = null
+
+    const settleFromText = (forced: Partial<FileResult> = {}): void => {
+      const parsed = parseTap(text)
+      let loadError: string | null = forced.loadError ?? null
+      if (loadError === null) {
+        if (!parsed.sawSummary) {
+          /**
+           * **没有汇总行 = 没跑完**（崩溃、被掐断、或输出被吞）→ 计数不可信，明确失败。
+           * 少算的用例不会让任何断言失败，所以必须在这里拦住（docs/91 §5.2.34）。
+           */
+          loadError =
+            `没有拿到 TAP 汇总行（# pass N）：这个文件可能没跑完，用例数不可信。` +
+            `已解析到 ${parsed.tests} 个用例`
+        } else if (parsed.entries.length === 0) {
+          loadError = '测试结果为空：没有解析到任何 TAP 结果行'
+        } else if (parsed.unclassified.length > 0) {
+          // 无法判断是用例还是套件 → 计数必然不准。明确失败，不静默放行。
+          loadError =
+            `有 ${parsed.unclassified.length} 条 TAP 结果无法分类（缺少 type 字段），用例数不可信。` +
+            `首条：${parsed.unclassified[0]!.slice(0, 120)}`
+        }
+      }
+      finish({
+        passed: parsed.tests,
+        failed: parsed.failures.length,
+        skipped: parsed.skipped,
+        failures: parsed.failures.slice(0, 80),
+        loadError,
+        // 「可信」= 拿到汇总行（跑完了）+ 每条结果都分好类
+        summaryFound: loadError === null && parsed.sawSummary && parsed.unclassified.length === 0,
+        ...forced,
+      })
+    }
+
     const finish = (r: Omit<FileResult, 'file' | 'durationMs'>): void => {
       if (settled) return
       settled = true
       clearTimeout(timer)
+      if (summaryTimer) clearTimeout(summaryTimer)
       void worker.terminate()
       resolve({ file: rel, durationMs: Date.now() - started, ...r })
     }
@@ -118,10 +174,19 @@ function runFileIsolated(file: string): Promise<FileResult> {
       workerData: { file },
       // 让 Worker 能直接跑 .ts（类型剥离）
       execArgv: ['--experimental-strip-types'],
-      // 输出全部交回主线程处理，避免污染本轮输出
-      stdout: false,
-      stderr: false,
+      // 输出接到父线程的流里：TAP 文本（含汇总行）由这里解析，不污染本轮输出
+      stdout: true,
+      stderr: true,
     })
+
+    const onChunk = (chunk: Buffer | string): void => {
+      text += typeof chunk === 'string' ? chunk : chunk.toString('utf8')
+      if (summaryTimer !== null || !TAP_SUMMARY.test(text)) return
+      // 汇总行已出现 = 根套件跑完；再等一小会儿让尾部文本落定，然后收工
+      summaryTimer = setTimeout(() => settleFromText(), QUIET_AFTER_SUMMARY_MS)
+    }
+    worker.stdout?.on('data', onChunk)
+    worker.stderr?.on('data', onChunk)
 
     const timer = setTimeout(() => {
       finish({
@@ -134,16 +199,6 @@ function runFileIsolated(file: string): Promise<FileResult> {
       })
     }, FILE_TIMEOUT_MS)
 
-    worker.on('message', (m: WorkerMessage) => {
-      finish({
-        passed: m.passed,
-        failed: m.failed,
-        skipped: m.skipped,
-        failures: m.failures,
-        loadError: m.loadError,
-        summaryFound: m.summaryFound ?? false,
-      })
-    })
     worker.on('error', (e: Error) => {
       finish({
         passed: 0,
@@ -155,13 +210,18 @@ function runFileIsolated(file: string): Promise<FileResult> {
       })
     })
     worker.on('exit', code => {
-      // Worker 正常退出但没回消息（少见）：按失败处理，不静默当作通过
+      // 正常跑完的 Worker 会在测试结束后自然退出（**有用例失败时退出码也是 1**，
+      // 那是 TAP 里的事，不是夹具故障）：只要拿到了汇总行，就按 TAP 结算。
+      if (TAP_SUMMARY.test(text)) {
+        settleFromText()
+        return
+      }
       finish({
         passed: 0,
-        failed: code === 0 ? 0 : 1,
+        failed: 1,
         skipped: 0,
-        failures: code === 0 ? [] : [`Worker 异常退出（code ${code}）`],
-        loadError: code === 0 ? null : `Worker 退出码 ${code}`,
+        failures: [`Worker 异常退出（code ${code}），且没有拿到 TAP 汇总行`],
+        loadError: `Worker 退出码 ${code}`,
         summaryFound: false,
       })
     })

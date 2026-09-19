@@ -374,6 +374,12 @@ export const useCanvasStore = defineStore('editor/canvas', () => {
     saveStatus.value = 'idle'
     saveError.value = null
     clearPlayback()
+    /**
+     * 上一章登记的「生成画本」进度卡也要收起来：它属于**上一章**的任务，
+     * 留在新章（或另一本书的章）上就是「非本章的生成画本提示」（真机反馈 docs/91 §5.2.35）。
+     * 任务本身没有消失 —— 任务中心仍可查看与取消。
+     */
+    generateTaskId.value = null
 
     await Promise.all([loadIssueList(), loadReport()])
     // 报告刚读回来就把「是不是刚生成完」记下来：视图的 watch 在刷新后才会跑，

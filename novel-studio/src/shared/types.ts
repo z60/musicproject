@@ -321,6 +321,21 @@ export interface CharacterCandidate {
   occurrences: number
   /** 首次出现的章节标题，帮助人工确认 */
   firstChapterTitle: string | null
+  /**
+   * 出现过的章节数（迁移自 Online-novel-character-extraction 的聚合口径）。
+   * 比 occurrences 更能说明「这是个稳定角色」：碎片往往只在一章里反复出现。
+   */
+  chapterCount?: number
+  /**
+   * 四类描述（外貌/性格/语言/特征），各取**最长**的一段（上游 best_appearance 规则）。
+   * 目前由**规则**从正文里抽（关键词句式），拿不到时字段为 null —— 不是「没有外貌」的意思。
+   */
+  descriptions?: {
+    appearance: string | null
+    personality: string | null
+    speech: string | null
+    feature: string | null
+  }
 }
 
 export interface CharacterStats {

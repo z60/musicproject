@@ -42,6 +42,12 @@ import {
   mergeCharacters as mergeCharactersPure,
 } from '../../../../shared/canvas/character.ts'
 import { countReadableChars } from '../../../../shared/canvas/attribution.ts'
+import {
+  buildCharacterProfiles,
+  filterCharacterProfiles,
+  UPSTREAM_MIN_OCCURRENCES,
+  type CharacterObservation,
+} from '../../../../shared/canvas/character-profile.ts'
 import { dropUndefined } from '../../../../shared/util/drop-undefined.ts'
 import type { TaskQueue } from '../../../infra/queue/queue.ts'
 import type { Logger } from '../../../infra/log/index.ts'
@@ -331,7 +337,31 @@ export function createCharacterService(deps: CharacterServiceDeps): CharacterSer
         })
       }
 
-      const candidates = extractCharacterCandidates(text, { chapterTitle: perChapter[0]?.title ?? null })
+      /**
+       * 抽取前先收集「被形态证据挡掉的词」（docs/91 §5.2.32）。
+       *
+       * 为什么要把它们记下来：真机上整本书能抽出 200+ 个候选，其中大半是
+       * `开始 / 上面 / 尽管 / 躬身 / 随口` 这类**引导语窗口切错的常用词**
+       * （`随口问道` 能命中 62 次 —— 按出现次数根本挡不住）。
+       * 挡掉它们之后候选从 231 降到 71，但「候选为什么变少了」必须能在日志里查到。
+       */
+      const rejectedWords: Array<{ name: string; occurrences: number; reason: string }> = []
+      const candidates = extractCharacterCandidates(text, {
+        chapterTitle: perChapter[0]?.title ?? null,
+        onReject: (list) => rejectedWords.push(...list),
+      })
+      if (rejectedWords.length > 0) {
+        log?.info?.('character.extract.notPersonLike', {
+          event: 'character.extract.notPersonLike',
+          bookId,
+          rejected: rejectedWords.length,
+          samples: [...rejectedWords]
+            .sort((a, b) => b.occurrences - a.occurrences)
+            .slice(0, 10)
+            .map((r) => `${r.name}(${r.occurrences})`),
+          note: '这些词在正文里出现很多次，但不具备人名形态（姓氏/称谓/说话人位置），已判为常用词',
+        })
+      }
       /**
        * `firstChapterTitle` 必须真的是**首次出现的那一章**。
        *
@@ -357,6 +387,45 @@ export function createCharacterService(deps: CharacterServiceDeps): CharacterSer
         for (const a of c.aliases) known.add(a)
       }
       const fresh = candidates.filter((c) => !known.has(c.name) && !c.aliases.some((a) => known.has(a)))
+
+      /**
+       * 按开源项目 `Online-novel-character-extraction`（MIT）的统计规则做后处理：
+       *   ① 同一个角色跨章聚合（别名去重且排除自身）；
+       *   ② 四类描述各取**最长**（上游 `best_appearance`）；
+       *   ③ **出现次数 < 3 的角色删掉**（上游 `filter_characters.py` 的实测阈值）。
+       *
+       * 为什么值得移植第 ③ 条：真机上「抽到 7 个候选：丑陋 / 毫无疑 / 骂咧咧 / 模样不 /
+       * 丧尸星 / 嫌弃的 / 一通」全是碎片 —— 它们共同的特征就是**出现次数少**。
+       * 被删掉的画像会记进日志（数量 + 样本），不让「候选变少了」变成一个无解释的现象。
+       */
+      const observations: CharacterObservation[] = fresh.map((c) => ({
+        name: c.name,
+        aliases: c.aliases,
+        occurrences: c.occurrences,
+        chapterTitle: c.firstChapterTitle,
+        // 描述提取只扫「首次出现那一章」的正文（再长由 describeFromText 内部截断）
+        text: perChapter.find((ch) => ch.title === c.firstChapterTitle)?.text ?? '',
+      }))
+      const profiles = buildCharacterProfiles(observations, { maxProfiles: 200 })
+      const { kept, removed } = filterCharacterProfiles(profiles, { minOccurrences: UPSTREAM_MIN_OCCURRENCES })
+      if (removed.length > 0) {
+        log?.info?.('character.extract.filtered', {
+          event: 'character.extract.filtered',
+          bookId,
+          removed: removed.length,
+          minOccurrences: UPSTREAM_MIN_OCCURRENCES,
+          samples: removed.slice(0, 10).map((p) => `${p.name}(${p.occurrences})`),
+          note: '按 Online-novel-character-extraction 的统计规则过滤（出现次数不足的角色多半是碎片）',
+        })
+      }
+      const enriched = kept.map((p) => ({
+        name: p.name,
+        aliases: p.aliases,
+        occurrences: p.occurrences,
+        firstChapterTitle: p.firstChapterTitle,
+        chapterCount: p.chapterCount,
+        descriptions: p.descriptions,
+      }))
       log?.info?.('character.extracted', {
         event: 'character.extracted',
         bookId,
@@ -364,8 +433,11 @@ export function createCharacterService(deps: CharacterServiceDeps): CharacterSer
         chars: text.length,
         candidates: candidates.length,
         fresh: fresh.length,
+        profiles: kept.length,
+        filtered: removed.length,
+        notPersonLike: rejectedWords.length,
       })
-      return fresh
+      return enriched
     },
 
     async stats(characterId) {

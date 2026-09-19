@@ -28,6 +28,7 @@ import type {
   Timestamp,
 } from '../types.ts'
 import {
+  CUE_MODIFIERS,
   CUE_VERBS,
   INNER_CUE_VERBS,
   NON_NAME_TOKENS,
@@ -36,6 +37,13 @@ import {
   looksLikePersonName,
   matchCue,
 } from './attribution.ts'
+import {
+  isRoleTitle,
+  looksLikeAppellation,
+  looksLikeTransliteratedName,
+  normalizeSurname,
+  startsWithSurname,
+} from './person-name.ts'
 
 // ============================================================================
 // 注入式分词器（信号 3）
@@ -71,7 +79,36 @@ export interface ExtractCharacterOptions {
   chapterTitle?: string | null
   /** 额外停用词（如作品里的地名、功法名被误抽时） */
   stopwords?: string[]
+  /**
+   * 是否要求**人名形态证据**（默认 true，见 docs/91 §5.2.32）。
+   *
+   * 关掉它 = 回到「只要在引导语窗口里出现过就算候选」的旧行为（更全、但会带进一堆常用词）。
+   */
+  requirePersonEvidence?: boolean
+  /**
+   * 被形态证据挡掉的候选（用于日志与界面说明；纯函数不自己打日志）。
+   *
+   * 用法：调用方传入收集器，抽完自己写日志/上报 —— 这样「候选变少了」永远有解释。
+   */
+  onReject?: (rejected: ReadonlyArray<{ name: string; occurrences: number; reason: string }>) => void
 }
+
+/** 形态证据：一个候选凭什么被认为「像角色」。任一成立即通过（还要叠加主语位置证据） */
+export type PersonEvidenceKind =
+  /** 以常见姓氏开头（含异体归一：沉破天 → 沈破天） */
+  | 'surname'
+  /** 音译名形态（哈维尔 / 诺顿·阿兰 / 舍沙） */
+  | 'transliterated'
+  /** 称谓写法（老张 / 小炎子 / 荒老 / 大白猫 / 药老 / X长老） */
+  | 'appellation'
+  /** 角色称谓表（师尊 / 掌教 / 祖师 / 剑尊 / 冰帝） */
+  | 'role_title'
+  /** 行首说话人位置——整段就是名字（`无畏：“…”`） */
+  | 'speaker_position'
+  /** 行首说话人位置——只是名字前缀（`无畏翻了个白眼：“…”`） */
+  | 'dialogue_lead'
+  /** 注入的分词器把它标成了人名词性（nr / nrt）—— 这是最权威的证据 */
+  | 'ner'
 
 /** 称谓模式下「不是人名的后续字」：`老抚须笑道` 里的「老抚」就是这么冒出来的 */
 const NON_NAME_FOLLOWING = new Set(
@@ -112,7 +149,9 @@ const APPELLATION_PATTERNS: ReadonlyArray<{
   },
   {
     id: 'zuncheng',
-    regex: /([\u4e00-\u9fa5]{1,2})(长老|大人|前辈|姑娘|少爷|公子|小姐|夫人|道友|师兄|师姐|师妹|宗主|掌门|阁下|前辈|师叔|师尊)/g,
+    // 后缀表与 `person-name.ts` 的 ZUNCHENG_SUFFIXES 保持一致口径（含角色称谓表里的 祖师/掌教），
+    // 这样 `顾安祖师` / `晏掌教` 才能作为别名并到正名下，而不是留下一个切片
+    regex: /([\u4e00-\u9fa5]{1,2})(长老|大人|前辈|姑娘|少爷|公子|小姐|夫人|道友|师兄|师姐|师妹|宗主|掌门|阁下|师叔|师尊|祖师|掌教|门主|护法|城主|族长)/g,
     build: (m) => `${m[1]}${m[2]}`,
     stop: ['这位长老', '一位长老'],
   },
@@ -140,10 +179,20 @@ export function extractCharacterCandidates(
   /** 名字 → 记录（positions 用于跨信号去重：同一个位置只算一次） */
   const hits = new Map<
     string,
-    { positions: Set<string>; viaCue: number; viaAppellation: number; viaNer: number; aliases: Set<string> }
+    {
+      positions: Set<string>
+      viaCue: number
+      viaAppellation: number
+      viaNer: number
+      /** 行首说话人位置命中次数（`无畏：“…”`）—— 最强的人名证据 */
+      viaSpeakerPosition: number
+      /** 行首说话人位置的**前缀**命中次数（`无畏翻了个白眼：“…”` → 「无畏翻」） */
+      viaDialogueLead: number
+      aliases: Set<string>
+    }
   >()
   const appellations = new Map<string, number>()
-  const bump = (name: string, via: 'cue' | 'appellation' | 'ner', key: string): void => {
+  const bump = (name: string, via: 'cue' | 'appellation' | 'ner' | 'speaker' | 'dialogue', key: string): void => {
     if (name.length < 2) return
     if (stopwords.has(name)) return
     if (!/^[\u4e00-\u9fa5A-Za-z·]+$/.test(name)) return
@@ -155,12 +204,16 @@ export function extractCharacterCandidates(
       viaCue: 0,
       viaAppellation: 0,
       viaNer: 0,
+      viaSpeakerPosition: 0,
+      viaDialogueLead: 0,
       aliases: new Set<string>(),
     }
     if (!rec.positions.has(key)) {
       rec.positions.add(key)
       if (via === 'cue') rec.viaCue += 1
       else if (via === 'appellation') rec.viaAppellation += 1
+      else if (via === 'speaker') rec.viaSpeakerPosition += 1
+      else if (via === 'dialogue') rec.viaDialogueLead += 1
       else rec.viaNer += 1
     }
     hits.set(name, rec)
@@ -182,6 +235,40 @@ export function extractCharacterCandidates(
     // 再由后面的片段收敛按**出现位置是否被长者覆盖**决定留谁（子串关系不足以判断）。
     for (const candidate of guessNameVariants(window)) {
       bump(candidate, 'cue', `at@${at}`)
+    }
+  }
+
+  /**
+   * ---- 信号 1b：剧本体「名字：「台词」」的行首主语（真机反馈，docs/91 §5.2.30）----
+   *
+   * 为什么必须单列一条：`无畏：“你瞎啊…”` / `无畏翻了个白眼：“你瞎啊…”` 这种写法
+   * **没有任何言语引导语动词**，信号 1 一条都抽不到；而它恰恰是中文网文最常见的对白体之一。
+   * 真机实测（《我陪魔神历劫》第 2 章）：整章 726 字、全是这种写法，抽取结果为 **0 个候选**，
+   * 用户点「自动抽取」时界面什么都不出现。
+   *
+   * 取法（和信号 1 相反 —— 名字在窗口**开头**，不在末尾）：
+   *   · 行首整段（到冒号为止）本身就是人名 → 就取它（`纳兰嫣然：` 不会退化成「纳兰」）
+   *   · 否则取 2~3 字前缀（`无畏翻了个白眼` → 「无畏」/「无畏翻」）——
+   *     多出来的那一个（`无畏翻`）只在这句话里出现，靠后面的出现次数阈值与片段收敛收掉
+   *   · 窗口末尾已经有引导语动词的（`萧炎沉声道`）直接跳过：那是信号 1 的活，重复抽只会多出「萧炎沉」这种碎片
+   */
+  const dialogueLeadRe = /^[ \t\u3000]*([\u4e00-\u9fa5·]{2,12})[：:][ \t]*[“"「『]/gm
+  for (const m of text.matchAll(dialogueLeadRe)) {
+    const window = m[1]!
+    const at = m.index ?? 0
+    if (matchCue(window, 'before') !== null) continue
+    const whole = window
+    if (looksLikePersonName(whole)) {
+      // 「行首整段就是名字」—— 这就是最强的人名证据（他在说话，而且是这份文本标出来的）
+      bump(whole, 'speaker', `dialogue@${at}`)
+      continue
+    }
+    for (const len of [2, 3]) {
+      if (window.length < len) continue
+      const prefix = window.slice(0, len)
+      if (CUE_MODIFIERS.includes(prefix)) continue
+      // 前缀只是「可能的名字」，算行首说话人证据（弱一档）；能不能留下由后面的形态+位置证据决定
+      bump(prefix, 'dialogue', `dialogue@${at}`)
     }
   }
 
@@ -232,21 +319,18 @@ export function extractCharacterCandidates(
 
   // ---- 称谓归并：小炎子/老张/炎儿 若能归到某个全名，则作为别名而不是独立角色 ----
   for (const word of appellations.keys()) {
-    const core = word.replace(/^[老小]/, '').replace(/(儿|兄|长老|大人|前辈|姑娘|少爷|公子|小姐|夫人|道友|师兄|师姐|师妹|宗主|掌门|阁下)$/, '')
-    if (core.length === 0) continue
-    let owner: string | null = null
-    for (const name of hits.keys()) {
-      if (name === word) continue
-      if (name.includes(word) || word.includes(name)) {
-        owner = name
-        break
-      }
-      if (name.includes(core) || (core.length > 1 && name.includes(core[0]) && hits.get(name)!.viaCue > 0)) {
-        owner = name
-        break
-      }
+    const core = appellationCore(word)
+    const owner = core.length === 0 ? null : findAppellationOwner(word, core, hits)
+    if (!owner) {
+      /**
+       * 归不到任何全名时有两种可能：
+       *   · `老张` / `荒老` 本身就是一个称谓式角色 → 留着（形态证据会放行）
+       *   · `拜见师尊` / `知道师尊` / `劳烦师尊` 是**动词短语**被尊称模式切出来的 → 丢掉
+       *     （真机实测：`师尊` 名下曾挂上 60 多个这种垃圾别名，界面上完全没法看）
+       */
+      if (!isStandaloneAppellation(word) || isZunchengForm(word)) hits.delete(word)
+      continue
     }
-    if (!owner) continue // 归不到任何全名 → 它本身就是一个候选（上方已 bump）
     const rec = hits.get(owner)!
     const aliasRec = hits.get(word)
     if (aliasRec) {
@@ -303,8 +387,30 @@ export function extractCharacterCandidates(
    */
   const merged = mergeShortFormsIntoFullNames(text, collapsed)
 
-  const out: CharacterCandidate[] = merged
-    .filter((m) => !isPrefixFragmentOfFrequent(m, merged))
+  const beforeEvidence = merged.filter((m) => !isPrefixFragmentOfFrequent(m, merged))
+
+  // ---- 人名形态证据（docs/91 §5.2.32）：把常用词挡在候选之外 ----
+  const requireEvidence = opts?.requirePersonEvidence !== false
+  const kept: Observation[] = []
+  const rejected: Array<{ name: string; occurrences: number; reason: string }> = []
+  for (const cand of beforeEvidence) {
+    if (!requireEvidence) {
+      kept.push(cand)
+      continue
+    }
+    const evidence = personEvidenceOf(cand, text)
+    if (evidence !== null) {
+      kept.push(cand)
+      continue
+    }
+    rejected.push({ name: cand.name, occurrences: cand.pos.length, reason: 'not-person-like' })
+  }
+  if (rejected.length > 0) opts?.onReject?.(rejected)
+
+  // ---- 异体姓氏归并：`沉破天` 是 `沈破天` 的异体写法 → 并成别名，而不是两个角色 ----
+  mergeSurnameVariants(text, kept)
+
+  const out: CharacterCandidate[] = kept
     .map((m) => ({
       name: m.name,
       aliases: [...m.rec.aliases],
@@ -319,8 +425,186 @@ export function extractCharacterCandidates(
 /** 候选（名字 + 信号记录 + 出现位置） */
 interface Observation {
   name: string
-  rec: { positions: Set<string>; viaCue: number; viaAppellation: number; viaNer: number; aliases: Set<string> }
+  rec: {
+    positions: Set<string>
+    viaCue: number
+    viaAppellation: number
+    viaNer: number
+    viaSpeakerPosition: number
+    viaDialogueLead: number
+    aliases: Set<string>
+  }
   pos: number[]
+}
+
+/** 称谓的前缀（`老张` / `小炎子` / `大黑` / `阿兰`） */
+const APPELLATION_PREFIXES = ['老', '小', '大', '阿'] as const
+
+/** 称谓的后缀（`炎儿` / `张兄` / `荒老` / `景琼师兄` / `晏掌教` / `顾安祖师`） */
+const APPELLATION_SUFFIXES: readonly string[] = [
+  '儿', '兄', '老', '长老', '大人', '前辈', '姑娘', '少爷', '公子', '小姐', '夫人',
+  '道友', '师兄', '师姐', '师妹', '宗主', '掌门', '阁下', '师叔', '师尊', '弟子',
+  // 与 `person-name.ts` 的 ZUNCHENG_SUFFIXES 保持同一口径：这些是「角色称谓」，
+  // 少一个都会让 `顾安祖师` 这类写法并不到正名下，只能被丢掉
+  '祖师', '掌教', '门主', '护法', '城主', '族长', '家主', '尊者', '上人', '真人',
+]
+
+/** 去掉称谓前后缀，留下「名字部分」（`景琼师兄` → `景琼`） */
+function appellationCore(word: string): string {
+  let core = word
+  for (const prefix of APPELLATION_PREFIXES) {
+    if (core.length > prefix.length && core.startsWith(prefix)) {
+      core = core.slice(prefix.length)
+      break
+    }
+  }
+  for (const suffix of [...APPELLATION_SUFFIXES].sort((a, b) => b.length - a.length)) {
+    if (core.length > suffix.length && core.endsWith(suffix)) {
+      core = core.slice(0, core.length - suffix.length)
+      break
+    }
+  }
+  return core
+}
+
+/**
+ * 给一个称谓词找它的「正名」。
+ *
+ * 判定按可信度从高到低，**必须有证据**，不能凭「字符串包含」就归并：
+ *
+ *   1. 精确的前后缀组合：`景琼师兄` = `景琼` + 师兄、`小沈` = 小 + `沈`（正名必须是候选）
+ *   2. 多字名字部分本身就是候选：`晏掌教` 的 `晏` …不成立；`景琼师叔` 的 `景琼` 成立
+ *   3. 单字昵称：`炎儿`/`小炎` → 正名里含这个字（真机回归：`炎儿 → 萧炎`）
+ *
+ * 反例（必须挡住）：`拜见师尊` / `劳烦师尊` —— 它们是「动词 + 尊称」的短语，
+ * 名字部分是动词、也不在候选里，按字符串包含关系会被错误挂到 `师尊` 名下（真机实测 60+ 个）。
+ */
+function findAppellationOwner(
+  word: string,
+  core: string,
+  hits: Map<string, Observation['rec']>,
+): string | null {
+  for (const name of hits.keys()) {
+    if (name === word) continue
+    // 1) 精确的前后缀组合
+    if (word.startsWith(name) && APPELLATION_SUFFIXES.includes(word.slice(name.length))) return name
+    if (word.endsWith(name) && (APPELLATION_PREFIXES as readonly string[]).includes(word.slice(0, word.length - name.length))) {
+      return name
+    }
+  }
+  for (const name of hits.keys()) {
+    if (name === word) continue
+    // 2) 多字名字部分本身就是候选（`景琼师叔` → 景琼）
+    if (core.length >= 2 && name === core) return name
+    // 3) 单字昵称（`炎儿` / `小炎` → 萧炎），且正名必须有引导语证据，避免随便沾一个字就并
+    if (core.length === 1 && word.length <= 3 && name.includes(core) && hits.get(name)!.viaCue > 0) return name
+  }
+  return null
+}
+
+/**
+ * 归不到正名的称谓词，本身能不能作为角色留下？
+ *
+ * `老张 / 荒老 / 大白猫` 可以（它们就是「某老」「某猫」这种称谓式角色）；
+ * `拜见师尊 / 劳烦师尊` 不行 —— 前缀或名字部分不像名字，说明它是被切出来的动词短语。
+ */
+function isStandaloneAppellation(word: string): boolean {
+  const core = appellationCore(word)
+  if (core.length === 0) return false
+  if (looksLikePersonName(core)) return true
+  // `老张` / `小沈` / `大白`：核心 1 字 + 称谓前缀
+  if (/^[老小大阿][\u4e00-\u9fa5]$/.test(word)) return true
+  // `荒老` / `练老`：核心 1 字 + `X老` 写法
+  return /^[\u4e00-\u9fa5]老$/.test(word)
+}
+
+/** 「名字 + 尊称」的后缀（`景琼师兄` / `晏掌教`）—— 必须有正名才留，否则就是动词短语切片 */
+const ZUNCHENG_SUFFIXES: readonly string[] = [
+  '长老', '大人', '前辈', '姑娘', '少爷', '公子', '小姐', '夫人', '道友', '师兄',
+  '师姐', '师妹', '宗主', '掌门', '阁下', '师叔', '师尊', '掌教', '祖师',
+]
+
+/** 该词是不是「名字 + 尊称」形式（这种形式只有找到正名才允许保留） */
+export function isZunchengForm(word: string): boolean {
+  return ZUNCHENG_SUFFIXES.some((suffix) => word.length > suffix.length && word.endsWith(suffix))
+}
+
+/**
+ * 一条候选能不能被当成「人」：**形态证据 + 位置证据**都成立才通过（docs/91 §5.2.32）。
+ *
+ * 形态证据（任一）：分词器 nr / 行首说话人位置 / 角色称谓 / 称谓写法 / 姓氏开头 / 音译名形态。
+ * 位置证据：至少有 5% 的出现在**句首**（至少 1 次）—— 真人名会反复做主语。
+ *
+ * 为什么非要有形态证据：真机 122 万字抽出的 230 个候选里，`开始(355)`、`上面(354)`、
+ * `尽管(245)`、`躬身(106)`、`随口(74)`、`随后轻(29)` 全是**引导语窗口切错的常用词**，
+ * 它们的「出现次数」比一半真角色都高 —— 按次数过滤拦不住（`随口问道` 能命中 62 次），
+ * 只有形态能拦：这些词没有一个以姓氏开头、也没有一个是音译名形态。
+ *
+ * 为什么要位置证据（反例）：`马上 / 高兴 / 于是 / 后来` 都以姓氏字开头，
+ * 但它们在句首出现的比例很低（`随口` 74 次里只有 1 次），而真人名是 17%~61%。
+ *
+ * 返回命中的形态证据名（便于 UI 解释「为什么它是候选」）；不通过返回 null。
+ */
+function personEvidenceOf(cand: Observation, text: string): PersonEvidenceKind | null {
+  const name = cand.name
+  const shape: PersonEvidenceKind | null =
+    cand.rec.viaNer > 0 ? 'ner'
+    : cand.rec.viaSpeakerPosition > 0 ? 'speaker_position'
+    : cand.rec.viaDialogueLead > 0 ? 'dialogue_lead'
+    : isRoleTitle(name) ? 'role_title'
+    : looksLikeAppellation(name) ? 'appellation'
+    : startsWithSurname(name) ? 'surname'
+    : looksLikeTransliteratedName(name) ? 'transliterated'
+    : null
+  if (shape === null) return null
+  /**
+   * 位置证据的豁免：分词器 `nr`、行首说话人位置、以及**角色称谓表**里的词。
+   *
+   * 前两者本身就是「这里是人在说话」的证据；角色称谓是人工维护的窄表（师尊/掌教/剑尊…），
+   * 它们在文中多为**称呼语**（`拜见掌教`、`掌教大人`），句首比例天然偏低 ——
+   * 真机实测 `掌教` 1398 次里只有 39 次在句首（2.8%），拿 5% 去卡会误杀。
+   */
+  if (shape === 'ner' || shape === 'speaker_position' || shape === 'role_title') return shape
+  return hasEnoughSentenceStart(cand, text) ? shape : null
+}
+
+/**
+ * 句首出现比例是否够（≥ 5%，且至少 1 次）。
+ *
+ * 5% 这个量级是实测来的：真机上真角色是 17%~61%（`小丧` 1/6 最低、`姜练` 3261/5304 最高），
+ * 而被误抽的常用词是 0%~1.4%（`开始` 0/355、`躬身` 0/106、`随口` 1/74）。
+ * 取 5% 既能让只出场几次的小角色过关，又能把常用词的偶然句首出现挡在外面。
+ */
+function hasEnoughSentenceStart(cand: Observation, text: string): boolean {
+  const atStart = cand.pos.filter((p) => p === 0 || SENTENCE_BOUNDARY.has(text[p - 1] ?? '')).length
+  if (atStart === 0) return false
+  return atStart / Math.max(1, cand.pos.length) >= 0.05
+}
+
+/** 句子/段落边界字符（句首判定用） */
+const SENTENCE_BOUNDARY = new Set([...'\n。！？…"」』”’'])
+
+/**
+ * 异体姓氏归并：`沉破天(253)` 与 `沈破天(233)` 是同一个角色的两种写法。
+ *
+ * 判据：两个候选**只有首字不同**、其余部分完全相同、且首字是一对已知异体（沉/沈、肖/萧…）。
+ * 标准写法的那个留作正名，另一个并成别名（否则用户会看到两个角色，还得手动合并）。
+ * 注意这里**不**改出现次数：与「简称并入全名」同一口径，别名不重复计入正名的出现次数。
+ */
+function mergeSurnameVariants(_text: string, candidates: Observation[]): void {
+  const drop = new Set<string>()
+  for (const cand of candidates) {
+    const normalized = normalizeSurname(cand.name)
+    if (normalized === cand.name) continue
+    const standard = candidates.find((c) => c.name === normalized)
+    if (!standard) continue
+    if (!standard.rec.aliases.has(cand.name)) standard.rec.aliases.add(cand.name)
+    drop.add(cand.name)
+  }
+  if (drop.size === 0) return
+  for (let i = candidates.length - 1; i >= 0; i--) {
+    if (drop.has(candidates[i]!.name)) candidates.splice(i, 1)
+  }
 }
 
 /** 引导语动词的**首字**集合（判断「名字后面是不是紧跟着言语引导语」用） */

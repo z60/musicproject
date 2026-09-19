@@ -340,6 +340,109 @@ describe('Step 2 规则粗筛：classifyKind', () => {
 })
 
 // ---------------------------------------------------------------------------
+// 引号外的文字（真机事故：画本里「只有双引号里面的内容」）
+// ---------------------------------------------------------------------------
+
+/** 真机原文（《我陪魔神历劫》楔子，82 字）—— 用户报「只有引号里的内容」的就是它 */
+const REAL_PREFACE = '楔子\n为了三界安生，我带着他的神魂下界，历劫的世界是天帝一手操办的，可是我刚睁眼，一颗脑袋混着血浆“嘭”的一声，在我跟前炸了，眼前尸横遍野，那一刻我懵在了原地。\n\n'
+
+describe('引号外的文字必须成行（旁白），不能只留引号里的内容', () => {
+  it('classifyKind 把引号前后的话交出来（偏移能切回原文）', () => {
+    const raw = '疑惑的看向无畏：“什么意思，今年桃花宴换地方了？”'
+    const cls = classifyKind(raw)
+    assert.equal(cls.kind, 'dialogue')
+    assert.equal(cls.text, '什么意思，今年桃花宴换地方了？')
+    assert.equal(cls.narrations.length, 1, '引号前的叙述必须交出来')
+    const lead = cls.narrations[0]
+    assert.equal(lead.position, 'before')
+    assert.equal(lead.text, '疑惑的看向无畏：')
+    assert.equal(raw.slice(lead.start, lead.end), lead.text, 'start/end 必须能切回原文')
+  })
+
+  it('引号后的叙述也算旁白（我：“那现在怎么办？”总不能等死吧。）', () => {
+    const cls = classifyKind('我：“那现在怎么办？”总不能等死吧。')
+    assert.equal(cls.kind, 'dialogue')
+    assert.equal(cls.text, '那现在怎么办？')
+    assert.deepEqual(
+      cls.narrations.map((n) => `${n.position}:${n.text}`),
+      ['after:总不能等死吧。'],
+      '「我：」是纯说话人标签（不朗读），标点后的「总不能等死吧。」是旁白',
+    )
+  })
+
+  it('纯说话人标签不产出旁白片段（说了半天到底谁说的已经写进 cue）', () => {
+    for (const raw of ['萧炎沉声道：“我必去。”', '“别过来。”药老抚须笑道。', '无畏：“你瞎啊？”', '他们：“对，没错。”']) {
+      const cls = classifyKind(raw)
+      assert.equal(cls.kind, 'dialogue', raw)
+      assert.equal(cls.narrations.length, 0, `纯标签不该成行：${raw}`)
+    }
+    // 带动作的描述不是标签：它是有声书正文，必须念
+    assert.equal(classifyKind('无畏翻了个白眼：“你瞎啊？”').narrations[0]?.text, '无畏翻了个白眼：')
+  })
+
+  it('行内短引号（拟声/强调）整句按旁白，不切成一行一个字的台词', () => {
+    const raw = '一颗脑袋混着血浆“嘭”的一声，在我跟前炸了。'
+    const cls = classifyKind(raw)
+    assert.equal(cls.kind, 'narration')
+    assert.equal(cls.text, raw, '整句保留（引号里的拟声词照读）')
+    assert.ok(cls.matched.includes('inline_quote'))
+    assert.equal(cls.narrations.length, 0)
+  })
+
+  it('generateCanvas：一句话切出「旁白 → 台词」，顺序与原文一致', async () => {
+    const out = await generateCanvas({
+      chapterId: 'ch-outside', bookId: 'b',
+      chapterText: '疑惑的看向无畏：“什么意思，今年桃花宴换地方了？”',
+      characters: [], options: baseOptions(), embed: new FakeEmbeddingProvider(),
+    })
+    assert.deepEqual(
+      out.lines.map((l) => `${l.kind}:${l.text}`),
+      ['narration:疑惑的看向无畏：', 'dialogue:什么意思，今年桃花宴换地方了？'],
+    )
+  })
+
+  it('真机楔子：整章文字都进画本（除了章节标题），不再只剩「嘭」', async () => {
+    const out = await generateCanvas({
+      chapterId: 'ch-preface', bookId: 'b', chapterText: REAL_PREFACE,
+      characters: [], options: baseOptions(), embed: new FakeEmbeddingProvider(),
+    })
+    const kinds = out.lines.map((l) => `${l.kind}:${l.text}`)
+    assert.equal(kinds[0], 'narration:楔子')
+    assert.equal(kinds.length, 2, `实际 ${JSON.stringify(kinds)}`)
+    assert.match(out.lines[1].text, /为了三界安生/, '叙述正文必须成行')
+    assert.match(out.lines[1].text, /血浆“嘭”的一声/, '行内拟声词保留在旁白里')
+    assert.equal(out.lines.filter((l) => l.kind === 'dialogue').length, 0, '这章没有台词，不该凭空造一个「嘭」')
+    // 覆盖率：原文所有非空白字符都出现在某一行里
+    const joined = out.lines.map((l) => l.text).join('')
+    for (const ch of REAL_PREFACE) {
+      if (/\s/.test(ch)) continue
+      assert.ok(joined.includes(ch), `原文的「${ch}」在画本里找不到`)
+    }
+  })
+
+  it('同一句原文切出的旁白不打断「连续对白」链', async () => {
+    // 第一句有引导语（判定为萧炎），引号后的叙述单独成行；
+    // 第二句无引导语 —— 它仍应沿用上一说话人（同一句原文的旁白只是叙述，不是换人说话）
+    const text = '萧炎沉声道：“我乃斗气大陆的炼药师。”他站在原地。\n“你说什么，再说一遍。”'
+    const out = await generateCanvas({
+      chapterId: 'ch-chain', bookId: 'b', chapterText: text,
+      characters: makeCharacters(), options: baseOptions(), embed: new FakeEmbeddingProvider(),
+      limits: { attributionThreshold: 0.5, attributionMargin: 0.02 },
+    })
+    const kinds = out.lines.map((l) => `${l.kind}:${l.text}`)
+    assert.deepEqual(kinds, [
+      'dialogue:我乃斗气大陆的炼药师。',
+      'narration:他站在原地。',
+      'dialogue:你说什么，再说一遍。',
+    ])
+    const second = out.lines[2]
+    assert.equal(second.characterId, idOf('萧炎'), `中间那句旁白不该把「上一说话人」清掉，实际 ${second.characterId}`)
+    assert.equal(second.decidedBy, 'rule')
+    assert.match(second.attributionReason, /连续对白/)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Step 5 + 6：回归集准确率（docs/06 §5.4 目标 ≥ 85%）
 // ---------------------------------------------------------------------------
 

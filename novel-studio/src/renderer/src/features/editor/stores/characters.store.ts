@@ -16,6 +16,7 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { call, callSafe } from '@/shared/lib/ipc.ts'
+import { describeExtractResult, shouldWidenToBook } from '@/shared/lib/extract-scope.ts'
 import type {
   ActorWorkload,
   Character,
@@ -64,6 +65,13 @@ export const useCharactersStore = defineStore('editor/characters', () => {
   const candidates = ref<CharacterCandidate[]>([])
   const loading = ref(false)
   const extracting = ref(false)
+  /**
+   * 上一次「自动抽取」的结果回执（UI 直接显示）。
+   *
+   * 为什么要有它：抽取可能**一个候选都抽不到**（那本书通篇是剧本体、或本章只有几十字），
+   * 只更新候选列表的话界面上毫无变化，用户无法区分「按钮没反应」与「抽不到」。
+   */
+  const extractNote = ref<string | null>(null)
   const includeArchived = ref(false)
   const bookId = ref<Id | null>(null)
   const projectId = ref<Id | null>(null)
@@ -283,13 +291,29 @@ export const useCharactersStore = defineStore('editor/characters', () => {
 
   async function extract(chapterIds?: Id[]): Promise<CharacterCandidate[]> {
     if (!bookId.value) return []
+    const chapterScoped = Boolean(chapterIds?.length)
     extracting.value = true
     try {
-      candidates.value = await call('character:extract', {
+      let list = await call('character:extract', {
         bookId: bookId.value,
-        ...(chapterIds?.length ? { chapterIds } : {}),
+        ...(chapterScoped ? { chapterIds } : {}),
       }) as CharacterCandidate[]
-      return candidates.value
+      const found = list.length
+      // 本章抽不到候选 → 扩大到全书（docs/11 §4.6；策略与文案见 shared/lib/extract-scope.ts）。
+      // 角色表是整本书的产物，盯着一个字数为几十的章节抽是错的范围 ——
+      // 真机上这会表现成「点了按钮什么都没发生」。
+      const widened = shouldWidenToBook({ chapterScoped, found })
+      if (widened) {
+        list = await call('character:extract', { bookId: bookId.value }) as CharacterCandidate[]
+      }
+      extractNote.value = describeExtractResult({
+        chapterScoped,
+        found,
+        widened,
+        bookFound: list.length,
+      })
+      candidates.value = list
+      return list
     } finally {
       extracting.value = false
     }
@@ -358,7 +382,7 @@ export const useCharactersStore = defineStore('editor/characters', () => {
 
   return {
     characters, actors, bindings, workload, stats, candidates,
-    loading, extracting, includeArchived, bookId, projectId, lastError,
+    loading, extracting, extractNote, includeArchived, bookId, projectId, lastError,
     attributionDirty, centroidTaskId,
     activeCharacters, characterById, actorById, bindingsByCharacter, colorByCharacter, unboundCount,
     nameOf, colorOf, statsOf, primaryActorOf,
