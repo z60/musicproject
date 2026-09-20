@@ -32,6 +32,7 @@ import type {
 } from '@shared/types.ts'
 import { useSettingsStore } from '@/app/store/settings.store.ts'
 import { estimateDurationMs } from '@/features/book/stores/import.store.ts'
+import { isBookSwitch, visibleCanvasTasks } from '@/shared/lib/book-scope.ts'
 
 /** 章节列表行（`chapter:list` 的响应元素） */
 export type ChapterRow = Chapter & { progress: ChapterProgress | null }
@@ -176,7 +177,7 @@ export const useChaptersStore = defineStore('book/chapters', () => {
      * 画本任务登记（`canvasTasks`）不清：每条都带 bookId，由 `currentBookCanvasTasks`
      * 按当前书过滤 —— 这样切回原书时进度卡还在，而本书永远不会显示别的书的任务。
      */
-    if (bookId.value !== null && bookId.value !== nextBookId) {
+    if (isBookSwitch(bookId.value, nextBookId)) {
       workloads.value = []
       // 行级忙碌态也是上一本书的章节 id，留着没有意义（换书后那些行根本不在列表里）
       busyIds.value = []
@@ -420,18 +421,19 @@ export const useChaptersStore = defineStore('book/chapters', () => {
   }
 
   /**
-   * **当前这本书**已提交的生成任务（视图渲染进度卡用）。
+   * **当前这本书**里仍然存在的章节的生成任务（视图渲染进度卡用）。
    *
-   * 按 `bookId` 过滤是刻意的：没有这道过滤，切书后「章节管理」会把上一本书的
-   * 「生成画本」提示继续显示出来（真机反馈 docs/91 §5.2.35）。
+   * 过滤规则在纯函数 `visibleCanvasTasks` 里（可被 Node 测试直接覆盖）：
+   * 别的书的任务、已删除章节的任务都不显示 —— 没有这道过滤，切书后「章节管理」
+   * 会把上一本书的「生成画本」提示继续显示出来（真机反馈 docs/91 §5.2.35）。
    */
-  const currentBookCanvasTasks = computed<Array<{ chapterId: string; taskId: string }>>(() => {
-    const id = bookId.value
-    if (!id) return []
-    return Object.entries(canvasTasks.value)
-      .filter(([, task]) => task.bookId === id)
-      .map(([chapterId, task]) => ({ chapterId, taskId: task.taskId }))
-  })
+  const currentBookCanvasTasks = computed<Array<{ chapterId: string; taskId: string }>>(() =>
+    visibleCanvasTasks({
+      tasks: Object.entries(canvasTasks.value).map(([chapterId, task]) => ({ chapterId, ...task })),
+      bookId: bookId.value,
+      chapterIds: rows.value.map(row => row.id),
+    }).map(task => ({ chapterId: task.chapterId, taskId: task.taskId })),
+  )
 
   function clearCanvasTask(chapterId: string): void {
     const next = { ...canvasTasks.value }

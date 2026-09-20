@@ -25,6 +25,7 @@ import { useRoute, useRouter } from 'vue-router'
 import type { ActorWorkload, ChapterCanvasState, ChapterKind } from '@shared/types.ts'
 import { formatCount, formatDate, formatDuration, formatDurationLong, formatInt, formatProgressRatio } from '@/shared/lib/format.ts'
 import { computeVisibleRange } from '@/shared/lib/virtual-list.ts'
+import { chapterTitleOrPlaceholder } from '@/shared/lib/book-scope.ts'
 import ConfirmDialog from '@/shared/ui/ConfirmDialog.vue'
 import EmptyState from '@/shared/ui/EmptyState.vue'
 import LoadingBlock from '@/shared/ui/LoadingBlock.vue'
@@ -296,21 +297,15 @@ async function onGenerateCanvas(ids: string[]): Promise<void> {
 /**
  * 画本任务面板（真机反馈：docs/91 §5.2.35）。
  *
- * store 里已经按 `bookId` 过滤过一次（`currentBookCanvasTasks`），这里再做一道
- * 「章节真的还在本书里」的过滤：
- *   · 上一本书的任务不会出现在本书（store 过滤）；
- *   · 已删除的章节也不显示（任务中心仍可查看/取消它）；
- *   · 最后取最近 6 个，避免把页面撑长。
+ * 过滤规则在 store 的 `currentBookCanvasTasks`（→ 纯函数 `visibleCanvasTasks`）里：
+ * 只显示**当前这本书**、且章节仍然存在的任务，最多 6 条 —— 上一本书的
+ * 「生成画本」提示不会出现在本书。
  */
-const canvasTaskEntries = computed(() =>
-  chapters.currentBookCanvasTasks
-    .filter(task => chapters.getById(task.chapterId) !== null)
-    .slice(-6),
-)
+const canvasTaskEntries = computed(() => chapters.currentBookCanvasTasks)
 
 /** 面板标题里的章节名：找不到就给「未知章节」，**绝不把 uuid 显示给用户** */
 function chapterTitleOf(chapterId: string): string {
-  return chapters.getById(chapterId)?.title ?? '未知章节'
+  return chapterTitleOrPlaceholder(chapters.getById(chapterId)?.title)
 }
 
 /** 重试：先清掉旧任务登记，再用同一章的选项重新提交（canvas:generate 的载荷是单章） */
