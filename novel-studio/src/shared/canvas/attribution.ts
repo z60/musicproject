@@ -137,6 +137,12 @@ export const INNER_CUE_VERBS: readonly string[] = [
 export const RULE_CONFIDENCE = {
   /** 引导语明确指名 */
   cueOverride: 0.95,
+  /** 行首说话人标签（`无畏：“…”` / `无畏翻了个白眼：“…”`）—— 结构清晰，但表单是「标签」不是动词 */
+  speakerLabel: 0.9,
+  /** 行内主语（引号前最先出现的角色名）—— 推断 */
+  subject: 0.8,
+  /** 行内主语但有歧义（引号前出现了多个角色名）→ 仍给结论，但进待确认 */
+  subjectAmbiguous: 0.6,
   /** 连续对白偏向上一说话人 */
   consecutive: 0.72,
   /** 短句保护下沿用的上下文结论 */
@@ -1026,6 +1032,115 @@ function escapeRegExp(s: string): string {
 }
 
 /**
+ * 「行首说话人标签 + 冒号 + 引号」的解析（`无畏：“你瞎啊？”`、`无畏翻了个白眼：“…”`）。
+ *
+ * 为什么必须有一条独立的规则（真机反馈 docs/91 §5.2.36）：中文网文里大量对白是
+ * **剧本体**（行首直接写说话人 + 冒号 + 引号），**一个言语引导语动词都没有** ——
+ * `matchCue`（要求句末是 说/道/问…）永远匹配不上，于是整本书的台词都归不到角色，
+ * 生成出来「只有旁白」。真机实测：8994 行台词只有 1 行归属到角色。
+ *
+ * 取名与抽取器的「剧本体行首主语」同一口径：
+ *   · 行首整段本身就是人名（`纳兰嫣然：`）→ 就是它
+ *   · 否则取 2~3 字前缀（`无畏翻了个白眼` → 「无畏」）
+ *   · 末尾已经带引导语动词的（`萧炎沉声道`）返回 null —— 那是 `matchCue` 的活
+ *
+ * 返回 null 表示「不是说话人标签」（可能是 `说明：…` 这种普通冒号句），
+ * 调用方必须再拿角色表核对一遍才敢用（见 Step 6 的 2b）。
+ */
+export function parseSpeakerLabel(text: string): { window: string; hint: string } | null {
+  const chunk = text.trim()
+  const m = /^[ \t\u3000]*([\u4e00-\u9fa5·]{2,12})[：:][ \t]*[“"「『]/.exec(chunk)
+  if (!m) return null
+  const run = m[1]!
+  if (matchCue(run, 'before') !== null) return null
+  if (looksLikePersonName(run)) return { window: run, hint: run }
+  for (const len of [2, 3]) {
+    if (run.length < len) continue
+    const prefix = run.slice(0, len)
+    if (CUE_MODIFIERS.includes(prefix)) continue
+    if (!looksLikePersonName(prefix)) continue
+    return { window: run, hint: prefix }
+  }
+  return null
+}
+
+/** 把 {@link parseSpeakerLabel} 的解析包成 `CueInfo`（verb 为空：它本来就没有引导语动词） */
+export function matchSpeakerLabel(text: string): CueInfo | null {
+  const parsed = parseSpeakerLabel(text)
+  if (!parsed) return null
+  return {
+    verb: '',
+    speakerHint: parsed.hint,
+    speakerWindow: parsed.window,
+    position: 'before',
+    text: parsed.window,
+  }
+}
+
+/**
+ * 名字前面出现这些字/标点时，说明它处在「可以作主语的边界」上
+ * （`的沈绪` / `，沈绪` / `向沈绪`），而不是嵌在别的词里（`代掌教` 里的「掌教」）。
+ *
+ * 这一条是给「行内主语」判定用的：真机第一次跑出来 `作为代掌教的沈绪…连忙赶上去问，“…”`
+ * 被判成了 **掌教**（「掌教」在「代掌教」里被先命中），而说话人其实是沈绪。
+ */
+const SUBJECT_BOUNDARY_CHARS = new Set(
+  ('，。！？；：、“”「」『』（）()【】《》…—\n\t 的了着过和与跟对向被把让给就才也都又还却便因为是在由从自连等及或而但' +
+    '这那此其一二三四五六七八九十两每').split(''),
+)
+
+/**
+ * 引号之前**最先出现**的角色名（句子的主语通常就是说话人）。
+ *
+ * 只在「引导语缺失、或引导语没能对上角色表」时兜底（Step 6 的 2b），覆盖两类真机句式：
+ *   · `沈绪轻轻的推开殿门而入，“拜见师尊。”`（主语 + 叙述 + 引号，没有引导语动词）
+ *   · `姜练微微点头，抬头看了一眼沈绪，随口问道，“入门试炼结束了？”`
+ *     （窗口只取到「随口」这种状语，真正的说话人「姜练」在句子更前面）
+ *
+ * 优先级：**处在主语边界上的提及**（句首、标点或虚词之后）优先于嵌在词里的提及
+ * （`代掌教的沈绪` → 沈绪 ✓，而不是「代掌教」里的掌教）。都不在边界上时退回「最先出现的」。
+ * `ambiguous`：引号前出现了**多个**角色名 —— 主语判断不再可靠，
+ * 结论照给（最先出现的那个），但调用方应把它标成待确认。
+ */
+export function firstCharacterMentionBeforeQuote(
+  sourceText: string,
+  characters: readonly CanvasCharacterRef[],
+): { character: CanvasCharacterRef; ambiguous: boolean } | null {
+  const quoteAt = firstQuoteIndex(sourceText)
+  const head = quoteAt >= 0 ? sourceText.slice(0, quoteAt) : sourceText
+  if (head.trim().length === 0) return null
+
+  const matched: Array<{ character: CanvasCharacterRef; at: number; onBoundary: boolean }> = []
+  for (const character of characters) {
+    let bestAt = -1
+    for (const key of [character.name, ...character.aliases]) {
+      if (key.length < 2) continue
+      const at = head.indexOf(key)
+      if (at >= 0 && (bestAt < 0 || at < bestAt)) bestAt = at
+    }
+    if (bestAt < 0) continue
+    const prev = bestAt > 0 ? head[bestAt - 1]! : ''
+    matched.push({ character, at: bestAt, onBoundary: bestAt === 0 || SUBJECT_BOUNDARY_CHARS.has(prev) })
+  }
+  if (matched.length === 0) return null
+
+  const preferred = matched.filter((m) => m.onBoundary)
+  const pool = preferred.length > 0 ? preferred : matched
+  pool.sort((a, b) => a.at - b.at)
+  return { character: pool[0]!.character, ambiguous: pool.length > 1 }
+}
+
+/** 文本里第一个引号（左引号）的下标；没有引号时返回 -1 */
+function firstQuoteIndex(text: string): number {
+  let at = -1
+  for (const [open] of QUOTE_PAIRS) {
+    const i = text.indexOf(open)
+    if (i >= 0 && (at < 0 || i < at)) at = i
+  }
+  return at
+}
+
+/**
  * 内心独白的引导语匹配：「萧炎心道，异火与斗气终究要合为一体。」
  * 结构是「人名 + 心想类动词 + 逗号 + 想法」，动词**不在句末**，所以不能复用 {@link matchCue}。
  * 失败返回 null（该行仍会被判为 inner，只是没有明确指名的说话人）。
@@ -1574,6 +1689,57 @@ export function applyRulePostProcess(
       } else if (needsSpeaker) {
         clone.needsReview = true
         clone.reason = `引导语未能匹配角色表（${line.cue.speakerHint ?? line.cue.speakerWindow ?? '?'}）`
+      }
+    }
+
+    /**
+     * 2b) 引号前的**说话人标签 / 行内主语**（真机反馈 docs/91 §5.2.36）
+     *
+     * 中文网文里大量台词既没有引导语动词、也不是标准引导语句式，实测三类：
+     *   · 剧本体：`无畏：“你瞎啊？”`（行首就是说话人，一个动词都没有）
+     *   · 主语 + 叙述 + 引号：`沈绪轻轻的推开殿门而入，“拜见师尊。”`
+     *   · 引导语被状语顶开：`姜练微微点头，抬头看了一眼沈绪，随口问道，“…”`
+     *     （窗口只取到「随口」，真正的说话人在句子更前面）
+     * 这三类以前全部落到「未指派 → 旁白」：真机实测 8994 行台词只有 1 行归属到角色，
+     * 用户看到的就是「只指定了旁白」。
+     *
+     * 放在**短句保护之前**是刻意的：`“拜见师尊。”` 这种 4 字短台词以前会被
+     * 「短句保护 + 无可用上下文」直接判成旁白，而它恰恰是最容易靠主语判出来的。
+     *
+     * 置信度低于 cueOverride(0.95)：这是推断而不是确定性证据；但仍高于
+     * `attributionThreshold`，所以不会一股脑进「待确认」——只有歧义（引号前有多个角色名）
+     * 才显式标 needsReview。
+     */
+    if (!decided && needsSpeaker) {
+      const source = line.sourceText ?? line.text
+      const label = line.cue ? null : matchSpeakerLabel(source)
+      const byLabel = label ? resolveSpeakerHint(opts.characters, label) : null
+      if (byLabel && label) {
+        clone.characterId = byLabel.character.id
+        clone.name = byLabel.character.name
+        clone.speakerType = 'character'
+        clone.confidence = Math.max(clone.confidence, RULE_CONFIDENCE.speakerLabel)
+        clone.decidedBy = 'rule'
+        clone.needsReview = false
+        clone.reason = `行首说话人标签「${label.speakerWindow ?? label.speakerHint ?? ''}」`
+        decided = true
+      } else {
+        const mentioned = firstCharacterMentionBeforeQuote(source, opts.characters)
+        if (mentioned) {
+          clone.characterId = mentioned.character.id
+          clone.name = mentioned.character.name
+          clone.speakerType = 'character'
+          clone.confidence = Math.max(
+            clone.confidence,
+            mentioned.ambiguous ? RULE_CONFIDENCE.subjectAmbiguous : RULE_CONFIDENCE.subject,
+          )
+          clone.decidedBy = 'rule'
+          clone.needsReview = mentioned.ambiguous
+          clone.reason = mentioned.ambiguous
+            ? `行内主语（引号前有多个角色名，取最先出现的「${mentioned.character.name}」）`
+            : `行内主语（引号前最先出现的角色名「${mentioned.character.name}」）`
+          decided = true
+        }
       }
     }
 

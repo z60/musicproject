@@ -190,7 +190,7 @@ function onKeydown(event: KeyboardEvent): void {
   padding: 0 5px;
   border: 1px solid var(--ns-border, #dcdfe6);
   border-radius: 3px;
-  background: #fff;
+  background: var(--ns-bg-elevated);
   color: var(--ns-text-regular, #606266);
   font-size: 10px;
   line-height: 16px;

@@ -145,13 +145,44 @@ export function createArchiverZipWriter(options: ArchiverZipWriterOptions): ZipW
     async finalize() {
       if (aborted) throw new AppError('TASK_CANCELLED')
       if (failure) throw new AppError('PACKAGE_EXPORT_FAILED', { cause: failure })
-      await archive.finalize()
-      await new Promise<void>((resolve, reject) => {
-        output.on('close', () => resolve())
-        output.on('finish', () => resolve())
-        output.end()
-        if (failure) reject(failure)
+
+      // ① 先挂「输出流落盘完成」的监听，**再** finalize。
+      //    旧写法在 `await archive.finalize()` 之后才挂 `output.on('close'/'finish')`：
+      //    如果事件在 finalize 期间就触发了，这个 Promise 会永远等不到 → 偶发挂死。
+      const outputDone = new Promise<void>((resolve, reject) => {
+        let settled = false
+        const ok = (): void => {
+          if (settled) return
+          settled = true
+          if (failure) reject(failure)
+          else resolve()
+        }
+        const bad = (e: unknown): void => {
+          if (settled) return
+          settled = true
+          reject(e)
+        }
+        output.on('close', ok)
+        output.on('finish', ok)
+        output.on('error', bad)
       })
+
+      // ② archiver 的 'end' = 所有条目（含中央目录 / EOCD）都已写进输出流。
+      //    必须等它：`await archive.finalize()` 回归时输出流里可能还差最后一截，
+      //    此时 end() 会把没写完的 EOCD 截掉，产出「大小正常却打不开」的包
+      //    （openZip 报 eocd-not-found；见 docs/91 §5.2.26 ③ 的实测竞态）。
+      const archiveEnded = new Promise<void>((resolve, reject) => {
+        archive.on('end', () => resolve())
+        archive.on('error', (e) => reject(e))
+      })
+      // finalize() 先抛错时不要留下一个未处理的 rejection
+      archiveEnded.catch(() => undefined)
+
+      await archive.finalize()
+      await archiveEnded
+      output.end()
+      await outputDone
+      if (failure) throw new AppError('PACKAGE_EXPORT_FAILED', { cause: failure })
       finalized = true
       return { entries: [...names], bytes: archive.pointer(), uncompressedBytes: uncompressed }
     },

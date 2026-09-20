@@ -276,7 +276,7 @@ function onCountdownChange(event: Event): void {
   padding: 6px 12px;
   border: 1px solid var(--ns-border, #dcdfe6);
   border-radius: 6px;
-  background: #fff;
+  background: var(--ns-bg-elevated);
   color: var(--ns-text-primary, #303133);
   font-size: 13px;
   cursor: pointer;

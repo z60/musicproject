@@ -104,7 +104,7 @@ function reloadPage(): void {
   max-width: 520px;
   padding: 24px 28px;
   border-radius: 8px;
-  background: #fff;
+  background: var(--ns-bg-elevated);
   box-shadow: 0 12px 40px rgb(0 0 0 / 30%);
 }
 .ns-shell__blocker-title {
@@ -142,7 +142,7 @@ function reloadPage(): void {
   padding: 7px 16px;
   border: 1px solid var(--ns-border, #dcdfe6);
   border-radius: 4px;
-  background: #fff;
+  background: var(--ns-bg-elevated);
   color: var(--ns-text-primary, #303133);
   font-size: 13px;
   cursor: pointer;

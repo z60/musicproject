@@ -28,6 +28,7 @@ import { cleanupCaches, cleanupStaleTemps, defaultCleanupTargets, DEFAULT_CACHE_
 import { recoverRecordings } from './bootstrap/recovery.ts'
 import { createWindowManager, MEDIA_SCHEME } from './bootstrap/window-manager.ts'
 import { checkIntegrity, openDatabase, runMigrations } from './db.ts'
+import { currentSchemaVersion } from './infra/db/index.ts'
 import { resolveAppPaths, ffmpegCandidates } from './paths.ts'
 import { createSettingsStore } from './settings.ts'
 import { createStoreLogger } from './store-logger.ts'
@@ -149,7 +150,9 @@ export function createBootStepHandlers(deps: BootDeps): BootStepHandlers {
         },
         ...(readLogLevelOverride() ? { logLevel: readLogLevelOverride()! } : {}),
       })
-      return { schemaVersion: 0 }
+      // 报告**真实的** schema 版本（迁移前的现状），不要写死 0：
+      // 写死会让「库已经是 v5」与「全新空库」在启动报告里无法区分。
+      return { schemaVersion: currentSchemaVersion(opened.db) }
     },
 
     // ── 5. 跑迁移 ──────────────────────────────────────────────────────────
@@ -199,20 +202,42 @@ export function createBootStepHandlers(deps: BootDeps): BootStepHandlers {
           causeChain,
           stack: e instanceof Error ? e.stack : undefined,
         })
-        return { readOnly: true, reason, details, causeChain }
+        // `degraded` 是**故意**的：执行器原来只看「抛没抛错」，于是这一步虽然返回了
+        // `readOnly: true`，启动报告仍打印 `[ok]`。真机上「迁移没跑、库里只剩一张 settings 表」
+        // 就是这样被一屏 15 行的报告盖住的（docs/91 §5.2.1、§8）。带病启动必须显式标记。
+        return {
+          degraded: true,
+          degradedReason: `迁移失败，已进入只读模式：${reason}`,
+          readOnly: true,
+          reason,
+          details,
+          causeChain,
+        }
       }
     },
 
     // ── 6. 完整性检查 ──────────────────────────────────────────────────────
     'integrity-check': () => {
       const log = state.requireLogger()
-      const result = checkIntegrity(state.requireDb(), log)
+      // 把只读状态传下去：迁移失败后 `schemaVersion` 会是 0，与「刚建的空库」
+      // 长得一模一样。让 checkIntegrity 明确区分这两种情况（docs/91 §8）。
+      const result = checkIntegrity(state.requireDb(), log, {
+        readOnly: state.readOnly,
+        readOnlyReason: state.readOnlyReason,
+      })
       if (!result.ok) {
         // 不致命：应用照常启动，但要让用户知道（UI 读 capabilities 里的诊断位）
         log.warn('db.integrity.needsAttention', {
           event: 'db.integrity.needsAttention',
           errors: result.errors.slice(0, 3),
         })
+        // 完整性检查没过同样是「带病启动」，不能记成 [ok]。
+        return {
+          ok: result.ok,
+          errors: result.errors,
+          degraded: true,
+          degradedReason: `完整性检查未通过（${result.errors.length} 项）`,
+        }
       }
       return { ok: result.ok, errors: result.errors }
     },

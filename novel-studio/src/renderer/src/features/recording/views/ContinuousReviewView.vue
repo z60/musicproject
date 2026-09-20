@@ -520,7 +520,7 @@ function goAlignment(): void {
 .ns-review-page__title { margin: 0; font-size: 18px; color: var(--ns-text-primary, #303133); }
 .ns-review-page__subtitle { margin: 4px 0 0; font-size: 12px; color: var(--ns-text-secondary, #909399); }
 .ns-review-page__header-actions { display: flex; gap: 8px; }
-.ns-review-page__button { padding: 5px 12px; border: 1px solid var(--ns-border, #dcdfe6); border-radius: 4px; background: #fff; font-size: 13px; color: var(--ns-text-regular, #606266); cursor: pointer; }
+.ns-review-page__button { padding: 5px 12px; border: 1px solid var(--ns-border, #dcdfe6); border-radius: 4px; background: var(--ns-bg-elevated); font-size: 13px; color: var(--ns-text-regular, #606266); cursor: pointer; }
 .ns-review-page__button:hover:not(:disabled) { border-color: var(--ns-primary, #409eff); color: var(--ns-primary, #409eff); }
 .ns-review-page__button.is-primary { border-color: var(--ns-primary, #409eff); background: var(--ns-primary, #409eff); color: #fff; }
 .ns-review-page__button:disabled { cursor: not-allowed; opacity: 0.5; }
@@ -540,7 +540,7 @@ function goAlignment(): void {
 .ns-review-page__pair { display: flex; flex-direction: column; gap: 6px; padding: 10px; border: 1px solid var(--ns-border-light, #e4e7ed); border-radius: 6px; background: var(--ns-bg-subtle, #fafafa); }
 .ns-review-page__pair-title { margin: 0; font-size: 13px; color: var(--ns-text-primary, #303133); }
 .ns-review-page__list { display: flex; flex-direction: column; gap: 6px; margin: 0; padding: 0; max-height: 260px; overflow-y: auto; list-style: none; }
-.ns-review-page__list li { display: flex; flex-direction: column; gap: 4px; padding: 6px 8px; border: 1px solid var(--ns-border-light, #e4e7ed); border-radius: 4px; background: #fff; font-size: 12px; color: var(--ns-text-regular, #606266); }
+.ns-review-page__list li { display: flex; flex-direction: column; gap: 4px; padding: 6px 8px; border: 1px solid var(--ns-border-light, #e4e7ed); border-radius: 4px; background: var(--ns-bg-elevated); font-size: 12px; color: var(--ns-text-regular, #606266); }
 .ns-review-page__list-main { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
 .ns-review-page__list-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .ns-review-page__select { max-width: 260px; padding: 3px 6px; border: 1px solid var(--ns-border, #dcdfe6); border-radius: 3px; font-size: 12px; }

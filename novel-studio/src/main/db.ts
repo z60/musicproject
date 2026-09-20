@@ -238,24 +238,57 @@ export async function runMigrations(opts: {
   }
 }
 
+export interface CheckIntegrityOptions {
+  /** 是否处于只读模式（迁移失败后） */
+  readOnly?: boolean
+  /** 只读原因（进日志，便于一眼看出「迁移没跑完」） */
+  readOnlyReason?: string | null
+  /** 本次启动期望的最终 schema 版本（用于区分「全新库待迁移」与「迁移失败」） */
+  expectedSchemaVersion?: number
+}
+
 /**
  * 完整性与外键检查（启动顺序第 6 步）。
  *
  * **不抛错**：`integrity_check` 报问题时应用仍应能启动（给提示 + 引导从备份恢复）。
  * 把用户直接挡在门外是更糟的选择 —— 他连导出数据的机会都没有。
+ *
+ * ### 为什么需要 `opts.readOnly`（docs/91 §8 的第二个已知缺陷）
+ *   只读模式下 `schemaVersion` 必然是 0（迁移没跑完），但这跟「刚建的全新库」
+ *   在日志里长得**一模一样**：都是 `db.integrity.ok schemaVersion: 0`。
+ *   于是真机上「迁移根本没跑、一张业务表都没有」这件事被读成了「正常空库」。
+ *   只读 + 完整性通过 ≠ 一切正常，必须单独记一条 `db.integrity.degraded`。
  */
-export function checkIntegrity(db: DbLike, log: Logger): IntegrityResult {
+export function checkIntegrity(db: DbLike, log: Logger, opts: CheckIntegrityOptions = {}): IntegrityResult {
   const result = integrityCheck(db)
+  const schemaVersion = currentSchemaVersion(db)
   if (!result.ok) {
     log.warn('db.integrity.failed', {
       event: 'db.integrity.failed',
+      schemaVersion,
+      readOnly: opts.readOnly === true,
       errors: result.errors.slice(0, 5),
+      foreignKeyViolations: result.foreignKeyViolations,
+    })
+  } else if (opts.readOnly === true) {
+    log.warn('db.integrity.degraded', {
+      event: 'db.integrity.degraded',
+      readOnly: true,
+      reason: opts.readOnlyReason ?? null,
+      schemaVersion,
+      // 0 → 迁移一条都没应用；>0 → 只应用了一部分就失败了
+      schemaState: schemaVersion === 0 ? 'migration-not-applied' : 'partial-schema',
+      expectedSchemaVersion: opts.expectedSchemaVersion ?? null,
+      hint: '迁移未完成：当前为只读模式，缺表/缺列不是数据损坏',
       foreignKeyViolations: result.foreignKeyViolations,
     })
   } else {
     log.info('db.integrity.ok', {
       event: 'db.integrity.ok',
-      schemaVersion: currentSchemaVersion(db),
+      schemaVersion,
+      // 全新库（schemaVersion 0）本身正常（待迁移），但要显式标出状态，
+      // 避免与「迁移失败导致的 0」混为一谈。
+      schemaState: schemaVersion === 0 ? 'empty-pending-migration' : 'migrated',
       foreignKeyViolations: result.foreignKeyViolations,
     })
   }

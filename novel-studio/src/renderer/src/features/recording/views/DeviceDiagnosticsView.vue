@@ -41,6 +41,12 @@ const monitor = useMonitor()
 
 /** 已成功上报主进程的自检结果（null = 还没上报） */
 const submitted = ref<boolean | null>(null)
+/**
+ * 自检/回放的提示（docs/91 §5.2.38）：
+ * 采集被中断（`AbortError`）与「没有可回放的缓冲」以前都是**静默**的 ——
+ * 按了按钮什么都没发生、也没有任何文字解释，只能靠猜。
+ */
+const selfTestNotice = ref('')
 
 // ---------------------------------------------------------------------------
 // 设置项读写（唯一来源是 settings.audio，本页不缓存副本）
@@ -105,13 +111,18 @@ const testProgress = computed(() => {
 
 async function runSelfTest(): Promise<void> {
   submitted.value = null
+  selfTestNotice.value = ''
   const summary = await test.start({
     durationMs: SELF_TEST_MS,
     deviceId: selectedDeviceId.value || null,
     sampleRate: sampleRate.value,
     channels: channels.value,
   })
-  if (!summary) return
+  if (!summary) {
+    // 采集被中断 / 设备不可用：必须给出文字解释（静默 = 用户以为按钮坏了）
+    selfTestNotice.value = '自检没有完成：采集被中断或输入设备不可用。请确认上面选中的输入设备、系统麦克风权限后重试。'
+    return
+  }
   // docs/12 §11：自检结果存主进程（本机偏好的一部分）
   submitted.value = await devices.submitSelfTest(summary)
 }
@@ -121,7 +132,11 @@ function stopSelfTest(): void {
 }
 
 async function playBack(): Promise<void> {
-  await test.play()
+  selfTestNotice.value = ''
+  const played = await test.play()
+  if (!played) {
+    selfTestNotice.value = '没有可回放的自检录音：请先完成一次「录 5 秒并回放」，再点回放。'
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -452,8 +467,7 @@ const requiredFreeText = computed(() => formatBytes(RECORD_LIMITS.requiredFreeBy
           </button>
           <button type="button" class="ns-device-page__button" :disabled="!hasResult" @click="playBack">
             ▶ 回放刚才的录音
-          </button>
-          <button
+          </button>          <button
             type="button"
             class="ns-device-page__button"
             :disabled="test.meter.noiseFloorDb.value === null"
@@ -466,6 +480,9 @@ const requiredFreeText = computed(() => formatBytes(RECORD_LIMITS.requiredFreeBy
         <div v-if="test.running.value" class="ns-device-page__progress">
           <div class="ns-device-page__progress-bar" :style="{ width: `${Math.round(testProgress * 100)}%` }" />
         </div>
+
+        <!-- 自检/回放的回执：中断与「没有可回放缓冲」都必须有文字，否则按钮像坏的 -->
+        <p v-if="selfTestNotice" class="ns-device-page__notice">{{ selfTestNotice }}</p>
 
         <p class="ns-device-page__note">
           降噪参考值：
@@ -548,11 +565,11 @@ const requiredFreeText = computed(() => formatBytes(RECORD_LIMITS.requiredFreeBy
 .ns-device-page__card-title { margin: 0; font-size: 14px; color: var(--ns-text-primary, #303133); }
 .ns-device-page__grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px 18px; }
 .ns-device-page__field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--ns-text-secondary, #909399); }
-.ns-device-page__control { padding: 5px 8px; border: 1px solid var(--ns-border, #dcdfe6); border-radius: 4px; background: #fff; font-size: 13px; color: var(--ns-text-primary, #303133); }
+.ns-device-page__control { padding: 5px 8px; border: 1px solid var(--ns-border, #dcdfe6); border-radius: 4px; background: var(--ns-bg-elevated); font-size: 13px; color: var(--ns-text-primary, #303133); }
 .ns-device-page__range { width: 100%; max-width: 220px; }
 .ns-device-page__inline { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; font-size: 12px; color: var(--ns-text-regular, #606266); }
 .ns-device-page__inline--spread { justify-content: space-between; }
-.ns-device-page__button { padding: 5px 12px; border: 1px solid var(--ns-border, #dcdfe6); border-radius: 4px; background: #fff; font-size: 13px; color: var(--ns-text-regular, #606266); cursor: pointer; }
+.ns-device-page__button { padding: 5px 12px; border: 1px solid var(--ns-border, #dcdfe6); border-radius: 4px; background: var(--ns-bg-elevated); font-size: 13px; color: var(--ns-text-regular, #606266); cursor: pointer; }
 .ns-device-page__button:hover:not(:disabled) { border-color: var(--ns-primary, #409eff); color: var(--ns-primary, #409eff); }
 .ns-device-page__button.is-primary { border-color: var(--ns-primary, #409eff); background: var(--ns-primary, #409eff); color: #fff; }
 .ns-device-page__button:disabled { cursor: not-allowed; opacity: 0.5; }
@@ -574,4 +591,13 @@ const requiredFreeText = computed(() => formatBytes(RECORD_LIMITS.requiredFreeBy
 .ns-device-page__suggestion { margin: 0; padding: 8px 10px; border-radius: 4px; background: rgb(230 162 60 / 12%); font-size: 12px; color: var(--ns-warning, #e6a23c); }
 .ns-device-page__warn { margin: 0; font-size: 12px; color: var(--ns-warning, #e6a23c); }
 .ns-device-page__note { margin: 0; font-size: 12px; color: var(--ns-text-secondary, #909399); }
+.ns-device-page__notice {
+  margin: 8px 0 0;
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: rgb(230 162 60 / 14%);
+  color: var(--ns-warning, #e6a23c);
+  font-size: 12px;
+  line-height: 1.7;
+}
 </style>

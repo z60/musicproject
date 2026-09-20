@@ -22,7 +22,7 @@
  *      watcher（否则拖动时 Vue 的调度开销会和绘制抢时间）。
  */
 
-import { onScopeDispose, ref } from 'vue'
+import { onScopeDispose, ref, watch } from 'vue'
 import type { Ref } from 'vue'
 import type { ArrangementItem, Id, TrackId } from '@shared/types.ts'
 import { callSafe } from '@/shared/lib/ipc.ts'
@@ -44,6 +44,8 @@ import {
 } from '@/shared/lib/waveform-transform.ts'
 import type { PeaksPerSec, Rect, Viewport } from '@/shared/lib/waveform-transform.ts'
 import { TRACK_GAP_PX } from '../stores/timeline.store.ts'
+import { useUiStore } from '@/app/store/ui.store.ts'
+import { themeColor } from '@/shared/lib/canvas-theme.ts'
 import type { SegmentSource, TrackKind, TrackView } from '../stores/arrangement.store.ts'
 
 // ===========================================================================
@@ -338,12 +340,13 @@ export interface TimelineRendererApi {
   dispose: () => void
 }
 
-/** 底色常量（与 theme.css 的变量对齐；Canvas 不能直接用 CSS 变量） */
+/**
+ * 强调色（网格/播放头/选区/冲突/循环区）：深浅色下都能看清，保持常量。
+ *
+ * ⚠️ **底色与文字色不在这里** —— 它们必须跟着主题走（见 `canvasColors()`）：
+ * 真机反馈「深色模式下有些背景是白的」，时间线画布就是其中一块。
+ */
 const COLORS = {
-  background: '#ffffff',
-  laneFill: '#fbfcfe',
-  laneAltFill: '#f6f8fb',
-  laneBorder: '#e6e9f0',
   gridMajor: 'rgba(144, 147, 153, 0.28)',
   gridMinor: 'rgba(144, 147, 153, 0.13)',
   playhead: '#f56c6c',
@@ -354,11 +357,36 @@ const COLORS = {
   marqueeFill: 'rgba(64, 158, 255, 0.14)',
   marqueeBorder: '#409eff',
   conflict: '#f56c6c',
-  text: 'rgba(48, 49, 51, 0.92)',
   textInverse: '#ffffff',
-  lock: 'rgba(48, 49, 51, 0.55)',
   loading: 'rgba(144, 147, 153, 0.25)',
 } as const
+
+/** 画布里的主题相关颜色从 `:root` 取（Canvas 不认 CSS 变量，见 shared/lib/canvas-theme.ts） */
+const themeVar = themeColor
+
+/**
+ * 画布里的**主题相关**颜色。
+ *
+ * 为什么每次重绘都取一遍：用户切深浅色后不能等下次 resize 才变 ——
+ * 取值很便宜（`getComputedStyle` 一次），换来的是「切主题立刻跟着变」。
+ */
+export function canvasColors(): {
+  background: string
+  laneFill: string
+  laneAltFill: string
+  laneBorder: string
+  text: string
+  lock: string
+} {
+  return {
+    background: themeVar('--ns-bg-elevated', '#ffffff'),
+    laneFill: themeVar('--ns-bg-subtle', '#fbfcfe'),
+    laneAltFill: themeVar('--ns-fill-light', '#f6f8fb'),
+    laneBorder: themeVar('--ns-border-light', '#e6e9f0'),
+    text: themeVar('--ns-text-primary', 'rgba(48, 49, 51, 0.92)'),
+    lock: themeVar('--ns-text-secondary', 'rgba(48, 49, 51, 0.55)'),
+  }
+}
 
 export function useTimelineRenderer(options: TimelineRendererOptions): TimelineRendererApi {
   let canvas: HTMLCanvasElement | null = null
@@ -487,9 +515,10 @@ export function useTimelineRenderer(options: TimelineRendererOptions): TimelineR
     layer.height = Math.max(1, Math.round(cssHeight * dpr))
     const layerCtx = layer.getContext('2d')
     if (!layerCtx) return
+    const theme = canvasColors()
     layerCtx.setTransform(dpr, 0, 0, dpr, 0, 0)
     layerCtx.clearRect(0, 0, cssWidth, cssHeight)
-    layerCtx.fillStyle = COLORS.background
+    layerCtx.fillStyle = theme.background
     layerCtx.fillRect(0, 0, cssWidth, cssHeight)
 
     const layout = options.layout()
@@ -499,9 +528,9 @@ export function useTimelineRenderer(options: TimelineRendererOptions): TimelineR
     // 1) 轨道底色（交替底色便于横向对齐视线）
     layout.rows.forEach((row) => {
       if (row.top > cssHeight || row.top + row.height < 0) return
-      layerCtx.fillStyle = row.index % 2 === 0 ? COLORS.laneFill : COLORS.laneAltFill
+      layerCtx.fillStyle = row.index % 2 === 0 ? theme.laneFill : theme.laneAltFill
       layerCtx.fillRect(0, row.top, cssWidth, row.height)
-      layerCtx.strokeStyle = COLORS.laneBorder
+      layerCtx.strokeStyle = theme.laneBorder
       layerCtx.lineWidth = 1
       layerCtx.beginPath()
       layerCtx.moveTo(0, row.top + row.height + 0.5)
@@ -689,9 +718,9 @@ export function useTimelineRenderer(options: TimelineRendererOptions): TimelineR
     if (size < 4) return
     const x = rect.x + rect.w - size - 4
     const y = rect.y + 4
-    target.fillStyle = COLORS.lock
+    target.fillStyle = canvasColors().lock
     target.fillRect(x, y + size * 0.45, size, size * 0.6)
-    target.strokeStyle = COLORS.lock
+    target.strokeStyle = canvasColors().lock
     target.lineWidth = 1.2
     target.beginPath()
     target.arc(x + size / 2, y + size * 0.45, size * 0.3, Math.PI, 0)
@@ -762,7 +791,7 @@ export function useTimelineRenderer(options: TimelineRendererOptions): TimelineR
         target.beginPath()
         target.rect(rect.x + 3, rect.y, Math.max(0, rect.w - 6), rect.h)
         target.clip()
-        target.fillStyle = COLORS.text
+        target.fillStyle = canvasColors().text
         target.font = '11px system-ui, -apple-system, "Segoe UI", sans-serif'
         target.textBaseline = 'top'
         target.fillText(text, rect.x + 4, rect.y + (rect.h >= 34 ? 3 : Math.max(2, rect.h / 2 - 7)))
@@ -828,7 +857,7 @@ export function useTimelineRenderer(options: TimelineRendererOptions): TimelineR
         region.x, region.y, region.w, region.h,
       )
     } else {
-      ctx.fillStyle = COLORS.background
+      ctx.fillStyle = canvasColors().background
       ctx.fillRect(region.x, region.y, region.w, region.h)
     }
 
@@ -1037,6 +1066,16 @@ export function useTimelineRenderer(options: TimelineRendererOptions): TimelineR
 
   onScopeDispose(dispose)
 
+  /**
+   * 深浅色切换后重建静态层（底色画在静态层里）。
+   *
+   * 不做这一步的表现：用户切到深色主题后，时间线画布仍是白底 ——
+   * 真机反馈「深色模式下有些背景是白的」里就有它。
+   */
+  if (typeof watch === 'function') {
+    const ui = useUiStore()
+    watch(() => ui.theme, () => invalidateStatic())
+  }
   return {
     attach,
     resize,

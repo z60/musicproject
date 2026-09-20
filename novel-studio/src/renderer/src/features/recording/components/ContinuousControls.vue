@@ -319,7 +319,7 @@ function hint(id: string): string {
   padding: 6px 12px;
   border: 1px solid var(--ns-border, #dcdfe6);
   border-radius: 4px;
-  background: #fff;
+  background: var(--ns-bg-elevated);
   font-size: 13px;
   color: var(--ns-text-regular, #606266);
   cursor: pointer;

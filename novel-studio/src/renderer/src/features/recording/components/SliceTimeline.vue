@@ -532,7 +532,7 @@ watch(
 .ns-slice-timeline__hint .is-unmatched { color: var(--ns-warning, #e6a23c); }
 .ns-slice-timeline__canvas-wrap { position: relative; width: 100%; overflow: hidden; border: 1px solid var(--ns-border-light, #e4e7ed); border-radius: 6px; background: var(--ns-bg-subtle, #fafafa); cursor: crosshair; }
 .ns-slice-timeline__canvas { display: block; width: 100%; height: 100%; }
-.ns-slice-timeline__tooltip { position: absolute; z-index: 2; max-width: 250px; padding: 6px 8px; border: 1px solid var(--ns-border, #dcdfe6); border-radius: 4px; background: rgb(255 255 255 / 96%); box-shadow: 0 4px 12px rgb(0 0 0 / 12%); pointer-events: none; }
+.ns-slice-timeline__tooltip { position: absolute; z-index: 2; max-width: 250px; padding: 6px 8px; border: 1px solid var(--ns-border, #dcdfe6); border-radius: 4px; background: var(--ns-bg-elevated); box-shadow: 0 4px 12px rgb(0 0 0 / 12%); pointer-events: none; }
 .ns-slice-timeline__tooltip-title { margin: 0; font-size: 12px; font-weight: 600; color: var(--ns-text-primary, #303133); }
 .ns-slice-timeline__tooltip-meta { margin: 2px 0 0; font-size: 11px; font-variant-numeric: tabular-nums; color: var(--ns-text-secondary, #909399); }
 .ns-slice-timeline__tooltip-text { margin: 4px 0 0; font-size: 12px; color: var(--ns-text-regular, #606266); }

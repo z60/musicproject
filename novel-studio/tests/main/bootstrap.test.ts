@@ -260,6 +260,51 @@ describe('runBootSequence 执行器', () => {
     const paths = report.steps.find(s => s.id === 'resolve-paths')!
     assert.ok(paths.elapsedMs >= 4, `耗时应被记录，实际 ${paths.elapsedMs}ms`)
   })
+
+  // -------------------------------------------------------------------------
+  // 降级状态（docs/91 §5.2.1 / §8）：迁移失败进只读时报告不能显示 [ok]
+  // -------------------------------------------------------------------------
+  it('步骤返回 readOnly 时标成降级，而不是伪装成 [ok]', async () => {
+    const report = await runBootSequence({
+      steps: BOOT_STEPS.slice(0, 5),
+      handlers: {
+        'single-instance-lock': () => void 0,
+        'resolve-paths': () => void 0,
+        'init-logger': () => void 0,
+        'open-database': () => void 0,
+        // 这就是 run-migrations 在迁移失败时的真实返回形状
+        'run-migrations': () => ({ readOnly: true, reason: 'DB_MIGRATION_FAILED' }),
+      },
+    })
+    const step = report.steps.find(s => s.id === 'run-migrations')!
+    assert.equal(step.ok, true, '步骤本身没抛错，ok 仍为 true')
+    assert.equal(step.degraded, true, '迁移失败进只读必须被标成降级')
+    assert.match(step.degradedReason ?? '', /DB_MIGRATION_FAILED/)
+    assert.equal(report.abortedAt, null, '降级不是中止')
+  })
+
+  it('步骤可用显式 degraded 标记降级并给出原因', async () => {
+    const report = await runBootSequence({
+      steps: BOOT_STEPS.slice(0, 2),
+      handlers: {
+        'single-instance-lock': () => void 0,
+        'resolve-paths': () => ({ degraded: true, degradedReason: '磁盘只读' }),
+      },
+    })
+    const step = report.steps.find(s => s.id === 'resolve-paths')!
+    assert.equal(step.ok, true)
+    assert.equal(step.degraded, true)
+    assert.equal(step.degradedReason, '磁盘只读')
+  })
+
+  it('正常步骤不带降级标记', async () => {
+    const report = await runBootSequence({
+      steps: BOOT_STEPS.slice(0, 1),
+      handlers: { 'single-instance-lock': () => ({ hasLock: true }) },
+    })
+    assert.equal(report.steps[0]!.degraded, undefined)
+    assert.equal(report.steps[0]!.degradedReason, undefined)
+  })
 })
 
 describe('启动报告格式', () => {
@@ -290,5 +335,30 @@ describe('启动报告格式', () => {
     })
     const lines = formatBootReport(report)
     assert.ok(lines.some(l => l.includes('启动在中止于：open-database')))
+  })
+
+  it('降级步骤显示成 [DEGR] 并带原因，不再伪装成 [ok  ]', async () => {
+    const report = await runBootSequence({
+      steps: BOOT_STEPS.slice(0, 5),
+      handlers: {
+        'single-instance-lock': () => void 0,
+        'resolve-paths': () => void 0,
+        'init-logger': () => void 0,
+        'open-database': () => void 0,
+        'run-migrations': () => ({
+          readOnly: true,
+          reason: 'DB_MIGRATION_FAILED',
+          degraded: true,
+          degradedReason: '迁移失败，已进入只读模式：DB_MIGRATION_FAILED',
+        }),
+      },
+    })
+    const lines = formatBootReport(report)
+    const line = lines.find(l => l.includes('run-migrations'))!
+    assert.ok(line.includes('[DEGR]'), `降级必须是独立状态，实际：${line}`)
+    assert.ok(line.includes('只读'), `应带降级原因，实际：${line}`)
+    assert.ok(!line.includes('[ok  ]'), '降级不能显示成普通成功')
+    // 其余正常步骤仍是 [ok  ]
+    assert.ok(lines.some(l => l.includes('[ok  ]') && l.includes('open-database')))
   })
 })

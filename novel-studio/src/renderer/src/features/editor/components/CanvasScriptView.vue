@@ -400,7 +400,7 @@ function rowClass(line: CanvasLine): Record<string, boolean> {
   padding: 1px 8px;
   border: 1px solid var(--ns-border, #dcdfe6);
   border-radius: 3px;
-  background: #fff;
+  background: var(--ns-bg-elevated);
   color: var(--ns-text-regular, #606266);
   font-size: 11px;
   cursor: pointer;

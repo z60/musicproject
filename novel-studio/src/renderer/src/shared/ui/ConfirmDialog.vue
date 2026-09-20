@@ -228,7 +228,7 @@ function onKeydown(event: KeyboardEvent): void {
   padding: 7px 16px;
   border: 1px solid var(--ns-border, #dcdfe6);
   border-radius: 4px;
-  background: #fff;
+  background: var(--ns-bg-elevated);
   color: var(--ns-text-primary, #303133);
   font-size: 13px;
   cursor: pointer;

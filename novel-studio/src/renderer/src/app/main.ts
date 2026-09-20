@@ -23,6 +23,17 @@ import { createApp, h, reactive } from 'vue'
 import { createPinia } from 'pinia'
 import ElementPlus from 'element-plus'
 import 'element-plus/dist/index.css'
+/**
+ * Element Plus 的**深色变量**（`html.dark { --el-* }`）。
+ *
+ * 为什么必须显式引入（真机反馈：深色模式下「有些背景是黑色、字体是深灰」）：
+ *   `element-plus/dist/index.css` 只定义**浅色**变量（`--el-text-color-*` 是 #303133 这类深灰）。
+ *   应用自己切到深色时只加了 `html.dark` 类，而 EP 的深色变量表没被加载 ——
+ *   于是按钮/输入框/下拉/标签/对话框这些 EP 组件的文字仍然是浅色模式的深灰，
+ *   落在我们自己的深色底上就是「黑底 + 深灰字」。
+ *   这张表只在 `html.dark` 下生效，浅色模式不受影响（见 ui.store.applyTheme 的类名切换）。
+ */
+import 'element-plus/theme-chalk/dark/css-vars.css'
 
 import App from './App.vue'
 import { router } from './router'

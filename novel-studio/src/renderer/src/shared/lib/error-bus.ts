@@ -17,8 +17,8 @@
  *   4. fatal 永不自动关闭，并禁止继续操作
  */
 
-import { AppError, resolve, isAppError, isSerializedAppError } from '@shared/errors.ts'
-import type { DisplayableError, SerializedAppError } from '@shared/errors.ts'
+import { AppError, resolve, normalizeErrorInput } from '@shared/errors.ts'
+import type { DisplayableError } from '@shared/errors.ts'
 import type { ErrorAction, MessageKey, Severity } from '@shared/messages.ts'
 
 // ---------------------------------------------------------------------------
@@ -317,9 +317,15 @@ export function reportBatchFailures(opts: {
 // ---------------------------------------------------------------------------
 
 function normalize(input: unknown): AppError {
-  if (isAppError(input)) return input
-  if (isSerializedAppError(input)) return AppError.fromSerialized(input as SerializedAppError)
-  return AppError.of('INTERNAL', { cause: input })
+  /**
+   * 归一化必须在 `@shared/errors.ts` 里做（`normalizeErrorInput`）：
+   * 它保证「已归一化 → 原样 / IPC 序列化体 → 还原 / 其余 → `wrapUnknown`（走 errno 映射表）」。
+   *
+   * 这里曾经自己写 `AppError.of('INTERNAL', { cause: input })`，把整张映射表绕过去了 ——
+   * 一次被中断的采集（DOMException `AbortError`）本该按「取消」静默，却弹出了
+   * 「发生了未预期的错误 / 错误编号「-」/ 兜底码…」（真机事故 docs/91 §5.2.38）。
+   */
+  return normalizeErrorInput(input)
 }
 
 function buildActions(

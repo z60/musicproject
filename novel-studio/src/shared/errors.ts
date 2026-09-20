@@ -232,6 +232,13 @@ export function isAbortError(e: unknown): boolean {
 
 /**
  * 读取错误的 code 字段（Node 系统错误、undici、DOMException 都在这里）
+ *
+ * ⚠️ DOMException 的 `code` 是**数字**（AbortError=20、NotAllowedError=18…），
+ * 它的「错误名」在 `name` 里。因此这里还要回看一次 `name` ——
+ * 否则 `SYSTEM_ERRNO_MAP` 里那批**按名字**写的条目
+ * （`NotAllowedError` / `NotFoundError` / `NotReadableError` / `OverconstrainedError` /
+ * `QuotaExceededError`）全是死代码：麦克风权限被拒、设备被占用都会退化成「未预期的错误」。
+ * 只查表里存在的名字，避免把普通 `Error` 的 name 当 errno。
  */
 function readErrorCode(e: unknown): string | undefined {
   if (!e || typeof e !== 'object') return undefined
@@ -239,6 +246,8 @@ function readErrorCode(e: unknown): string | undefined {
   if (typeof code === 'string') return code
   const errno = (e as { errno?: unknown }).errno
   if (typeof errno === 'string') return errno
+  const name = (e as { name?: unknown }).name
+  if (typeof name === 'string' && name !== 'Error' && name in SYSTEM_ERRNO_MAP) return name
   return undefined
 }
 
@@ -270,6 +279,30 @@ export function wrapUnknown(e: unknown, fallbackKey: MessageKey = 'INTERNAL'): A
 
   // 抛了非 Error（字符串 / 对象 / undefined）
   return new AppError(fallbackKey, { details: { raw: safeStringify(e) } })
+}
+
+/**
+ * 错误归一化的**唯一入口**（渲染进程的错误总线与主进程都用它）。
+ *
+ * 顺序：
+ *   1. 已经是 `AppError` → 原样返回（不重复包裹）
+ *   2. 过 IPC 的序列化体 → `AppError.fromSerialized` 还原
+ *   3. 其余一切都交给 {@link wrapUnknown} —— **必须走这一条**，
+ *      否则 `SYSTEM_ERRNO_MAP`、`isAbortError`、`detectSqliteSchemaError` 全都不生效
+ *
+ * ### 为什么单列这个函数（真机事故 docs/91 §5.2.38）
+ *   渲染进程的错误总线原来自己写了一句 `AppError.of('INTERNAL', { cause: input })`，
+ *   绕过了 `wrapUnknown`。后果是**所有映射都失效**：
+ *     · 设备诊断里一次被中断的采集（DOMException `AbortError`）本该按「取消」静默处理，
+ *       却弹出「发生了未预期的错误 / 错误编号：「-」」+「兜底码…某处缺少精确抛错」；
+ *     · `NotAllowedError`（麦克风权限被拒）、`ENOSPC`（磁盘满）、`SQLITE_BUSY` 等
+ *       也全都退化成同一句「未预期的错误」，用户拿不到任何可行动的线索。
+ *   把归一化收在这里之后，「先映射、再兜底」这件事只剩一处实现，两边都测得到。
+ */
+export function normalizeErrorInput(input: unknown): AppError {
+  if (isAppError(input)) return input
+  if (isSerializedAppError(input)) return AppError.fromSerialized(input as SerializedAppError)
+  return wrapUnknown(input)
 }
 
 /**

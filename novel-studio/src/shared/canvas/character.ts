@@ -28,7 +28,6 @@ import type {
   Timestamp,
 } from '../types.ts'
 import {
-  CUE_MODIFIERS,
   CUE_VERBS,
   INNER_CUE_VERBS,
   NON_NAME_TOKENS,
@@ -36,6 +35,7 @@ import {
   guessNameVariants,
   looksLikePersonName,
   matchCue,
+  parseSpeakerLabel,
 } from './attribution.ts'
 import {
   isRoleTitle,
@@ -246,30 +246,20 @@ export function extractCharacterCandidates(
    * 真机实测（《我陪魔神历劫》第 2 章）：整章 726 字、全是这种写法，抽取结果为 **0 个候选**，
    * 用户点「自动抽取」时界面什么都不出现。
    *
-   * 取法（和信号 1 相反 —— 名字在窗口**开头**，不在末尾）：
-   *   · 行首整段（到冒号为止）本身就是人名 → 就取它（`纳兰嫣然：` 不会退化成「纳兰」）
-   *   · 否则取 2~3 字前缀（`无畏翻了个白眼` → 「无畏」/「无畏翻」）——
-   *     多出来的那一个（`无畏翻`）只在这句话里出现，靠后面的出现次数阈值与片段收敛收掉
-   *   · 窗口末尾已经有引导语动词的（`萧炎沉声道`）直接跳过：那是信号 1 的活，重复抽只会多出「萧炎沉」这种碎片
+   * 解析逻辑与**判定层**共用 `parseSpeakerLabel`（`attribution.ts`）—— 同一套「行首说话人标签」
+   * 既要能抽出候选，又要能在生成画本时把台词判给那个人；两处各写一遍必然会漂移。
+   * 这里只负责把解析结果登记成候选证据：
+   *   · 整段就是名字（`纳兰嫣然：`）→ `speaker`（最强证据：他正在说话）
+   *   · 只是名字前缀（`无畏翻了个白眼` → 「无畏」）→ `dialogue`（弱一档）
    */
-  const dialogueLeadRe = /^[ \t\u3000]*([\u4e00-\u9fa5·]{2,12})[：:][ \t]*[“"「『]/gm
-  for (const m of text.matchAll(dialogueLeadRe)) {
-    const window = m[1]!
-    const at = m.index ?? 0
-    if (matchCue(window, 'before') !== null) continue
-    const whole = window
-    if (looksLikePersonName(whole)) {
-      // 「行首整段就是名字」—— 这就是最强的人名证据（他在说话，而且是这份文本标出来的）
-      bump(whole, 'speaker', `dialogue@${at}`)
-      continue
+  let lineStart = 0
+  for (const line of text.split('\n')) {
+    const parsed = parseSpeakerLabel(line)
+    if (parsed) {
+      const strong = parsed.hint === parsed.window
+      bump(parsed.hint, strong ? 'speaker' : 'dialogue', `dialogue@${lineStart}`)
     }
-    for (const len of [2, 3]) {
-      if (window.length < len) continue
-      const prefix = window.slice(0, len)
-      if (CUE_MODIFIERS.includes(prefix)) continue
-      // 前缀只是「可能的名字」，算行首说话人证据（弱一档）；能不能留下由后面的形态+位置证据决定
-      bump(prefix, 'dialogue', `dialogue@${at}`)
-    }
+    lineStart += line.length + 1
   }
 
   // ---- 信号 2：高频称谓 ----

@@ -353,7 +353,7 @@ function clearFilter(): void {
   padding: 3px 10px;
   border: 1px solid var(--ns-border, #dcdfe6);
   border-radius: 12px;
-  background: #fff;
+  background: var(--ns-bg-elevated);
   font-size: 12px;
   color: var(--ns-text-regular, #606266);
   cursor: pointer;
@@ -412,7 +412,7 @@ function clearFilter(): void {
   padding: 4px 10px;
   border: 1px solid var(--ns-border, #dcdfe6);
   border-radius: 4px;
-  background: #fff;
+  background: var(--ns-bg-elevated);
   font-size: 12px;
   color: var(--ns-text-regular, #606266);
   cursor: pointer;

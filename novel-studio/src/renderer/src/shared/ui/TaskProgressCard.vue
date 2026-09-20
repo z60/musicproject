@@ -280,7 +280,7 @@ function onOpen(): void {
   padding: 3px 10px;
   border: 1px solid var(--ns-border, #dcdfe6);
   border-radius: 4px;
-  background: #fff;
+  background: var(--ns-bg-elevated);
   color: var(--ns-text-primary, #303133);
   font-size: 12px;
   cursor: pointer;

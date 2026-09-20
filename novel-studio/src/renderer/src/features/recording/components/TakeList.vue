@@ -330,7 +330,7 @@ defineExpose({
   padding: 2px 8px;
   border: 1px solid var(--ns-border, #dcdfe6);
   border-radius: 4px;
-  background: #fff;
+  background: var(--ns-bg-elevated);
   font-size: 12px;
   cursor: pointer;
 }
@@ -385,7 +385,7 @@ defineExpose({
   height: 22px;
   border: 1px solid var(--ns-border, #dcdfe6);
   border-radius: 50%;
-  background: #fff;
+  background: var(--ns-bg-elevated);
   cursor: pointer;
   line-height: 1;
 }
@@ -430,7 +430,7 @@ defineExpose({
   padding: 2px 8px;
   border: 1px solid var(--ns-border, #dcdfe6);
   border-radius: 4px;
-  background: #fff;
+  background: var(--ns-bg-elevated);
   color: var(--ns-text-primary, #303133);
   font-size: 11px;
   cursor: pointer;

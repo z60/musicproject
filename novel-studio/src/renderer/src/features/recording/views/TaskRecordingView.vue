@@ -27,6 +27,7 @@ import TakeCompareDialog from '../components/TakeCompareDialog.vue'
 import TakeFlagsPanel from '../components/TakeFlagsPanel.vue'
 import TakeList from '../components/TakeList.vue'
 import TransportBar from '../components/TransportBar.vue'
+import { useRecordCountdown } from '../composables/useRecordCountdown.ts'
 import { useRecorder } from '../composables/useRecorder.ts'
 import { useShortcuts } from '../composables/useShortcuts.ts'
 import { useDeviceStore } from '../stores/device.store.ts'
@@ -61,9 +62,6 @@ const compareOpen = ref(false)
 const comparePicks = ref<string[]>([])
 const confirmDiscard = ref(false)
 const activeFlags = ref<string[]>([])
-const countdownVisible = ref(false)
-const countdownSeconds = ref(0)
-let countdownTimer: ReturnType<typeof setInterval> | null = null
 
 const actor = computed<VoiceActor | null>(() => session.actor)
 const characterNames = computed(() => new Map(characters.value.map(character => [character.id, character.name])))
@@ -151,30 +149,25 @@ async function prepareSession(): Promise<boolean> {
 async function beginRecording(): Promise<void> {
   if (await prepareSession()) await recorder.start()
 }
-function stopCountdown(): void {
-  if (countdownTimer) clearInterval(countdownTimer)
-  countdownTimer = null
-  countdownVisible.value = false
-  countdownSeconds.value = 0
+/**
+ * 倒计时（docs/12 §3.2）：与主录音页共用同一个 composable（真机事故 docs/91 §5.2.37 ——
+ * 两份各自写的 setInterval 都只关遮罩、不开录，默认 3 秒倒计时导致「点了录制没反应」）。
+ */
+const countdown = useRecordCountdown({ onElapsed: () => { void beginRecording() } })
+const countdownVisible = countdown.visible
+const countdownSeconds = countdown.seconds
+async function onCountdownCancel(): Promise<void> {
+  countdown.cancelAndBegin()
 }
 /** 开始前走倒计时（settings.audio.countdownMs；0 = 立即开始，docs/12 §3.2） */
 function requestRecord(): void {
   if (recording.diskLow) { pageNotice.value = '磁盘空间不足：请清理后重试。'; return }
-  const countdownMs = settings.audio?.countdownMs ?? 0
-  if (countdownMs <= 0) { void beginRecording(); return }
-  countdownSeconds.value = countdownMs / 1000
-  countdownVisible.value = true
-  let remaining = countdownMs
-  countdownTimer = setInterval(() => {
-    remaining -= 100
-    countdownSeconds.value = Math.max(0, remaining / 1000)
-    if (remaining <= 0) stopCountdown()
-  }, 100)
+  countdown.request(settings.audio?.countdownMs ?? 0)
 }
 async function toggleRecord(): Promise<void> {
   if (recording.isRecording) { await stopRecording(); return }
   if (recording.isPaused) { await recorder.resume(); return }
-  if (countdownVisible.value) { stopCountdown(); await beginRecording(); return }
+  if (countdownVisible.value) { countdown.cancelAndBegin(); return }
   requestRecord()
 }
 async function stopRecording(): Promise<void> {
@@ -285,7 +278,7 @@ onMounted(async () => {
   }
 })
 onBeforeUnmount(() => {
-  stopCountdown()
+  countdown.stop()
   shortcuts.disable()
   ui.setCapturingShortcuts(false)
   recording.dispose()
@@ -387,7 +380,7 @@ onBeforeUnmount(() => {
     <ConfirmDialog v-model="confirmDiscard" title="丢弃本次录音？" type="warning" confirm-text="丢弃"
       message="未定稿的会话文件会被删除，已生成的 take 不受影响。" @confirm="discardSession" />
     <CountdownOverlay :visible="countdownVisible" :seconds="countdownSeconds"
-      cancel-hint="按任意键立刻开始录音" @cancel="stopCountdown(); beginRecording()" />
+      cancel-hint="按任意键立刻开始录音" @cancel="onCountdownCancel" />
   </div>
 </template>
 
@@ -400,7 +393,7 @@ onBeforeUnmount(() => {
 .ns-task__title { margin: 0; font-size: 18px; color: var(--ns-text-primary, #303133); }
 .ns-task__sub { margin: 0; font-size: 12px; color: var(--ns-text-secondary, #909399); }
 .ns-task__toggle { display: inline-flex; gap: 6px; align-items: center; font-size: 12px; color: var(--ns-text-regular, #606266); }
-.ns-task__btn { padding: 5px 12px; border: 1px solid var(--ns-border, #dcdfe6); border-radius: 4px; background: #fff; font-size: 13px; color: var(--ns-text-regular, #606266); cursor: pointer; }
+.ns-task__btn { padding: 5px 12px; border: 1px solid var(--ns-border, #dcdfe6); border-radius: 4px; background: var(--ns-bg-elevated); font-size: 13px; color: var(--ns-text-regular, #606266); cursor: pointer; }
 .ns-task__btn:hover:not(:disabled) { border-color: var(--ns-primary, #409eff); color: var(--ns-primary, #409eff); }
 .ns-task__btn:disabled { cursor: not-allowed; opacity: 0.5; }
 .ns-task__readonly { margin: 0; padding: 8px 12px; border-left: 3px solid var(--ns-primary, #409eff); border-radius: 4px; background: rgb(64 158 255 / 8%); font-size: 12px; color: var(--ns-text-regular, #606266); }

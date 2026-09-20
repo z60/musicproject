@@ -211,7 +211,7 @@ function onOpenChange(value: boolean): void {
   padding: 4px 0;
   border: 1px solid var(--ns-border, #dcdfe6);
   border-radius: 3px;
-  background: #fff;
+  background: var(--ns-bg-elevated);
   color: var(--ns-text-regular, #606266);
   font-size: 12px;
   cursor: pointer;
@@ -237,7 +237,7 @@ function onOpenChange(value: boolean): void {
   height: 22px;
   border: 1px solid var(--ns-border, #dcdfe6);
   border-radius: 50%;
-  background: #fff;
+  background: var(--ns-bg-elevated);
   color: var(--ns-text-regular, #606266);
   font-size: 11px;
   cursor: pointer;

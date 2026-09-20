@@ -20,6 +20,7 @@ import { describe, it } from 'node:test'
 import {
   CUE_LOOKBACK_DEFAULT,
   EMOTION_LEXICON,
+  RULE_CONFIDENCE,
   applyRulePostProcess,
   attributeByVector,
   buildContext,
@@ -509,6 +510,92 @@ describe('说话人判定：30 行人工标注回归集准确率 ≥ 85%', () =>
     assert.ok(out.report.elapsedMs >= 0)
     assert.equal(typeof out.report.lowConfidence, 'number')
     assert.equal(out.report.unmatchedQuote, 0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Step 6 的规则 2b：引号前的说话人标签 / 行内主语（真机事故：整本书只有旁白）
+// ---------------------------------------------------------------------------
+
+/** 只用「名字」构造判定引用（不需要向量：2b 是规则层的活） */
+const nameRef = (name: string): CanvasCharacterRef => ({ id: `c-${name}`, name, aliases: [], centroid: null })
+
+describe('Step 6 · 2b 说话人标签与行内主语（docs/91 §5.2.36）', () => {
+  async function run(text: string, characters: string[]) {
+    const out = await generateCanvas({
+      chapterId: 'ch-subject', bookId: 'b', chapterText: text,
+      characters: characters.map(nameRef),
+      options: baseOptions(),
+      // 无向量：与章节管理在「没有 ONNX 模型」时走的同一条路径（真机就是这个路径）
+      embed: undefined,
+      limits: { attributionThreshold: 0.5, attributionMargin: 0.02 },
+    })
+    // 引号外的叙述会成为单独一行旁白（docs/91 §5.2.29），所以按 kind 取台词行
+    return {
+      lines: out.lines,
+      dialogue: out.lines.filter((l) => l.kind === 'dialogue'),
+    }
+  }
+
+  it('剧本体：行首「名字 + 冒号 + 引号」直接判给那个人（一个引导语动词都没有）', async () => {
+    const { dialogue } = await run('无畏：“你瞎啊？”\n琉璃：“是这个道理。”', ['无畏', '琉璃'])
+    assert.equal(dialogue[0]?.characterName, '无畏', `实际：${dialogue[0]?.attributionReason}`)
+    assert.equal(dialogue[0]?.decidedBy, 'rule')
+    assert.equal(dialogue[0]?.confidence, RULE_CONFIDENCE.speakerLabel)
+    assert.match(dialogue[0]?.attributionReason ?? '', /行首说话人标签/)
+    assert.equal(dialogue[1]?.characterName, '琉璃')
+  })
+
+  it('剧本体的前缀写法：`无畏翻了个白眼：“…”` 也算无畏', async () => {
+    const { dialogue } = await run('无畏翻了个白眼：“你瞎啊？”', ['无畏'])
+    assert.equal(dialogue.length, 1)
+    assert.equal(dialogue[0]?.characterName, '无畏')
+    assert.match(dialogue[0]?.attributionReason ?? '', /行首说话人标签/)
+  })
+
+  it('主语 + 叙述 + 引号：`沈绪轻轻的推开殿门而入，“拜见师尊。”` → 沈绪（短台词也不再丢）', async () => {
+    const { dialogue } = await run('沈绪轻轻的推开殿门而入，“拜见师尊。”', ['沈绪', '师尊'])
+    assert.equal(dialogue[0]?.characterName, '沈绪', `实际：${dialogue[0]?.attributionReason}`)
+    assert.match(dialogue[0]?.attributionReason ?? '', /行内主语/)
+  })
+
+  it('引导语被状语顶开时回到句首主语：`姜练…看了一眼沈绪，随口问道，“…”` → 姜练', async () => {
+    const { dialogue } = await run('姜练微微点头，抬头看了一眼沈绪，随口问道，“入门试炼结束了？”', ['姜练', '沈绪'])
+    assert.equal(dialogue[0]?.characterName, '姜练', `不该判给被提及的沈绪：${dialogue[0]?.attributionReason}`)
+    assert.equal(dialogue[0]?.needsReview, false)
+  })
+
+  it('主语边界优先：`作为代掌教的沈绪…问，“…”` 判沈绪，而不是「代掌教」里的掌教', async () => {
+    // 真机第一次跑出来判成了「掌教」（它在「代掌教」里被先命中）——这是回归用例
+    const { dialogue } = await run('此刻，作为代掌教的沈绪有些心神不宁，连忙赶上去问，“入门试炼的事？”', ['掌教', '沈绪'])
+    assert.equal(dialogue[0]?.characterName, '沈绪', `实际：${dialogue[0]?.attributionReason}`)
+  })
+
+  it('歧义（引号前有两个角色名）→ 给结论但标待确认', async () => {
+    const { dialogue } = await run('姜练看向沈绪，沈绪又看向掌教，“谁去？”', ['姜练', '沈绪', '掌教'])
+    assert.ok(dialogue[0]?.characterName, '仍要给一个结论，而不是一律旁白')
+    assert.equal(dialogue[0]?.needsReview, true, '歧义必须进待确认')
+    assert.equal(dialogue[0]?.confidence, RULE_CONFIDENCE.subjectAmbiguous)
+    assert.match(dialogue[0]?.attributionReason ?? '', /多个角色名/)
+  })
+
+  it('引号前没有角色名时不瞎猜（仍是未指派 + 待确认）', async () => {
+    const { dialogue } = await run('“就这些？”\n“在可能的情况下，系统会发布任务。”', ['姜练', '沈绪'])
+    assert.equal(dialogue[0]?.characterName, null)
+    assert.equal(dialogue[0]?.speakerType, 'narration')
+    assert.equal(dialogue[0]?.needsReview, true)
+  })
+
+  it('引导语指名仍然优先（不被 2b 覆盖）', async () => {
+    const { dialogue } = await run('萧炎沉声道：“我必去。”', ['萧炎', '药老'])
+    assert.equal(dialogue[0]?.characterName, '萧炎')
+    assert.equal(dialogue[0]?.confidence, RULE_CONFIDENCE.cueOverride)
+    assert.match(dialogue[0]?.attributionReason ?? '', /引导语指名/)
+  })
+
+  it('标签对不上角色表时不动手（`说明：“…”`）', async () => {
+    const { dialogue } = await run('说明：“这里没有角色名。”', ['姜练'])
+    assert.equal(dialogue[0]?.characterName, null, '标签没能对上角色表就不能指派')
   })
 })
 

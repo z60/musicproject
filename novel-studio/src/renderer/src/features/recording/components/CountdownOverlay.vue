@@ -256,7 +256,7 @@ function onOverlayClick(): void {
   padding: 6px 18px;
   border: 1px solid var(--ns-border, #dcdfe6);
   border-radius: 4px;
-  background: #fff;
+  background: var(--ns-bg-elevated);
   color: var(--ns-text-regular, #606266);
   cursor: pointer;
 }

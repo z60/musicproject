@@ -38,6 +38,7 @@ import {
   SYSTEM_ERRNO_MAP,
   formatBytes,
   isAbortError,
+  normalizeErrorInput,
   isSerializedAppError,
   resolve,
   toLogFields,
@@ -513,6 +514,60 @@ describe('wrapUnknown 包裹规则', () => {
 
   it('可用自定义兜底码', () => {
     assert.equal(wrapUnknown(new Error('x'), 'TASK_FAILED').key, 'TASK_FAILED')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 归一化唯一入口（真机事故：渲染进程绕过映射表，什么都变成「未预期的错误」）
+// ---------------------------------------------------------------------------
+
+/**
+ * 事故（docs/91 §5.2.38）：设备诊断「录 5 秒并回放」被中断时，用户看到的是
+ * 「发生了未预期的错误 / 错误编号：「-」/ 兜底码…某处缺少精确抛错」，原因链是
+ * `AbortError: The user aborted a request.`。
+ *
+ * 根因不是映射表缺条目（`AbortError → TASK_CANCELLED` 一直在表里），而是**渲染进程的错误总线
+ * 自己写了一句 `AppError.of('INTERNAL', { cause: input })`，把整张表绕过去了**。
+ * 这组测试盯住 `normalizeErrorInput`：它是两边的唯一入口。
+ */
+describe('normalizeErrorInput：先映射、再兜底', () => {
+  it('被中断的采集（DOMException AbortError）→ 取消，不是「未预期的错误」', () => {
+    const dom = new DOMException('The user aborted a request.', 'AbortError')
+    const e = normalizeErrorInput(dom)
+    assert.equal(e.key, 'TASK_CANCELLED', `实际：${e.key}（事故里显示的是 INTERNAL「-」）`)
+    assert.equal(e.isCancelled, true, '取消类错误必须静默：不弹提示、不写 error 级日志')
+    assert.notEqual(e.numericCode, '-', '不该退化成没有编号的兜底码')
+  })
+
+  it('浏览器侧错误按名字映射（权限 / 设备 / 配额）', () => {
+    assert.equal(normalizeErrorInput(new DOMException('denied', 'NotAllowedError')).key, 'DEVICE_PERMISSION')
+    assert.equal(normalizeErrorInput(new DOMException('gone', 'NotFoundError')).key, 'DEVICE_UNAVAILABLE')
+    assert.equal(normalizeErrorInput(new DOMException('busy', 'NotReadableError')).key, 'DEVICE_UNAVAILABLE')
+    assert.equal(normalizeErrorInput(new DOMException('full', 'QuotaExceededError')).key, 'DISK_FULL')
+  })
+
+  it('系统 errno 整张表都吃得下（任何一个漏掉都会退化成「未预期的错误」）', () => {
+    for (const [errno, key] of Object.entries(SYSTEM_ERRNO_MAP)) {
+      const e = normalizeErrorInput(Object.assign(new Error(`mock ${errno}`), { code: errno }))
+      assert.equal(e.key, key, `${errno} 应映射为 ${key}，实际 ${e.key}`)
+    }
+  })
+
+  it('已是 AppError / IPC 序列化体 → 原样保留（不重复包裹、不改码）', () => {
+    const original = new AppError('DISK_FULL', { params: { need: '1 GB' } })
+    assert.equal(normalizeErrorInput(original), original)
+
+    const serialized = toSerialized(original)
+    const restored = normalizeErrorInput(serialized)
+    assert.equal(restored.key, 'DISK_FULL')
+    assert.deepEqual(restored.params, { need: '1 GB' })
+  })
+
+  it('真正未知的错误才落到兜底码 INTERNAL（并保留原因链供排查）', () => {
+    const e = normalizeErrorInput(new Error('something exploded'))
+    assert.equal(e.key, 'INTERNAL')
+    assert.ok(e.causeChain.some((line) => line.includes('something exploded')), JSON.stringify(e.causeChain))
+    assert.equal(e.isCancelled, false)
   })
 })
 

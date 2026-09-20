@@ -34,6 +34,7 @@
 import { onScopeDispose, readonly, shallowRef } from 'vue'
 import type { Ref } from 'vue'
 import { formatDb } from '@/shared/lib/format.ts'
+import { themeColor } from '@/shared/lib/canvas-theme.ts'
 
 // ---------------------------------------------------------------------------
 // 常量
@@ -553,7 +554,7 @@ export function drawBarMeter(
   // 峰值保持线（2 px，比 RMS 条更醒目）
   const holdRatio = ratioOfDb(state.peakHoldDb, minDb, maxDb)
   if (state.peakHoldDb !== null && holdRatio > 0) {
-    ctx.fillStyle = options.peakColor ?? 'rgb(48 49 51 / 90%)'
+    ctx.fillStyle = options.peakColor ?? themeColor('--ns-text-primary', 'rgb(48 49 51 / 90%)')
     if (vertical) {
       const y = Math.max(0, Math.min(height - 2, height - holdRatio * height - 1))
       ctx.fillRect(0, y, width, 2)

@@ -36,7 +36,7 @@ import { computed, onScopeDispose, ref, shallowRef, watch } from 'vue'
 import type { ComputedRef, Ref, ShallowRef } from 'vue'
 import { call, callSafe, send } from '@/shared/lib/ipc.ts'
 import { reportError } from '@/shared/lib/error-bus.ts'
-import { AppError } from '@shared/errors.ts'
+import { AppError, isAbortError } from '@shared/errors.ts'
 import { formatBytes, formatDurationLong } from '@/shared/lib/format.ts'
 import { AUDIO_DEFAULTS, RECORD_LIMITS, TRIM_DEFAULTS } from '@shared/constants.ts'
 import type { IpcSendPayload } from '@shared/ipc.ts'
@@ -1011,7 +1011,25 @@ export function useDeviceSelfTest(): UseDeviceSelfTestReturn {
       return summary
     } catch (error) {
       running.value = false
-      reportError(error, { event: 'selfTest.captureFailed' })
+      if (timer) {
+        clearInterval(timer)
+        timer = null
+      }
+      /**
+       * 采集被中断（DOMException `AbortError`：音频上下文被关掉、设备切换、页面跳走）
+       * **不是故障**，按「取消」处理：只记 info 日志，不弹错误框。
+       *
+       * 真机事故 docs/91 §5.2.38：以前这里原样 `reportError(error)`，而渲染进程的错误总线
+       * 又绕过了 errno 映射表，于是「一次被中断的自检」弹出了
+       * 「发生了未预期的错误 / 错误编号「-」/ 兜底码…」。
+       */
+      if (isAbortError(error)) {
+        reportError(AppError.of('TASK_CANCELLED', { cause: error }), { event: 'selfTest.aborted' })
+      } else {
+        reportError(error, { event: 'selfTest.captureFailed' })
+      }
+      // 失败/中断必须把采集图拆掉：否则麦克风与 AudioContext 会一直挂着（占用设备、系统亮录音指示）
+      await release()
       return null
     }
   }

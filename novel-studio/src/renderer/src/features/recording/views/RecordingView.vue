@@ -35,6 +35,7 @@ import TakeList from '../components/TakeList.vue'
 import TransportBar from '../components/TransportBar.vue'
 import { useMonitor } from '../composables/useMonitor.ts'
 import { usePedal } from '../composables/usePedal.ts'
+import { useRecordCountdown } from '../composables/useRecordCountdown.ts'
 import { useRecorder } from '../composables/useRecorder.ts'
 import { useShortcuts } from '../composables/useShortcuts.ts'
 import { useContinuousStore } from '../stores/continuous.store.ts'
@@ -71,9 +72,6 @@ const compareOpen = ref(false)
 const comparePicks = ref<string[]>([])
 const confirmDiscard = ref(false)
 const autoNext = ref(true)
-const countdownVisible = ref(false)
-const countdownSeconds = ref(0)
-let countdownTimer: ReturnType<typeof setInterval> | null = null
 /** onPcmBlock 的解除函数（卸载必须调用，否则采集块会继续推给已销毁的波形组件） */
 let offPcm: (() => void) | null = null
 const waveformRef = ref<WaveformExposed | null>(null)
@@ -190,34 +188,26 @@ async function prepareSession(): Promise<boolean> {
 async function beginRecording(): Promise<void> {
   if (await prepareSession()) await recorder.start()
 }
-function stopCountdown(): void {
-  if (countdownTimer) clearInterval(countdownTimer)
-  countdownTimer = null
-  countdownVisible.value = false
-  countdownSeconds.value = 0
-}
+/**
+ * 倒计时（docs/12 §3.2）：逻辑在 `useRecordCountdown` 里（只此一份，可单测）。
+ * **归零后必须真的开始录音** —— 真机事故（docs/91 §5.2.37）就是这里只关遮罩不开录。
+ */
+const countdown = useRecordCountdown({ onElapsed: () => { void beginRecording() } })
+const countdownVisible = countdown.visible
+const countdownSeconds = countdown.seconds
 function requestRecord(): void {
   if (!diskOk.value) { pageNotice.value = '磁盘空间不足：请清理后重试（预检要求见上方提示）。'; return }
-  const countdownMs = settings.audio?.countdownMs ?? 0
-  if (countdownMs <= 0) { void beginRecording(); return }
-  countdownSeconds.value = countdownMs / 1000
-  countdownVisible.value = true
-  let remaining = countdownMs
-  countdownTimer = setInterval(() => {
-    remaining -= 100
-    countdownSeconds.value = Math.max(0, remaining / 1000)
-    if (remaining <= 0) stopCountdown()
-  }, 100)
+  // request 返回 false = 设置里没有倒计时（0）→ 立即开录
+  countdown.request(settings.audio?.countdownMs ?? 0)
 }
 async function onCountdownCancel(): Promise<void> {
-  stopCountdown()
-  await beginRecording()
+  countdown.cancelAndBegin()
 }
 /** 录制键的唯一入口：录音中 → 停；暂停中 → 继续；倒计时中 → 立刻开始；否则起录 */
 async function toggleRecord(): Promise<void> {
   if (recording.isRecording) { await stopRecording(); return }
   if (recording.isPaused) { await recorder.resume(); return }
-  if (countdownVisible.value) { stopCountdown(); await beginRecording(); return }
+  if (countdownVisible.value) { countdown.cancelAndBegin(); return }
   requestRecord()
 }
 async function stopRecording(): Promise<void> {
@@ -432,7 +422,7 @@ onMounted(async () => {
   }
 })
 onBeforeUnmount(() => {
-  stopCountdown()
+  countdown.stop()
   offPcm?.(); offPcm = null
   pedal.dispose()
   shortcuts.disable()
@@ -572,8 +562,7 @@ onBeforeUnmount(() => {
     <ConfirmDialog v-model="confirmDiscard" title="丢弃本次录音？" type="warning" confirm-text="丢弃"
       message="未定稿的会话文件会被删除；已生成的 take 不受影响。" @confirm="discardSession" />
     <CountdownOverlay :visible="countdownVisible" :seconds="countdownSeconds"
-      cancel-hint="按任意键立刻开始录音" @cancel="onCountdownCancel" />
-  </div>
+      cancel-hint="按任意键立刻开始录音" @cancel="onCountdownCancel" />  </div>
 </template>
 
 <style scoped>
@@ -584,10 +573,10 @@ onBeforeUnmount(() => {
 .ns-rec__field { flex-direction: column; gap: 2px; align-items: stretch; font-size: 12px; color: var(--ns-text-secondary, #909399); }
 .ns-rec__col { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
 .ns-rec__title { margin: 0; font-size: 18px; color: var(--ns-text-primary, #303133); } .ns-rec__sub { margin: 4px 0 0; font-size: 12px; font-variant-numeric: tabular-nums; color: var(--ns-text-secondary, #909399); }
-.ns-rec__mode { padding: 4px 12px; border: 1px solid var(--ns-border, #dcdfe6); border-radius: 14px; background: #fff; font-size: 12px; color: var(--ns-text-regular, #606266); cursor: pointer; } .ns-rec__mode.is-on { border-color: var(--ns-primary, #409eff); background: var(--ns-primary, #409eff); color: #fff; }
+.ns-rec__mode { padding: 4px 12px; border: 1px solid var(--ns-border, #dcdfe6); border-radius: 14px; background: var(--ns-bg-elevated); font-size: 12px; color: var(--ns-text-regular, #606266); cursor: pointer; } .ns-rec__mode.is-on { border-color: var(--ns-primary, #409eff); background: var(--ns-primary, #409eff); color: #fff; }
 .ns-rec__mode:disabled, .ns-rec__btn:disabled { cursor: not-allowed; opacity: 0.5; }
-.ns-rec__control { padding: 4px 8px; border: 1px solid var(--ns-border, #dcdfe6); border-radius: 4px; background: #fff; font-size: 12px; } .ns-rec__range { width: 130px; }
-.ns-rec__btn { padding: 5px 12px; border: 1px solid var(--ns-border, #dcdfe6); border-radius: 4px; background: #fff; font-size: 13px; color: var(--ns-text-regular, #606266); cursor: pointer; }
+.ns-rec__control { padding: 4px 8px; border: 1px solid var(--ns-border, #dcdfe6); border-radius: 4px; background: var(--ns-bg-elevated); font-size: 12px; } .ns-rec__range { width: 130px; }
+.ns-rec__btn { padding: 5px 12px; border: 1px solid var(--ns-border, #dcdfe6); border-radius: 4px; background: var(--ns-bg-elevated); font-size: 13px; color: var(--ns-text-regular, #606266); cursor: pointer; }
 .ns-rec__btn:hover:not(:disabled) { border-color: var(--ns-primary, #409eff); color: var(--ns-primary, #409eff); }
 .ns-rec__btn.is-primary { border-color: var(--ns-primary, #409eff); background: var(--ns-primary, #409eff); color: #fff; }
 .ns-rec__link { padding: 0 4px; border: 0; background: transparent; font-size: 12px; color: var(--ns-primary, #409eff); cursor: pointer; }

@@ -314,6 +314,18 @@ export interface BootStepResult {
    * 它不进 IPC、不进 UI，只用于主进程日志。
    */
   cause?: unknown
+  /**
+   * 是否**降级**完成：步骤本身没抛错（`ok` 仍为 true），但结果是「带病运行」。
+   *
+   * 存在的理由（docs/91 §5.2.1 / §8 的第一次真机事故）：
+   * `run-migrations` 失败时会**进入只读模式**并返回 `{ readOnly: true }`，
+   * 但执行器只看「抛没抛错」，于是启动报告把它打印成 `[ok]` —— 一屏 15 行里
+   * 完全看不出「迁移根本没跑、一张业务表都没有」，这是当时排查困难的重要原因。
+   * 降级必须与成功 / 失败 / 跳过并列，显示成独立状态。
+   */
+  degraded?: boolean
+  /** 降级原因（已转成可读文本，用于启动报告） */
+  degradedReason?: string
   /** 该步骤产出的、后续步骤需要的值 */
   produced?: Record<string, unknown>
 }
@@ -418,11 +430,20 @@ export async function runBootSequence(options: {
       if (produced && typeof produced === 'object') {
         Object.assign(ctx.values, produced)
       }
+      const producedFields =
+        produced && typeof produced === 'object' ? (produced as Record<string, unknown>) : undefined
+      // 降级标记：显式 `{ degraded: true }`，或域内约定 `{ readOnly: true }`
+      // （迁移失败进入只读模式）都算降级 —— 绝不能让「带病启动」显示成 `[ok]`。
+      const degraded = producedFields?.['degraded'] === true || producedFields?.['readOnly'] === true
+      const degradedReason = degraded
+        ? String(producedFields?.['degradedReason'] ?? producedFields?.['reason'] ?? '已降级完成')
+        : undefined
       const result: BootStepResult = {
         id: step.id,
         ok: true,
         skipped: false,
         elapsedMs: now() - t0,
+        ...(degraded ? { degraded: true, degradedReason } : {}),
         ...(produced ? { produced: produced as Record<string, unknown> } : {}),
       }
       results.push(result)
@@ -455,8 +476,11 @@ export function formatBootReport(report: BootReport): string[] {
   const lines: string[] = []
   lines.push(`启动耗时 ${report.finishedAt - report.startedAt}ms，共 ${report.steps.length} 步`)
   for (const s of report.steps) {
-    const mark = s.skipped ? 'skip' : s.ok ? 'ok  ' : 'FAIL'
-    lines.push(`  [${mark}] ${s.id.padEnd(28)} ${String(s.elapsedMs).padStart(5)}ms${s.error ? `  ${s.error}` : ''}`)
+    // 四态：跳过 / 成功 / 降级 / 失败。降级单列一态，
+    // 否则「迁移失败进只读」会和「一切正常」在报告里长得一模一样（docs/91 §5.2.1）。
+    const mark = s.skipped ? 'skip' : !s.ok ? 'FAIL' : s.degraded ? 'DEGR' : 'ok  '
+    const note = s.error ?? (s.degraded ? `降级：${s.degradedReason ?? '未知原因'}` : undefined)
+    lines.push(`  [${mark}] ${s.id.padEnd(28)} ${String(s.elapsedMs).padStart(5)}ms${note ? `  ${note}` : ''}`)
   }
   if (report.abortedAt) lines.push(`  ** 启动在中止于：${report.abortedAt} **`)
   return lines

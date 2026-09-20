@@ -523,7 +523,7 @@ const finishedSummary = computed(() => {
   flex: 0 0 auto;
   padding: 0 6px;
   border-radius: 8px;
-  background: #fff;
+  background: var(--ns-bg-elevated);
   color: var(--ns-text-secondary, #909399);
   font-size: 11px;
   font-weight: 400;
@@ -545,7 +545,7 @@ const finishedSummary = computed(() => {
   padding: 6px 12px;
   border: 1px solid var(--ns-border, #dcdfe6);
   border-radius: 16px;
-  background: #fff;
+  background: var(--ns-bg-elevated);
   color: var(--ns-text-regular, #606266);
   font-size: 13px;
   cursor: pointer;
