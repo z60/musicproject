@@ -151,6 +151,18 @@ export const useCharactersStore = defineStore('editor/characters', () => {
   async function load(targetBookId?: Id | null, targetProjectId?: Id | null): Promise<void> {
     const bid = targetBookId ?? bookId.value
     if (!bid) return
+    /**
+     * 换书时丢掉上一本书的**界面级状态**（真机反馈的同一类问题：docs/91 §5.2.35）。
+     *
+     * store 是单例：不清理的话，切到另一本书后角色面板还会显示上一本书的
+     * 「抽取候选」「抽取回执」「建议重算归属」提示与原型重建任务 —— 它们都属于上一本书。
+     */
+    if (bookId.value !== null && bookId.value !== bid) {
+      candidates.value = []
+      extractNote.value = null
+      attributionDirty.value = false
+      centroidTaskId.value = null
+    }
     bookId.value = bid
     if (targetProjectId !== undefined) projectId.value = targetProjectId
     loading.value = true

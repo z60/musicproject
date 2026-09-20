@@ -294,17 +294,17 @@ async function onGenerateCanvas(ids: string[]): Promise<void> {
 }
 
 /**
- * 画本任务面板：chapterId → taskId。
+ * 画本任务面板（真机反馈：docs/91 §5.2.35）。
  *
- * 两道过滤（真机反馈：docs/91 §5.2.35）：
- *   · `chapterIdOf` 只认**当前这本书里真实存在的章节** —— 上一本书的任务登记
- *     （切换书籍时 store 会清掉，但 `load` 还没回来、或章节已被删除时仍可能出现）
- *     不该在「章节管理」里冒充本书的提示；
- *   · 再取最近 6 个，避免把页面撑长。
+ * store 里已经按 `bookId` 过滤过一次（`currentBookCanvasTasks`），这里再做一道
+ * 「章节真的还在本书里」的过滤：
+ *   · 上一本书的任务不会出现在本书（store 过滤）；
+ *   · 已删除的章节也不显示（任务中心仍可查看/取消它）；
+ *   · 最后取最近 6 个，避免把页面撑长。
  */
 const canvasTaskEntries = computed(() =>
-  Object.entries(chapters.canvasTasks)
-    .filter(([chapterId]) => chapters.getById(chapterId) !== null)
+  chapters.currentBookCanvasTasks
+    .filter(task => chapters.getById(task.chapterId) !== null)
     .slice(-6),
 )
 
@@ -458,10 +458,10 @@ const bookTitle = computed(() => session.book?.title ?? '未选择书籍')
       <!-- 画本任务进度（每个任务一张统一进度卡，docs/04 §2.4） -->
       <div v-if="canvasTaskEntries.length" class="cl__tasks">
         <TaskProgressCard
-          v-for="[chapterId, taskId] in canvasTaskEntries"
-          :key="taskId"
-          :task-id="taskId"
-          :title="`生成画本：${chapterTitleOf(chapterId)}`"
+          v-for="task in canvasTaskEntries"
+          :key="task.taskId"
+          :task-id="task.taskId"
+          :title="`生成画本：${chapterTitleOf(task.chapterId)}`"
           kind="canvas.generate"
           size="compact"
           cancelable
@@ -469,8 +469,8 @@ const bookTitle = computed(() => session.book?.title ?? '未选择书籍')
           closable
           openable
           @cancel="tasks.cancel"
-          @retry="retryCanvas(chapterId)"
-          @close="chapters.clearCanvasTask(chapterId)"
+          @retry="retryCanvas(task.chapterId)"
+          @close="chapters.clearCanvasTask(task.chapterId)"
           @open="router.push({ path: '/tasks' })"
         />
       </div>

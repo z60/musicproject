@@ -82,8 +82,15 @@ export const useChaptersStore = defineStore('book/chapters', () => {
   const keyword = ref('')
   /** 正在写库的章节 id */
   const busyIds = ref<string[]>([])
-  /** 已提交的「生成画本」任务：chapterId → taskId */
-  const canvasTasks = ref<Record<string, string>>({})
+  /**
+   * 已提交的「生成画本」任务：chapterId → { taskId, bookId }。
+   *
+   * 为什么每个任务都要带 `bookId`：这张表是**界面级**登记（章节管理用它渲染进度卡），
+   * 而 store 是单例、切书时不会重建 —— 不带 bookId 就会把上一本书的任务显示到本书的
+   * 章节管理里，而 `chapterTitleOf` 在本书里找不到那个章节，只能回退成 uuid，
+   * 于是界面上出现「生成画本：1925adee-…」这种**非本书的提示**（真机反馈 docs/91 §5.2.35）。
+   */
+  const canvasTasks = ref<Record<string, { taskId: string; bookId: string }>>({})
   const workloads = ref<ActorWorkload[]>([])
   const workloadLoading = ref(false)
 
@@ -127,7 +134,8 @@ export const useChaptersStore = defineStore('book/chapters', () => {
     return [...set]
   })
 
-  const runningCanvasTaskIds = computed<string[]>(() => Object.values(canvasTasks.value))
+  const runningCanvasTaskIds = computed<string[]>(() =>
+    Object.values(canvasTasks.value).map(task => task.taskId))
 
   /** 单章预估时长（字数 / 4.2 字每秒，docs/10 §6.6） */
   function durationOf(row: ChapterRow): number {
@@ -163,18 +171,15 @@ export const useChaptersStore = defineStore('book/chapters', () => {
 
   async function load(nextBookId: string): Promise<ChapterRow[]> {
     /**
-     * 换书时先丢掉上一本书的**界面级状态**（真机反馈：docs/91 §5.2.35）。
+     * 换书时丢掉上一本书的**配音员分工**（它按 bookId 算，留着就是别的书的数字）。
      *
-     * `canvasTasks` 的键是 chapterId —— 上一本书提交的「生成画本」任务如果不清理，
-     * 切到另一本书后「章节管理」还会继续显示那些进度卡；而 `chapterTitleOf` 在新书里
-     * 找不到那些章节，只能回退成 uuid，于是界面上出现「生成画本：1925adee-…」这种
-     * **非本书的提示**。`workloads`（配音员分工）同理，它也是上一本书的数据。
-     *
-     * 任务本身没有消失：任务中心（`/tasks`）仍然能看到与取消它。
+     * 画本任务登记（`canvasTasks`）不清：每条都带 bookId，由 `currentBookCanvasTasks`
+     * 按当前书过滤 —— 这样切回原书时进度卡还在，而本书永远不会显示别的书的任务。
      */
     if (bookId.value !== null && bookId.value !== nextBookId) {
-      canvasTasks.value = {}
       workloads.value = []
+      // 行级忙碌态也是上一本书的章节 id，留着没有意义（换书后那些行根本不在列表里）
+      busyIds.value = []
     }
     bookId.value = nextBookId
     loading.value = true
@@ -394,7 +399,10 @@ export const useChaptersStore = defineStore('book/chapters', () => {
       try {
         const result = await call('canvas:generate', { chapterId, options: opts }, { onError: 'silent' }) as { taskId: string }
         if (result?.taskId) {
-          canvasTasks.value = { ...canvasTasks.value, [chapterId]: result.taskId }
+          canvasTasks.value = {
+            ...canvasTasks.value,
+            [chapterId]: { taskId: result.taskId, bookId: bookId.value ?? '' },
+          }
           submitted++
         } else {
           failed.push(chapterId)
@@ -408,8 +416,22 @@ export const useChaptersStore = defineStore('book/chapters', () => {
 
   /** 某章已提交的生成任务 id（视图据此渲染 TaskProgressCard） */
   function taskIdOf(chapterId: string): string | null {
-    return canvasTasks.value[chapterId] ?? null
+    return canvasTasks.value[chapterId]?.taskId ?? null
   }
+
+  /**
+   * **当前这本书**已提交的生成任务（视图渲染进度卡用）。
+   *
+   * 按 `bookId` 过滤是刻意的：没有这道过滤，切书后「章节管理」会把上一本书的
+   * 「生成画本」提示继续显示出来（真机反馈 docs/91 §5.2.35）。
+   */
+  const currentBookCanvasTasks = computed<Array<{ chapterId: string; taskId: string }>>(() => {
+    const id = bookId.value
+    if (!id) return []
+    return Object.entries(canvasTasks.value)
+      .filter(([, task]) => task.bookId === id)
+      .map(([chapterId, task]) => ({ chapterId, taskId: task.taskId }))
+  })
 
   function clearCanvasTask(chapterId: string): void {
     const next = { ...canvasTasks.value }
@@ -456,7 +478,7 @@ export const useChaptersStore = defineStore('book/chapters', () => {
 
   return {
     rows, loading, lastError, bookId, keyword, busyIds, canvasTasks, workloads, workloadLoading,
-    visibleRows, stats, volumeTitles, runningCanvasTaskIds,
+    visibleRows, stats, volumeTitles, runningCanvasTaskIds, currentBookCanvasTasks,
     durationOf, progressOf, isBusy, getById, setKeyword,
     load, reload, updateChapter, rename, setKind, setVolumeTitle,
     reorder, moveBy, merge, split, remove,
