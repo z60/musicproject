@@ -50,19 +50,32 @@ const PROJECT_ID = 'p1'
 const FORMAT: AudioFormat = { sampleRate: 48000, bitDepth: 16, channels: 1 }
 
 /** 假装一个采集端口：只实现本服务用到的那一小面（见文件头说明） */
-function fakePort(): RecordPortLike & { send(samples: Float32Array): void; closed: boolean } {
+function fakePort(): RecordPortLike & {
+  send(samples: Float32Array): void
+  /** 按原始载荷投递（用于测试"认不出的形状"/类型化数组视图） */
+  deliver(payload: unknown): void
+  closed: boolean
+  started: boolean
+} {
   const listeners: Array<(e: { data: unknown }) => void> = []
   return {
     closed: false,
+    started: false,
     on(_event, listener) {
       listeners.push(listener)
+    },
+    start() {
+      this.started = true
     },
     close() {
       this.closed = true
     },
+    deliver(payload) {
+      for (const l of listeners) l({ data: payload })
+    },
     send(samples) {
       const buf = samples.buffer.slice(samples.byteOffset, samples.byteOffset + samples.byteLength)
-      for (const l of listeners) l({ data: { frames: samples.length, data: buf } })
+      this.deliver({ frames: samples.length, data: buf })
     },
   }
 }
@@ -73,10 +86,15 @@ interface Harness {
   record: RecordService
   handlers: ReturnType<typeof createAudioHandlers>
   events: Array<{ event: string; payload: Record<string, unknown> }>
+  /** 服务写出的日志（用于断言"失败必须可见"这类不变量，docs/91 §5.2.41~§5.2.43） */
+  logs: Array<{ level: string; event: string; data: Record<string, unknown> }>
   cleanup: () => void
 }
 
-async function harness(opts?: { freeBytes?: number }): Promise<Harness> {
+async function harness(opts?: {
+  freeBytes?: number
+  markLineRecorded?: (lineId: string) => Promise<{ from: never; to: never; changed: boolean } | null>
+}): Promise<Harness> {
   const root = mkdtempSync(join(tmpdir(), 'ns-record-'))
   const db = new DatabaseSync(':memory:')
   await migrate(db as unknown as DbLike, loadMigrations(), { log: () => {} })
@@ -113,6 +131,7 @@ async function harness(opts?: { freeBytes?: number }): Promise<Harness> {
   })
   const scope = createAudioProjectScope({ getDb: () => dbLike })
   const events: Array<{ event: string; payload: Record<string, unknown> }> = []
+  const logs: Array<{ level: string; event: string; data: Record<string, unknown> }> = []
 
   let idSeq = 0
   const record = createRecordService({
@@ -142,6 +161,12 @@ async function harness(opts?: { freeBytes?: number }): Promise<Harness> {
     },
     newId: (prefix) => `${prefix}-${++idSeq}`,
     now: () => 1_700_000_000_000,
+    ...(opts?.markLineRecorded ? { markLineRecorded: opts.markLineRecorded } : {}),
+    log: {
+      info: (event, data) => logs.push({ level: 'info', event, data: data ?? {} }),
+      warn: (event, data) => logs.push({ level: 'warn', event, data: data ?? {} }),
+      error: (event, data) => logs.push({ level: 'error', event, data: data ?? {} }),
+    },
   })
 
   const analysis = createAnalysisService({
@@ -164,6 +189,7 @@ async function harness(opts?: { freeBytes?: number }): Promise<Harness> {
     db,
     record,
     events,
+    logs,
     handlers: createAudioHandlers({ analysis, device, take, record, log: { info: () => {}, warn: () => {} } }),
     cleanup: () => {
       record.closeAll('test-cleanup')
@@ -679,8 +705,10 @@ describe('录音域 · optimizeTrim 与单向通道', () => {
       await h.record.start(prepared.sessionId)
       port.send(block(0.2, 0.5))
       await h.record.onMark({ sessionId: prepared.sessionId, kind: 'retake', atMs: 120 })
-      // 声称发了 48000 帧，实际只写了 9600 帧 → 差额必须被记成丢帧
-      await h.record.onMeter({ sessionId: prepared.sessionId, rmsDb: -6, peakDb: -6, frames: 48000 })
+      // 声称累计发了 48000 帧，实际只写了 9600 帧 → 差额必须被记成丢帧。
+      // **要连续两次采样**才算确认（单次可能只是"数据还在途中"，见下一条用例）
+      await h.record.onMeter({ sessionId: prepared.sessionId, rmsDb: -6, peakDb: -6, claimedFrames: 48000 })
+      await h.record.onMeter({ sessionId: prepared.sessionId, rmsDb: -6, peakDb: -6, claimedFrames: 48000 })
 
       const result = await h.record.stop(prepared.sessionId, 'l1')
       assert.ok(result.session.droppedFrames > 0, '声明的帧数与落盘帧数的差额必须可见（P0 指标）')
@@ -690,6 +718,310 @@ describe('录音域 · optimizeTrim 与单向通道', () => {
         }).marks,
       ) as Array<{ kind: string; atMs: number }>
       assert.deepEqual(marks, [{ kind: 'retake', atMs: 120 }])
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  /**
+   * 丢帧核对的口径（真机事故 docs/91 §5.2.41 复查时补）：
+   * 端口（数据）与 record:meter（声称值）是两条独立通道，到达顺序不保证。
+   */
+  it('单次采样有缺口只是「在途」，不计丢帧（否则健康会话开头就报丢帧 2304）', async () => {
+    const h = await harness()
+    try {
+      const port = fakePort()
+      const prepared = await h.record.prepare({ projectId: PROJECT_ID, chapterId: 'c1', mode: 'line_by_line', format: FORMAT })
+      h.record.attachIncomingPort(port)
+      await h.record.attachPort(prepared.sessionId)
+      await h.record.start(prepared.sessionId)
+
+      // 声称发了 9600 帧，但数据还没到主进程（在途）
+      await h.record.onMeter({ sessionId: prepared.sessionId, rmsDb: -6, peakDb: -6, claimedFrames: 9600 })
+      const result = await h.record.stop(prepared.sessionId, 'l1')
+      assert.equal(result.session.droppedFrames, 0, '在途块补齐前不得计入丢帧')
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  it('缺口持续存在时确认为丢帧，且同一次丢失只累计一次', async () => {
+    const h = await harness()
+    try {
+      const port = fakePort()
+      const prepared = await h.record.prepare({ projectId: PROJECT_ID, chapterId: 'c1', mode: 'line_by_line', format: FORMAT })
+      h.record.attachIncomingPort(port)
+      await h.record.attachPort(prepared.sessionId)
+      await h.record.start(prepared.sessionId)
+
+      const meter = (claimedFrames: number) =>
+        h.record.onMeter({ sessionId: prepared.sessionId, rmsDb: -6, peakDb: -6, claimedFrames })
+      await meter(9600) // 第一次：未知是否在途
+      await meter(9600) // 第二次：缺口依旧 → 确认 9600
+      await meter(9600) // 第三、四次：不能重复累加
+      await meter(9600)
+
+      const result = await h.record.stop(prepared.sessionId, 'l1')
+      assert.equal(result.session.droppedFrames, 9600, '持续缺口只应计一次（不随采样次数累加）')
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  it('缺口扩大（又丢一块）时只累加新增部分', async () => {
+    const h = await harness()
+    try {
+      const port = fakePort()
+      const prepared = await h.record.prepare({ projectId: PROJECT_ID, chapterId: 'c1', mode: 'line_by_line', format: FORMAT })
+      h.record.attachIncomingPort(port)
+      await h.record.attachPort(prepared.sessionId)
+      await h.record.start(prepared.sessionId)
+
+      const meter = (claimedFrames: number) =>
+        h.record.onMeter({ sessionId: prepared.sessionId, rmsDb: -6, peakDb: -6, claimedFrames })
+      await meter(9600)
+      await meter(9600) // 确认 9600
+      await meter(19200) // 又丢一块（还没确认）
+      await meter(19200) // 确认到 19200
+
+      const result = await h.record.stop(prepared.sessionId, 'l1')
+      assert.equal(result.session.droppedFrames, 19200, '缺口扩大只累加新增的那一块')
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  it('缺口被追上（数据到达）后清零，后续不再算丢帧', async () => {
+    const h = await harness()
+    try {
+      const port = fakePort()
+      const prepared = await h.record.prepare({ projectId: PROJECT_ID, chapterId: 'c1', mode: 'line_by_line', format: FORMAT })
+      h.record.attachIncomingPort(port)
+      await h.record.attachPort(prepared.sessionId)
+      await h.record.start(prepared.sessionId)
+
+      await h.record.onMeter({ sessionId: prepared.sessionId, rmsDb: -6, peakDb: -6, claimedFrames: 9600 })
+      // 数据补上（写盘 9600 帧）→ 缺口归零
+      port.send(block(0.2, 0.5))
+      await h.record.onMeter({ sessionId: prepared.sessionId, rmsDb: -6, peakDb: -6, claimedFrames: 9600 })
+      const result = await h.record.stop(prepared.sessionId, 'l1')
+      assert.equal(result.session.droppedFrames, 0, '在途补齐后不得留下丢帧')
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  /**
+   * 真机事故 docs/91 §5.2.42：
+   * 端口已 attached、渲染侧一直在发，但主进程 `written` 恒为 0 ——
+   * 因为 `MessagePortMain` 在 `start()` 之前**把消息一直排队**。
+   * 端口有两条绑定路径（先到会话 / 先到端口），两条都必须 start()。
+   */
+  it('端口排队时不该 start()，被会话认领后必须 start()（否则一条块都收不到）', async () => {
+    const h = await harness()
+    try {
+      const port = fakePort()
+      h.record.attachIncomingPort(port)
+      assert.equal(port.started, false, '还没有 ready 会话：端口只是排队，不该动它')
+
+      // prepare 会认领排队的端口（"端口先于会话到达"这条路径）
+      const prepared = await h.record.prepare({ projectId: PROJECT_ID, chapterId: 'c1', mode: 'line_by_line', format: FORMAT })
+      assert.equal(port.started, true, 'MessagePortMain 必须先 start() 才会投递消息')
+
+      await h.record.start(prepared.sessionId)
+      port.send(block(0.2, 0.5))
+      const result = await h.record.stop(prepared.sessionId, 'l1')
+      assert.equal(result.session.droppedFrames, 0, 'start() 之后数据必须真的写进去')
+      assert.ok((result.session.durationMs ?? 0) >= 190, `时长应约 200ms，实际 ${result.session.durationMs}`)
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  it('端口晚于会话到达时（直接绑定）同样必须 start()', async () => {
+    const h = await harness()
+    try {
+      const prepared = await h.record.prepare({ projectId: PROJECT_ID, chapterId: 'c1', mode: 'line_by_line', format: FORMAT })
+      const port = fakePort()
+      h.record.attachIncomingPort(port)
+      assert.equal(port.started, true, '有 ready 会话时端口被立即绑定 → 必须 start()')
+
+      await h.record.start(prepared.sessionId)
+      port.send(block(0.2, 0.5))
+      const result = await h.record.stop(prepared.sessionId, 'l1')
+      assert.ok((result.session.durationMs ?? 0) >= 190, `时长应约 200ms，实际 ${result.session.durationMs}`)
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  it('端口载荷是类型化数组视图（而非 ArrayBuffer）时同样要写盘', async () => {
+    const h = await harness()
+    try {
+      const port = fakePort()
+      const prepared = await h.record.prepare({ projectId: PROJECT_ID, chapterId: 'c1', mode: 'line_by_line', format: FORMAT })
+      h.record.attachIncomingPort(port)
+      await h.record.attachPort(prepared.sessionId)
+      await h.record.start(prepared.sessionId)
+
+      // 模拟 Electron 反序列化后给出的 Uint8Array 视图（§5.2.41 的 `instanceof` 判断会把它丢掉）
+      const samples = block(0.2, 0.5)
+      const bytes = new Uint8Array(samples.buffer.slice(0))
+      port.deliver({ frames: samples.length, data: bytes })
+
+      const result = await h.record.stop(prepared.sessionId, 'l1')
+      assert.ok((result.session.durationMs ?? 0) >= 190, `视图形态也必须被解释成音频，实际 ${result.session.durationMs}ms`)
+      assert.equal(result.session.droppedFrames, 0)
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  /**
+   * 真机事故 docs/91 §5.2.43：发送侧一旦带 transfer 列表，主进程收到的
+   * `event.data` **恒为 null**（事件照发、渲染侧不报错）。这种"消息到了但载荷是空"
+   * 的情况必须留下日志，否则又是"录了 3 秒、盘上 0 字节、什么都没有"。
+   */
+  it('消息体是 null 时必须记 record.portMessage.nullPayload（不许静默丢弃）', async () => {
+    const h = await harness()
+    try {
+      const port = fakePort()
+      const prepared = await h.record.prepare({ projectId: PROJECT_ID, chapterId: 'c1', mode: 'line_by_line', format: FORMAT })
+      h.record.attachIncomingPort(port)
+      await h.record.attachPort(prepared.sessionId)
+      await h.record.start(prepared.sessionId)
+
+      port.deliver(null)
+      port.deliver(null) // 只报一次
+      const nullLogs = h.logs.filter((l) => l.event === 'record.portMessage.nullPayload')
+      assert.equal(nullLogs.length, 1, '必须报一次、且只报一次')
+      assert.equal(nullLogs[0]!.level, 'error')
+      assert.equal(nullLogs[0]!.data.sessionId, prepared.sessionId)
+      assert.deepEqual(nullLogs[0]!.data.received, { kind: 'null' })
+
+      // 空载荷不该影响会话：随后来的正常块照样写盘
+      port.send(block(0.2, 0.5))
+      const result = await h.record.stop(prepared.sessionId, 'l1')
+      assert.ok((result.session.durationMs ?? 0) >= 190, '空载荷之后正常的块仍然要写进去')
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  it('认不出的载荷形状要记 record.portMessage.unsupported（带类型描述）', async () => {
+    const h = await harness()
+    try {
+      const port = fakePort()
+      const prepared = await h.record.prepare({ projectId: PROJECT_ID, chapterId: 'c1', mode: 'line_by_line', format: FORMAT })
+      h.record.attachIncomingPort(port)
+      await h.record.attachPort(prepared.sessionId)
+      await h.record.start(prepared.sessionId)
+
+      port.deliver({ frames: 9600, data: 'not-a-buffer' })
+      const bad = h.logs.filter((l) => l.event === 'record.portMessage.unsupported')
+      assert.equal(bad.length, 1, '认不出的形状必须报一次')
+      assert.equal(bad[0]!.level, 'error')
+      assert.equal((bad[0]!.data.received as { kind?: string }).kind, 'string', '要说明收到的是什么类型')
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  it('第一个有效块要记 record.portFirstBlock（端口真的在投递的正面证据）', async () => {
+    const h = await harness()
+    try {
+      const port = fakePort()
+      const prepared = await h.record.prepare({ projectId: PROJECT_ID, chapterId: 'c1', mode: 'line_by_line', format: FORMAT })
+      h.record.attachIncomingPort(port)
+      await h.record.attachPort(prepared.sessionId)
+      await h.record.start(prepared.sessionId)
+      port.send(block(0.2, 0.5))
+      port.send(block(0.2, 0.5))
+
+      const first = h.logs.filter((l) => l.event === 'record.portFirstBlock')
+      assert.equal(first.length, 1, '只记第一个块')
+      assert.equal(first[0]!.data.frames, 9600)
+      assert.equal(first[0]!.data.bytes, 9600 * 4)
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  /**
+   * 真机事故 docs/91 §5.2.44：录音保存成功了，但**画本行状态从没被推进成 recorded**，
+   * 于是画本表格没有 ✓、章节进度 recorded_count 恒为 0、QC 统计「已录行 0」，
+   * 用户看到的就是「点击停止没有把当前录制的保存」。
+   */
+  it('录完一行后必须把画本行推进到 recorded（docs/12 §3.3）', async () => {
+    const marked: Array<{ lineId: string; state: string }> = []
+    const h = await harness({
+      markLineRecorded: async (lineId) => {
+        const before = h.db.prepare(`SELECT state FROM canvas_lines WHERE id = ?`).get(lineId) as { state: string }
+        h.db.prepare(`UPDATE canvas_lines SET state = 'recorded' WHERE id = ?`).run(lineId)
+        marked.push({ lineId, state: before.state })
+        return { from: before.state as never, to: 'recorded' as never, changed: true }
+      },
+    })
+    try {
+      const port = fakePort()
+      const prepared = await h.record.prepare({ projectId: PROJECT_ID, chapterId: 'c1', mode: 'line_by_line', format: FORMAT })
+      h.record.attachIncomingPort(port)
+      await h.record.attachPort(prepared.sessionId)
+      await h.record.start(prepared.sessionId)
+      port.send(block(0.3, 0.5))
+      const result = await h.record.stop(prepared.sessionId, 'l1')
+
+      assert.ok(result.take, '先要有 take')
+      assert.deepEqual(marked, [{ lineId: 'l1', state: 'draft' }], '必须对刚录的那一行调用一次')
+      const row = h.db.prepare(`SELECT state FROM canvas_lines WHERE id = 'l1'`).get() as { state: string }
+      assert.equal(row.state, 'recorded', '画本行状态要真的落库')
+      assert.equal(
+        h.logs.filter((l) => l.event === 'record.lineRecorded').length,
+        1,
+        '要有 record.lineRecorded 日志（可检索）',
+      )
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  it('太短没有 take 时不得推进行状态（避免把没录上的行标成已录）', async () => {
+    const marked: string[] = []
+    const h = await harness({
+      markLineRecorded: async (lineId) => {
+        marked.push(lineId)
+        return null
+      },
+    })
+    try {
+      const port = fakePort()
+      const prepared = await h.record.prepare({ projectId: PROJECT_ID, chapterId: 'c1', mode: 'line_by_line', format: FORMAT })
+      h.record.attachIncomingPort(port)
+      await h.record.attachPort(prepared.sessionId)
+      await h.record.start(prepared.sessionId)
+      // 一个块都没有 → tooShort → 不产 take
+      const result = await h.record.stop(prepared.sessionId, 'l1')
+      assert.equal(result.take, null)
+      assert.deepEqual(marked, [], '没有 take 就不该标已录')
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  it('没有注入 markLineRecorded 时要记 unwired 警告（这类静默缺口必须可见）', async () => {
+    const h = await harness()
+    try {
+      // harness 默认注入了 markLineRecorded？—— 没有的话走 unwired 分支
+      const port = fakePort()
+      const prepared = await h.record.prepare({ projectId: PROJECT_ID, chapterId: 'c1', mode: 'line_by_line', format: FORMAT })
+      h.record.attachIncomingPort(port)
+      await h.record.attachPort(prepared.sessionId)
+      await h.record.start(prepared.sessionId)
+      port.send(block(0.3, 0.5))
+      await h.record.stop(prepared.sessionId, 'l1')
+      const wired = h.logs.some((l) => l.event === 'record.lineRecorded')
+      const unwired = h.logs.some((l) => l.event === 'record.lineRecorded.unwired')
+      assert.ok(wired || unwired, '要么真的推进了状态，要么明确报"没接线"——不许什么都不说')
     } finally {
       h.cleanup()
     }

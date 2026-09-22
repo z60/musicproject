@@ -71,6 +71,52 @@ class MisconfiguredProvider implements AIProvider {
 }
 
 /**
+ * 只解析**主** Provider（不含 LocalEcho 兜底、不包 FallbackProvider）。
+ *
+ * 存在的理由（设置页「测试连接」）：`FallbackProvider.healthCheck()` 的语义是
+ * `some(ok)`，而链尾永远有 LocalEcho（`ok: true`）—— 直接拿降级链做连通性测试
+ * 会**永远显示「连接成功」**，把「云端地址填错/密钥无效」这类问题全部掩盖。
+ * 测试连接必须只探用户真正配置的那一个 Provider。
+ */
+export function resolvePrimaryProvider(settings: AiSettings, options: ResolveProviderOptions = {}): AIProvider {
+  const http = options.http ?? createFetchHttpClient()
+
+  switch (settings.provider) {
+    case 'dify': {
+      if (!settings.baseUrl) return new MisconfiguredProvider('dify', '尚未填写 Dify 服务地址')
+      if (!options.apiKey) return new MisconfiguredProvider('dify', '尚未填写 Dify 应用密钥（app-xxx）')
+      return new DifyProvider({
+        baseUrl: settings.baseUrl,
+        apiKey: options.apiKey,
+        model: settings.model,
+        inputs: options.difyInputs,
+        userId: options.difyUserId,
+        timeoutMs: settings.timeoutMs,
+        http,
+      })
+    }
+    case 'openai-compatible': {
+      if (!settings.baseUrl) return new MisconfiguredProvider('openai-compatible', '尚未填写兼容服务地址')
+      return new OpenAICompatibleProvider({
+        baseUrl: settings.baseUrl,
+        apiKey: options.apiKey ?? null,
+        model: settings.model,
+        timeoutMs: settings.timeoutMs,
+        http,
+      })
+    }
+    case 'local':
+      return new LocalEchoProvider()
+    case 'mock':
+      return new MockProvider({ model: settings.model, responses: options.mockResponses })
+    default:
+      throw new AppError('INVALID_PAYLOAD', {
+        details: { field: 'ai.provider', value: String(settings.provider) },
+      })
+  }
+}
+
+/**
  * 按 `settings.ai.provider` 组装降级链（docs/06 §3.3）。
  *
  * | provider | 链 |
@@ -81,60 +127,11 @@ class MisconfiguredProvider implements AIProvider {
  * | `mock`              | [Mock, LocalEcho] |
  */
 export function resolveProvider(settings: AiSettings, options: ResolveProviderOptions = {}): AIProvider {
-  const http = options.http ?? createFetchHttpClient()
-  const chain: AIProvider[] = []
-
-  switch (settings.provider) {
-    case 'dify': {
-      if (!settings.baseUrl) {
-        chain.push(new MisconfiguredProvider('dify', '尚未填写 Dify 服务地址'))
-      } else if (!options.apiKey) {
-        chain.push(new MisconfiguredProvider('dify', '尚未填写 Dify 应用密钥（app-xxx）'))
-      } else {
-        chain.push(
-          new DifyProvider({
-            baseUrl: settings.baseUrl,
-            apiKey: options.apiKey,
-            model: settings.model,
-            inputs: options.difyInputs,
-            userId: options.difyUserId,
-            timeoutMs: settings.timeoutMs,
-            http,
-          }),
-        )
-      }
-      break
-    }
-    case 'openai-compatible': {
-      if (!settings.baseUrl) {
-        chain.push(new MisconfiguredProvider('openai-compatible', '尚未填写兼容服务地址'))
-      } else {
-        chain.push(
-          new OpenAICompatibleProvider({
-            baseUrl: settings.baseUrl,
-            apiKey: options.apiKey ?? null,
-            model: settings.model,
-            timeoutMs: settings.timeoutMs,
-            http,
-          }),
-        )
-      }
-      break
-    }
-    case 'local':
-      chain.push(new LocalEchoProvider())
-      break
-    case 'mock':
-      chain.push(new MockProvider({ model: settings.model, responses: options.mockResponses }))
-      break
-    default:
-      throw new AppError('INVALID_PAYLOAD', {
-        details: { field: 'ai.provider', value: String(settings.provider) },
-      })
-  }
+  const primary = resolvePrimaryProvider(settings, options)
+  const chain: AIProvider[] = [primary]
 
   // 永远兜底（docs/06 §3.3）
-  if (chain[chain.length - 1]?.kind !== 'local') chain.push(new LocalEchoProvider())
+  if (primary.kind !== 'local') chain.push(new LocalEchoProvider())
 
   return new FallbackProvider(chain, {
     failureThreshold: options.circuit?.failureThreshold,

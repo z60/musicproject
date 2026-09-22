@@ -315,14 +315,32 @@ export function createSettingsStore(opts: SettingsStoreOptions): SettingsStore {
 
   const state: { value: AppSettings } = { value: clone(defaults) }
 
+  /**
+   * 密钥（`is_secret = 1` 的行）在内存里的镜像。
+   *
+   * **与设置树完全隔离**：密钥键（如 `ai.apiKey`）不是 `AppSettings` 的叶子，
+   * 一旦混进 `state.value` 就会出现在 `getAll()` 的返回值里被渲染进程读到
+   * （docs/04 §9「密钥永不回显」）。所以它们只在这张表 + `secretCache` 里流转。
+   */
+  const secretCache = new Map<string, string>()
+
   /** 2) 把库里的值合并进默认树（库里的值优先） */
   function loadFromDb(): void {
     if (!db) return
     try {
-      const rows = db.prepare(`SELECT key, value FROM ${TABLE}`).all() as Array<{ key: string; value: string }>
+      const rows = db.prepare(`SELECT key, value, is_secret FROM ${TABLE}`).all() as Array<{
+        key: string
+        value: string
+        is_secret?: number
+      }>
       for (const row of rows) {
         try {
           const parsed: unknown = JSON.parse(row.value)
+          // 密钥行不进设置树，只进 secretCache（见上面 secretCache 的说明）
+          if (Number(row.is_secret) === 1) {
+            if (typeof parsed === 'string') secretCache.set(row.key, parsed)
+            continue
+          }
           // 只覆盖默认树里**已存在**的叶子：老版本残留的 key 不会污染当前结构
           // （`setByPath` 对不存在的路径返回 false，天然实现了这一点）
           //
@@ -350,9 +368,11 @@ export function createSettingsStore(opts: SettingsStoreOptions): SettingsStore {
     if (!db || changed.length === 0) return
     void keys
     try {
+      // 显式写 `is_secret = 0`：某个 key 曾经是密钥、现在被当普通设置写回时，
+      // 必须把它从「密钥」里摘出来，否则它既进不了设置树、也读不回密钥。
       const stmt = db.prepare(
-        `INSERT INTO ${TABLE} (key, value, updated_at) VALUES (?, ?, ?)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at;`,
+        `INSERT INTO ${TABLE} (key, value, is_secret, updated_at) VALUES (?, ?, 0, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, is_secret = 0, updated_at = excluded.updated_at;`,
       )
       for (const key of changed) {
         const v = getByPath(state.value, key)
@@ -456,14 +476,26 @@ export function createSettingsStore(opts: SettingsStoreOptions): SettingsStore {
     },
 
     setSecretRaw(key: string, encrypted: string): { changedKeys: string[] } {
-      const changed = setByPath(state.value, key, encrypted) ? [key] : []
-      persist(changed, changed)
-      return { changedKeys: changed }
+      // 密钥**不能**走设置树的 `setByPath`：它只写「默认树里已存在的叶子」，
+      // 而 `ai.apiKey` 恰恰不在默认树里 —— 旧实现因此返回 false、`persist` 拿到空
+      // changed 直接返回，密钥被**静默丢弃**（用户「配置了 AI 却连不上」的直接原因之一）。
+      // 现在按 `is_secret = 1` 独立落一行；空串表示「清除」。
+      secretCache.set(key, encrypted)
+      if (db) {
+        try {
+          db.prepare(
+            `INSERT INTO ${TABLE} (key, value, is_secret, updated_at) VALUES (?, ?, 1, ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, is_secret = 1, updated_at = excluded.updated_at;`,
+          ).run(key, JSON.stringify(encrypted), Date.now())
+        } catch {
+          /* 写库失败：内存里仍可用（与 set 的取舍一致，不把失败升级成崩溃） */
+        }
+      }
+      return { changedKeys: [key] }
     },
 
     getSecretRaw(key: string): string | null {
-      const v = getByPath(state.value, key)
-      return typeof v === 'string' ? v : null
+      return secretCache.get(key) ?? null
     },
 
     reset(keys?: string[]): void {

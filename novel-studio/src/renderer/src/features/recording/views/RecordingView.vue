@@ -58,7 +58,13 @@ const continuous = useContinuousStore()
 const recorder = useRecorder()
 const monitor = useMonitor()
 /** 子组件 defineExpose 的结构类型（不依赖组件类型推导） */
-interface WaveformExposed { pushBlock: (samples: Float32Array, sampleRate?: number) => void; reset: () => void }
+interface WaveformExposed {
+  pushBlock: (samples: Float32Array, sampleRate?: number) => void
+  reset: () => void
+  /** take 预览（docs/91 §5.2.46 / §5.2.47）：peaks 为 min/max 交替、归一化 [-1,1] */
+  showPeaks: (peaks: ArrayLike<number>, totalMs: number) => void
+  clearTake: () => void
+}
 interface TakeListExposed { player: HTMLAudioElement | null; stop: () => void }
 const mode = ref<RecordingMode>(route.query.mode === 'continuous' ? 'continuous' : 'line_by_line')
 const lines = ref<CanvasLine[]>([])
@@ -139,6 +145,44 @@ watch(currentLine, (line) => {
   recording.setLine(line.id)
   void takes.loadByLine(line.id)
 })
+
+// ── take 预览波形（docs/91 §5.2.46 / §5.2.47）────────────────────────────────
+// 未录音时，波形区显示 take（试录版本）的整段波形；没有 take 时为空。
+// 数据来源必须是主进程的 `analysis:peaks`（契约：min/max 交替、归一化 [-1,1]）——
+// 渲染进程 CSP 是 `connect-src 'self'`，`fetch('ns-media://…')` 会被拦掉（docs/91 §5.2.47）。
+//
+// 「刚录完的那一段」用 `pinnedTakeId` 钉住：停止后即使 autoNext 自动跳到了下一行，
+// 波形区也继续显示刚录的 take；**用户主动改行**（下一行/上一行/跳过）时才解除并跟随新行。
+let pinnedTakeId: string | null = null
+function releasePinnedTake(): void {
+  pinnedTakeId = null
+}
+const TAKE_PEAKS_PER_SEC = 100
+async function loadTakePeaks(take: Take): Promise<void> {
+  try {
+    const result = await callSafe('analysis:peaks', { path: take.filePath, peaksPerSec: TAKE_PEAKS_PER_SEC })
+    const peaks = result?.peaks
+    if (!peaks?.length) { waveformRef.value?.clearTake(); return }
+    const totalPeaks = result?.totalPeaks ?? Math.floor(peaks.length / 2)
+    // 时间轴右端 = 桶数 / 每秒桶数（与传进来的 peaks 自洽）
+    waveformRef.value?.showPeaks(peaks, Math.max(1, Math.round((totalPeaks / TAKE_PEAKS_PER_SEC) * 1000)))
+  } catch {
+    // 文件缺失/读取失败：回到空态（试听那条路会由 TakeList 走 error-bus 提示）
+    waveformRef.value?.clearTake()
+  }
+}
+/** 显示某条 take 的波形并钉住它（停止后调用） */
+async function showAndPinTake(take: Take): Promise<void> {
+  pinnedTakeId = take.id
+  await loadTakePeaks(take)
+}
+watch([currentLine, selectedTake], ([line, take]) => {
+  if (recording.isRecording || recording.isPaused) return
+  // 钉住的刚录 take：自动跳行不清、不换（只有用户主动改行才解除）
+  if (pinnedTakeId && take?.id !== pinnedTakeId) return
+  if (!take || !line) { waveformRef.value?.clearTake(); return }
+  void loadTakePeaks(take)
+})
 /** 录音中禁止改行（会误导，docs/12 §3.3）；返回 false 时已把原因写进页面提示 */
 function canJump(): boolean {
   if (recording.canNavigateLines) return true
@@ -147,6 +191,7 @@ function canJump(): boolean {
 }
 function moveLine(delta: number): void {
   if (!canJump()) return
+  releasePinnedTake()
   const next = currentIndex.value + delta
   if (next >= 0 && next < lines.value.length) currentIndex.value = next
 }
@@ -186,6 +231,8 @@ async function prepareSession(): Promise<boolean> {
   return true
 }
 async function beginRecording(): Promise<void> {
+  // 开始新的一段：解除"刚录 take"的钉住，波形交回实时流
+  releasePinnedTake()
   if (await prepareSession()) await recorder.start()
 }
 /**
@@ -197,8 +244,13 @@ const countdownVisible = countdown.visible
 const countdownSeconds = countdown.seconds
 function requestRecord(): void {
   if (!diskOk.value) { pageNotice.value = '磁盘空间不足：请清理后重试（预检要求见上方提示）。'; return }
-  // request 返回 false = 设置里没有倒计时（0）→ 立即开录
-  countdown.request(settings.audio?.countdownMs ?? 0)
+  /**
+   * ⚠️ 返回值必须兑现（真机事故 docs/91 §5.2.45）：
+   * `countdown.request(0)` 返回 **false = 设置里没有倒计时，调用方要立即开录**。
+   * 以前这里忽略了返回值 → 用户把倒计时设为 0（想跳过等待）后，点「录制」**完全没反应**。
+   */
+  const counting = countdown.request(settings.audio?.countdownMs ?? 0)
+  if (!counting) void beginRecording()
 }
 async function onCountdownCancel(): Promise<void> {
   countdown.cancelAndBegin()
@@ -219,6 +271,13 @@ async function stopRecording(): Promise<void> {
   if (lineId) await takes.loadByLine(lineId)
   if (mode.value === 'continuous') { await openSliceReview(); return }
   if (autoNext.value) nextUnrecordedLine()
+  /**
+   * 停止后**把刚录的 take 显示到波形区并钉住**（真机反馈 docs/91 §5.2.47：
+   * 「点击停止后该段录音没有加载入试录版本」）。
+   * 顺序很重要：先让 autoNext 跳行（它会触发 watcher 想清空），再钉住显示，
+   * 这样即使自动跳到了下一行，用户仍然能看到刚录完那一段的波形。
+   */
+  if (result.take) void showAndPinTake(result.take)
 }
 /** 连续模式停止后：VAD 切片 → 与画本行匹配 → 进确认页（docs/12 §4.3） */
 async function openSliceReview(): Promise<void> {
@@ -371,7 +430,17 @@ async function onDeviceChange(event: Event): Promise<void> {
   if (await devices.savePreference(deviceId, label)) await patchAudio({ defaultInputDeviceId: deviceId })
 }
 /** 快捷键与脚踏板（docs/12 §9；动作 id 见 shared/lib/shortcuts.ts） */
-const nextLineOrJump = (): void => (mode.value === 'continuous' ? moveLine(1) : nextUnrecordedLine())
+/** 走带栏「下一行」按钮（用户主动）→ 先解除刚录 take 的钉住 */
+function nextUnrecordedByUser(): void {
+  releasePinnedTake()
+  nextUnrecordedLine()
+}
+const nextLineOrJump = (): void => {
+  // 用户主动改行 → 解除"刚录 take"的钉住，波形跟随新行（无 take 时清空）
+  releasePinnedTake()
+  if (mode.value === 'continuous') moveLine(1)
+  else nextUnrecordedLine()
+}
 const shortcutActions: Record<string, () => void> = {
   'record.toggle': () => void toggleRecord(), 'record.toggleAlt': () => void toggleRecord(),
   'record.redo': () => void redoRecording(), 'line.next': nextLineOrJump, 'line.nextAlt': nextLineOrJump,
@@ -551,7 +620,7 @@ onBeforeUnmount(() => {
       :take-count="currentTakes.length" :has-selected-take="selectedTake !== null" :shortcuts="shortcutHints"
       :countdown-ms="settings.audio?.countdownMs ?? 0" :can-punch-in="selectedTake !== null"
       :has-punch-range="punchOutMs > punchInMs" @record="toggleRecord" @stop="stopRecording" @skip="skipLine"
-      @pause="recorder.pause" @resume="recorder.resume" @prev="moveLine(-1)" @next="nextUnrecordedLine"
+      @pause="recorder.pause" @resume="recorder.resume" @prev="moveLine(-1)" @next="nextUnrecordedByUser"
       @redo="redoRecording" @mark="markRecording" @punch-in="openPunchIn" @help="showShortcuts = true"
       @update:countdown-ms="patchAudio({ countdownMs: $event })" @update:auto-next="autoNext = $event" />
 

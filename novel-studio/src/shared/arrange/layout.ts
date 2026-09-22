@@ -2,17 +2,22 @@
  * Novel Studio · 自动排布（docs/05 §5.2 / docs/13 §4.2）
  * ============================================================================
  * 算法（顺序即语义，不可调换）：
- *   对每条轨道 t：
+ *   把整章画本行按 seq **全局排序**，用一个 cursor 逐句往下排：
  *     cursor = headSilenceMs
- *     for line in trackLines(t).sortBy(seq):
+ *     for line in allLines.sortBy(seq):
  *         seg = segment(line)
  *         if seg == null: continue                    # 缺录 → 记 gap，cursor 不动
  *         dur = (srcOut - srcIn) + fadeIn + fadeOut
  *         start = max(cursor + pauseAfter(prevLine), 0)
  *         if item.locked: start = item.timelineStartMs  # 尊重人工，自动排布不再移动它
- *         write item(start)
+ *         write item(start)                            # 轨道 = 车道，不改变时间位置
  *         cursor = start + dur
- *   章节总时长 = max(所有轨道的 cursor) + tailSilenceMs
+ *   章节总时长 = 最后一个 item 的结束 + tailSilenceMs
+ *
+ * ★ **不能**「每条轨道各自从 0 开始」：渲染是 `adelay=timelineStartMs` + `amix`
+ *   （src/shared/ffmpeg/arrangement-render.ts），`timelineStartMs` 是绝对时间线位置。
+ *   各轨从 0 起会把「角色第一句」和「旁白第一句」叠在一起播 —— 真机表现就是
+ *   「叶海本该在中间出现，却跑到了最前面」。
  *
  * 留白优先级（docs/13 §4.2）：行级 `line.pauseAfterMs` > 角色级 > 章节级默认(500 ms)。
  *
@@ -171,57 +176,56 @@ export function autoArrange(input: AutoArrangeInput): AutoArrangeResult {
   const trackOrder = orderTracks(input.lines)
   let maxCursor = 0
 
-  for (const trackId of trackOrder) {
-    const trackLines = input.lines
-      .filter(l => l.trackId === trackId)
-      .sort((a, b) => a.seq - b.seq)
+  // ★ 一个**全局 cursor**：整章按画本 seq 串行，不按轨道各自从 0 开始。
+  // 轨道只是车道（同一个人只占一条），「台词按画本顺序逐句播出」才是时间轴语义。
+  const ordered = [...input.lines].sort((a, b) => a.seq - b.seq)
+  const nextOrderInTrack = new Map<TrackId, number>()
 
-    let cursor = headSilenceMs
-    let prevLine: ArrangeLineInput | null = null
-    let orderInTrack = 0
+  let cursor = headSilenceMs
+  let prevLine: ArrangeLineInput | null = null
 
-    for (const line of trackLines) {
-      // 缺录：留占位（记 gap），cursor 不动 —— 绝不为了「补齐」插入静音片段
-      if (!line.segmentId) {
-        gaps.push({ lineId: line.lineId, trackId, seq: line.seq })
-        continue
-      }
-
-      const fadeInMs = line.existing?.fadeInMs ?? defaultFadeMs
-      const fadeOutMs = line.existing?.fadeOutMs ?? defaultFadeMs
-      const srcInMs = Math.max(0, line.srcInMs ?? 0)
-      const srcOutCandidate = line.srcOutMs ?? line.segmentDurationMs ?? srcInMs
-      const srcOutMs =
-        typeof line.segmentDurationMs === 'number'
-          ? Math.min(Math.max(srcOutCandidate, srcInMs), line.segmentDurationMs)
-          : Math.max(srcOutCandidate, srcInMs)
-
-      const pauseBeforeMs = resolvePauseAfterMs(prevLine, defaultPauseMs)
-      let startMs = Math.max(cursor + pauseBeforeMs, 0)
-      // 人工锁定：位置原样保留，自动排布不再移动它（docs/13 §4.2 / FR-4.8）
-      if (line.existing?.locked) startMs = Math.max(0, line.existing.timelineStartMs)
-
-      const item: ArrangementItem = {
-        id: line.existing?.id ?? input.idFactory?.(line, items.length) ?? `arr:${line.lineId}`,
-        arrangementId: input.arrangementId,
-        segmentId: line.segmentId,
-        lineId: line.lineId,
-        trackId,
-        timelineStartMs: Math.round(startMs),
-        srcInMs: Math.round(srcInMs),
-        srcOutMs: Math.round(srcOutMs),
-        fadeInMs,
-        fadeOutMs,
-        locked: line.existing?.locked ?? false,
-        orderInTrack: line.existing?.orderInTrack ?? orderInTrack,
-        overlapWith: null,
-      }
-      items.push(item)
-      orderInTrack++
-      cursor = startMs + itemDurationMs(item)
-      if (cursor > maxCursor) maxCursor = cursor
-      prevLine = line
+  for (const line of ordered) {
+    // 缺录：留占位（记 gap），cursor 不动 —— 绝不为了「补齐」插入静音片段
+    if (!line.segmentId) {
+      gaps.push({ lineId: line.lineId, trackId: line.trackId, seq: line.seq })
+      continue
     }
+
+    const fadeInMs = line.existing?.fadeInMs ?? defaultFadeMs
+    const fadeOutMs = line.existing?.fadeOutMs ?? defaultFadeMs
+    const srcInMs = Math.max(0, line.srcInMs ?? 0)
+    const srcOutCandidate = line.srcOutMs ?? line.segmentDurationMs ?? srcInMs
+    const srcOutMs =
+      typeof line.segmentDurationMs === 'number'
+        ? Math.min(Math.max(srcOutCandidate, srcInMs), line.segmentDurationMs)
+        : Math.max(srcOutCandidate, srcInMs)
+
+    const pauseBeforeMs = resolvePauseAfterMs(prevLine, defaultPauseMs)
+    let startMs = Math.max(cursor + pauseBeforeMs, 0)
+    // 人工锁定：位置原样保留，自动排布不再移动它（docs/13 §4.2 / FR-4.8）
+    if (line.existing?.locked) startMs = Math.max(0, line.existing.timelineStartMs)
+
+    const orderInTrack = nextOrderInTrack.get(line.trackId) ?? 0
+    const item: ArrangementItem = {
+      id: line.existing?.id ?? input.idFactory?.(line, items.length) ?? `arr:${line.lineId}`,
+      arrangementId: input.arrangementId,
+      segmentId: line.segmentId,
+      lineId: line.lineId,
+      trackId: line.trackId,
+      timelineStartMs: Math.round(startMs),
+      srcInMs: Math.round(srcInMs),
+      srcOutMs: Math.round(srcOutMs),
+      fadeInMs,
+      fadeOutMs,
+      locked: line.existing?.locked ?? false,
+      orderInTrack: line.existing?.orderInTrack ?? orderInTrack,
+      overlapWith: null,
+    }
+    items.push(item)
+    nextOrderInTrack.set(line.trackId, orderInTrack + 1)
+    cursor = startMs + itemDurationMs(item)
+    if (cursor > maxCursor) maxCursor = cursor
+    prevLine = line
   }
 
   return {
@@ -234,6 +238,12 @@ export function autoArrange(input: AutoArrangeInput): AutoArrangeResult {
 
 /**
  * 轨内重排（解锁后重跑单轨，docs/13 §4.7「解锁并重排」）。
+ *
+ * ⚠ **只适用于「这一轨独占整条时间线」的场景**（例如把单轨单独渲染出来做对比）。
+ * 绝不能拿它去重置多轨方案里的某一轨：时间线位置是**全局绝对时间**，
+ * 单轨从 0 排会和其它轨叠在一起（真机事故：角色音跑到最前面）。
+ * 多轨方案的单轨重置请走 `alignment.service.ts` 的 `resetTrack` —— 它对全章做全局排布，
+ * 只把目标轨的结果写回。
  *
  * @throws 不抛异常；返回只包含该轨的 items（调用方负责合并回整体）
  */

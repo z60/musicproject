@@ -136,12 +136,30 @@ function createAudioContext(requestedSampleRate: number): AudioContext | null {
   return new ctor({ sampleRate: requestedSampleRate, latencyHint: 'interactive' })
 }
 
-/** Blob → ObjectURL → addModule（自包含加载，见文件头说明） */
+/**
+ * Blob → ObjectURL → addModule（自包含加载，见文件头说明）。
+ *
+ * ⚠️ 失败必须**精确报错**，不能让原始异常冒上去：
+ *   渲染进程 CSP 的 `script-src` 必须允许 `blob:`（见 `src/renderer/index.html`）。
+ *   漏掉它的后果是 `addModule` 直接失败 —— 而 Chromium 把这种失败报成
+ *   **`AbortError`**（"The user aborted a request."），看起来像"用户点了取消"。
+ *   真机事故（docs/91 §5.2.40）：9 个录音会话全部 0 时长被 abort、0 个 take，
+ *   自检也弹「未预期的错误 / AbortError」，但没有任何一条线索指向 CSP。
+ *   所以这里把它包成 `RECORD_CAPTURE_UNAVAILABLE`（error 级、可重试、文案说明成因）。
+ */
 async function loadPcmWorklet(context: AudioContext): Promise<void> {
   const blob = new Blob([PCM_CAPTURE_WORKLET_SOURCE], { type: 'application/javascript' })
   const url = globalThis.URL.createObjectURL(blob)
   try {
     await context.audioWorklet.addModule(url)
+  } catch (error) {
+    throw AppError.of('RECORD_CAPTURE_UNAVAILABLE', {
+      cause: error,
+      details: {
+        reason: 'worklet-load-failed',
+        hint: '渲染进程 CSP 的 script-src 需要允许 blob:（AudioWorklet 模块从 Blob URL 加载）',
+      },
+    })
   } finally {
     // 模块加载完成后立刻回收 ObjectURL，避免长期占用内存
     globalThis.URL.revokeObjectURL(url)
@@ -258,12 +276,18 @@ export function useRecorder(): UseRecorderReturn {
   const captureContext = shallowRef<AudioContext | null>(null)
 
   let graph: CaptureGraph | null = null
-  let mainPort: MessagePort | null = null
+  /**
+   * 把一块 PCM 交给 preload 的音频通道（通道由 preload 创建，渲染进程不持有 MessagePort）。
+   * null = 通道没建立 —— 那种情况下**绝不能继续录**（录出来也是空文件，docs/91 §5.2.41）。
+   */
+  let sendPcm: ((buffer: ArrayBuffer, frames: number) => boolean) | null = null
   let blockHandlers: Array<(samples: Float32Array, sampleRate: number) => void> = []
   /** 采集块是否转投主进程：**由主进程状态驱动**（见下方 watch） */
   let capturing = false
   let lastMeterSentAt = 0
   let noSignalReported = false
+  /** 音频通道在录制中掉线只报一次（否则每 50 ms 一条错误） */
+  let pipeLostReported = false
   let deviceLostHandled = false
   let pendingFlushResolve: (() => void) | null = null
 
@@ -304,34 +328,101 @@ export function useRecorder(): UseRecorderReturn {
 
   // ── 采集图 ────────────────────────────────────────────────────────────────
 
-  /** 唯一允许碰 window.api 的地方：把 MessagePort 交给主进程（docs/20 §8 白名单） */
-  function attachMainPort(): MessagePort | null {
+  /**
+   * 建立音频通道（**通道在 preload 侧创建**，这里只拿到「送样本」这一件事）。
+   *
+   * 真机事故 docs/91 §5.2.41：以前是渲染进程 `new MessageChannel()` 再把 port2 交给 preload，
+   * 而渲染进程的 MessagePort 过了 contextBridge 就转移不出去 —— 主进程永远收不到端口，
+   * 于是「状态是 recording、电平在动、`record:meter` 一直在报帧数，但盘上一个字节都没写」
+   * （日志：`record.frameGap {claimed:2304, written:0}` ×738）。所以现在不再自己建端口。
+   */
+  function attachRecordPipe(): boolean {
     try {
-      const channel = new MessageChannel()
-      const api = (globalThis as unknown as { window?: { api?: { attachRecordPort?: (p: MessagePort) => void } } }).window?.api
-      if (!api?.attachRecordPort) {
-        reportError(AppError.of('INTERNAL', { details: { reason: 'preload 未暴露 attachRecordPort' } }), {
+      const api = (globalThis as unknown as {
+        window?: { api?: { attachRecordPort?: () => void; sendRecordPcm?: (buffer: ArrayBuffer, frames: number) => boolean } }
+      }).window?.api
+      if (!api?.attachRecordPort || !api.sendRecordPcm) {
+        reportError(AppError.of('RECORD_CAPTURE_UNAVAILABLE', { details: { reason: 'preload-api-missing' } }), {
           event: 'recording.attachPort.unavailable',
-          detailOverride: '当前 preload 没有暴露音频端口通道，音频样本无法送出（需要重新构建 preload）。',
+          detailOverride: '当前 preload 没有暴露录音音频通道（需要重新构建 preload）。',
         })
-        return null
+        return false
       }
-      // port1 留在渲染进程，port2 转给主进程（零拷贝通道，docs/05 §2.3）
-      api.attachRecordPort(channel.port2)
-      return channel.port1
+      api.attachRecordPort()
+      sendPcm = (buffer, frames) => api.sendRecordPcm!(buffer, frames)
+      pipeLostReported = false
+      /**
+       * ⚠️ `forwardedFrames` 是**本会话**的累计声称值，必须每个会话从 0 开始。
+       *
+       * 主进程拿它和"本会话已落盘帧数"相减算丢帧（§5.2.41 的口径修正）。如果不清零，
+       * 第二个会话一开始就会声称"发了上个会话那么多帧"，主进程立刻报一个巨大的差额：
+       * 真机日志实证 —— 第一段录了 1.68 s（74240 帧），第二段开始 100 ms 后
+       * 就出现 `claimed=78848 written=4608 gap=74240`，界面弹出"丢帧 74240"，
+       * 用户以为这段没录上（docs/91 §5.2.44）。
+       */
+      forwardedBlocks.value = 0
+      forwardedFrames.value = 0
+      lastMeterSentAt = 0
+      return true
     } catch (error) {
-      reportError(error, { event: 'recording.attachPort.failed' })
-      return null
+      reportError(AppError.of('RECORD_CAPTURE_UNAVAILABLE', {
+        cause: error,
+        details: { reason: 'attach-port-threw' },
+      }), { event: 'recording.attachPort.failed' })
+      return false
     }
   }
 
   function closeMainPort(): void {
+    sendPcm = null
     try {
-      mainPort?.close()
+      // 通道在 preload 侧：让那边把端口关掉，别让它在会话结束后一直挂着
+      const api = (globalThis as unknown as { window?: { api?: { detachRecordPort?: () => void } } }).window?.api
+      api?.detachRecordPort?.()
     } catch {
-      /* 关闭失败无所谓：端口会随渲染进程一起回收 */
+      /* 关不掉无所谓：它随会话一起回收 */
     }
-    mainPort = null
+  }
+
+  /**
+   * 把一块样本交给 preload 的音频通道。返回 false = 这一块没送出去。
+   *
+   * 三种失败都要处理，且**只精确报一次**（否则每 50 ms 一条错误）：
+   *   · 通道不存在（离开页面、preload 侧端口被关）
+   *   · 通道拒绝（preload 侧 recordPort 已为 null）
+   *   · 调用**抛错**（contextBridge 边界可能抛：参数不可序列化、transfer 列表非法）
+   *
+   * 真机事故 docs/91 §5.2.41 / §5.2.42 的共同教训就是"沉默地录了个空文件"：
+   * 界面上状态正常、电平在跳，盘上 0 字节，日志里连一条线索都没有。
+   */
+  function forwardBlock(samples: Float32Array): boolean {
+    if (!sendPcm) {
+      reportPipeLost('pcm-pipe-missing')
+      return false
+    }
+    try {
+      if (sendPcm(samples.buffer as ArrayBuffer, samples.length)) return true
+      reportPipeLost('pcm-pipe-rejected')
+      return false
+    } catch (error) {
+      reportPipeLost('send-pcm-threw', error)
+      return false
+    }
+  }
+
+  function reportPipeLost(reason: string, cause?: unknown): void {
+    if (pipeLostReported) return
+    pipeLostReported = true
+    reportError(
+      AppError.of('RECORD_CAPTURE_UNAVAILABLE', {
+        ...(cause === undefined ? {} : { cause }),
+        details: { reason, sessionId: store.sessionId },
+      }),
+      {
+        event: 'recording.pcmPipeLost',
+        detailOverride: '录音音频通道已断开：这一段没有写进文件，请停止后重录本行。',
+      },
+    )
   }
 
   /** 采集块到达：算电平 → 推给波形 → 转投主进程 → 20 Hz 上报电平 */
@@ -345,15 +436,14 @@ export function useRecorder(): UseRecorderReturn {
       overloadBlocks: meter.overloadBlocks.value,
     })
 
-    // 波形消费者先拿数据 —— 转投主进程会把 ArrayBuffer 转移（detach）掉
+    // 波形消费者先拿数据。**现在不会再被 detach**：样本过 contextBridge 是拷贝，
+    // 且 preload 送主进程时也不再用 transfer 列表（docs/91 §5.2.43 实测：带 transfer 会让
+    // 主进程收到 null）。顺序保留只是为了"消费者先读"这条不变量。
     for (const handler of blockHandlers) handler(samples, sampleRate)
 
     // 只在主进程说「正在录」时转发（暂停期间不写盘，docs/12 §2）
     if (capturing) {
-      if (mainPort) {
-        // 硬性约束 2：转投时同样转移 ArrayBuffer（零拷贝）
-        mainPort.postMessage({ type: 'pcm', frames: samples.length, data: samples.buffer }, [samples.buffer])
-      }
+      forwardBlock(samples)
       forwardedBlocks.value += 1
       forwardedFrames.value += samples.length
 
@@ -364,7 +454,16 @@ export function useRecorder(): UseRecorderReturn {
           sessionId: store.sessionId,
           rmsDb: sample.rmsDb,
           peakDb: sample.peakDb,
-          frames: samples.length,
+          /**
+           * ⚠️ 必须发**累计**帧数，不是本块帧数。
+           *
+           * 主进程拿 `claimedFrames - (已落盘 + 内存中)` 算丢帧（docs/12 §13 的 P0 指标）。
+           * 这里以前发的是 `samples.length`（单块 2304 帧）而主进程按累计口径比较，
+           * 于是除了第一个块之外**永远算不出差额** —— 指标形同虚设：真机日志里
+           * 7 个会话各报几十次 `record.frameGap {claimed:2304, written:0}`，
+           * 恰恰是因为写盘恒为 0 才"碰巧"被发现；部分丢块（例如丢 10%）一次都发现不了。
+           */
+          claimedFrames: forwardedFrames.value,
         }
         send('record:meter', payload)
       }
@@ -621,9 +720,54 @@ export function useRecorder(): UseRecorderReturn {
     }
 
     deviceLostHandled = false
-    mainPort = attachMainPort()
-    await callSafe('record:attachPort', { sessionId: prepared.sessionId })
+    /**
+     * 建立音频通道 + 告诉主进程「这个端口归哪个会话」。
+     *
+     * ⚠️ 这两步失败**必须中止本次录制**：以前通道失败时只记了个 warning，
+     * 界面照常进入 recording、电平照常跳，但盘上一个字节都不写，最后只得到一个
+     * 「录音太短」的提示（真机事故 docs/91 §5.2.41：`record.frameGap {claimed:2304, written:0}` ×738）。
+     */
+    if (!attachRecordPipe()) {
+      await abortSession(prepared.sessionId)
+      return null
+    }
+    if (!(await attachPortWithRetry(prepared.sessionId))) {
+      await abortSession(prepared.sessionId)
+      return null
+    }
     return prepared
+  }
+
+  /** 放弃一个已准备但没用起来的会话（不留空文件、不留空记录） */
+  async function abortSession(sessionId: string): Promise<void> {
+    await callSafe('record:abort', { sessionId, keepFile: false })
+    closeMainPort()
+    store.reset()
+  }
+
+  /**
+   * 声明端口归属，并容忍两次 IPC 的**到达顺序**：
+   * 端口走 `ipcRenderer.postMessage('record:port')`，而归属走 invoke —— 两条通道不保证先后，
+   * 主进程在「还没收到端口」时会明确报 no-port-received（这是设计好的），这里重试几次即可。
+   */
+  async function attachPortWithRetry(sessionId: string, attempts = 4): Promise<boolean> {
+    for (let i = 0; i < attempts; i++) {
+      try {
+        await call('record:attachPort', { sessionId })
+        return true
+      } catch (error) {
+        const last = i === attempts - 1
+        if (last) {
+          reportError(AppError.of('RECORD_CAPTURE_UNAVAILABLE', {
+            cause: error,
+            details: { reason: 'attach-port-failed', sessionId },
+          }), { event: 'recording.attachPort.failed' })
+          return false
+        }
+        await new Promise((resolve) => setTimeout(resolve, 40))
+      }
+    }
+    return false
   }
 
   async function start(): Promise<boolean> {
@@ -752,8 +896,15 @@ export function useRecorder(): UseRecorderReturn {
         return null
       }
       deviceLostHandled = false
-      mainPort = attachMainPort()
-      await callSafe('record:attachPort', { sessionId: result.sessionId })
+      // 与 prepare() 同一条纪律：通道建不起来就中止本次补录，绝不"录"出一个空文件
+      if (!attachRecordPipe()) {
+        await abortSession(result.sessionId)
+        return null
+      }
+      if (!(await attachPortWithRetry(result.sessionId))) {
+        await abortSession(result.sessionId)
+        return null
+      }
       return result.sessionId
     } catch (error) {
       store.setError(error)

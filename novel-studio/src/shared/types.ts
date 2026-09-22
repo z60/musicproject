@@ -610,6 +610,8 @@ export interface ArrangementItemPatch {
 
 export type AlignIssueKind =
   | 'missing_line'
+  /** 有录音（voice_segments）但方案里没有对应条目 —— 会被渲染/导出丢掉，必须重新排布 */
+  | 'unarranged_line'
   | 'orphan_segment'
   | 'same_track_overlap'
   | 'cross_track_overlap_warn'
@@ -623,6 +625,8 @@ export type AlignIssueKind =
 
 export interface ArrangementValidation {
   missingLines: Id[]
+  /** 有片段但不在方案条目里的画本行（渲染会丢音频；需重新自动排布） */
+  unarrangedLines: Id[]
   orphanSegments: Id[]
   sameTrackOverlaps: Array<{ a: Id; b: Id; overlapMs: number }>
   crossTrackOverlaps: Array<{ a: Id; b: Id; overlapMs: number; level: 'normal' | 'warning' }>

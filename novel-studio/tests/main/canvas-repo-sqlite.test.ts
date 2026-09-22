@@ -261,6 +261,50 @@ describe('画本行仓储（SQLite）· 写入语义', () => {
     await assert.rejects(() => repo.updateLine('nope', { text: 'x' }), { key: 'NOT_FOUND' })
   })
 
+  /**
+   * 真机事故 docs/91 §5.2.44：录音完成后必须把行推进到 `recorded`
+   * （docs/12 §3.3 / docs/01 §210 的状态机），否则画本表格没有 ✓、进度恒为 0。
+   */
+  describe('markLineRecorded（录音完成 → 行标已录）', () => {
+    it('draft → recorded，并推进 rev', async () => {
+      const { repo } = await sqliteRepo()
+      await repo.insertLines([sampleLine({ state: 'draft' })])
+
+      const marked = await repo.markLineRecorded('l1')
+      assert.deepEqual(marked, { from: 'draft', to: 'recorded', changed: true })
+      const line = await repo.getLine('l1')
+      assert.equal(line?.state, 'recorded')
+      assert.equal(line?.rev, 2, '状态变了就要推进 rev（画本快照/乐观锁依赖它）')
+    })
+
+    it('assigned → recorded（说话人已定但还没录）', async () => {
+      const { repo } = await sqliteRepo()
+      await repo.insertLines([sampleLine({ state: 'assigned' })])
+      const marked = await repo.markLineRecorded('l1')
+      assert.deepEqual(marked, { from: 'assigned', to: 'recorded', changed: true })
+    })
+
+    it('已经是 recorded / aligned 就不动（**只前进不后退**）', async () => {
+      const { repo } = await sqliteRepo()
+      await repo.insertLines([sampleLine({ id: 'r', seq: 0, state: 'recorded' }), sampleLine({ id: 'a', seq: 1, state: 'aligned' })])
+
+      const r = await repo.markLineRecorded('r')
+      const a = await repo.markLineRecorded('a')
+      assert.deepEqual(r, { from: 'recorded', to: 'recorded', changed: false })
+      assert.deepEqual(a, { from: 'aligned', to: 'aligned', changed: false }, '对轨过的行不许被一次重录退回 recorded')
+      assert.equal((await repo.getLine('a'))?.state, 'aligned')
+    })
+
+    it('行不存在 / 已软删除 → 返回 null（不抛错：录音成功但行被删是合法竞态）', async () => {
+      const { repo } = await sqliteRepo()
+      assert.equal(await repo.markLineRecorded('nope'), null)
+
+      await repo.insertLines([sampleLine()])
+      await repo.softDeleteLines(['l1'])
+      assert.equal(await repo.markLineRecorded('l1'), null)
+    })
+  })
+
   it('CHECK 约束的归一化：confidence 夹 0..1、emotionIntensity 夹 1..5、pauseAfterMs 负值归 0', async () => {
     const { repo } = await sqliteRepo()
     await repo.insertLines([sampleLine()])

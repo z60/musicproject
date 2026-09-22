@@ -26,6 +26,7 @@
  */
 
 import { AppError } from '../../shared/errors.ts'
+import { isValidEventName } from '../infra/log/logger.ts'
 import type {
   BrowserWindowLike,
   BrowserWindowOptionsLike,
@@ -87,6 +88,9 @@ export interface WindowManagerOptions {
   log?: {
     info: (event: string, fields: Record<string, unknown>) => void
     warn: (event: string, fields: Record<string, unknown>) => void
+    /** 渲染进程的 console.error 落到这一级；缺省时退到 warn */
+    error?: (event: string, fields: Record<string, unknown>) => void
+    debug?: (event: string, fields: Record<string, unknown>) => void
   }
   /** 打开外部链接（默认 electron.shell.openExternal） */
   openExternal?: (url: string) => void
@@ -107,6 +111,87 @@ export interface WindowManager {
   focusExisting(): boolean
 }
 
+// ---------------------------------------------------------------------------
+// 渲染进程 console → 主进程日志
+// ---------------------------------------------------------------------------
+// 为什么必须有这段（真机事故 docs/91 §5.2.41）：
+//   `src/renderer/src/app/main.ts` 把「渲染进程日志最终落盘」的实现写成
+//   「console.* → webContents 的 console-message 事件 → 主进程 electron-log」，
+//   但主进程**从来没有注册过 `console-message`** —— 于是渲染进程的一切输出
+//   （包括 reportError 的结构化记录）都停在了 devtools 里。
+//   取证时的直接后果：日志里有 738 条主进程侧的
+//   `record.frameGap {claimed:2304, written:0}`，却**一条渲染进程的
+//   `recording.attachPort.failed` 都没有**，排查只能靠猜。
+//
+// 渲染进程用 `console.x('[ns] ' + JSON.stringify(payload))` 发结构化记录
+// （必须是**单个字符串参数**：Chromium 只会把格式化后的文本交给 console-message，
+// 多参数的对象会被渲染成 `{event: 'x'}` 这种非 JSON 文本，解析不回来）。
+
+/** 结构化渲染日志的前缀（与 `src/renderer/src/app/main.ts` 的 `logToConsole` 约定一致） */
+export const RENDERER_LOG_PREFIX = '[ns] '
+/** 单条消息落盘上限：超长的堆栈/JSON 会挤爆日志文件 */
+export const RENDERER_CONSOLE_MAX_CHARS = 4000
+
+export interface RendererConsoleMessage {
+  /** 0 verbose / 1 info / 2 warning / 3 error */
+  level: number
+  message: string
+  line: number
+  sourceId: string
+}
+
+/** 把 console-message 的两种参数形态（Electron ≤31 位置参数 / ≥32 的 details 对象）归一 */
+export function parseConsoleMessageArgs(args: readonly unknown[]): RendererConsoleMessage {
+  const second = args[1]
+  const asLevel = (value: unknown): number => {
+    if (typeof value === 'number' && Number.isFinite(value)) return Math.min(3, Math.max(0, Math.trunc(value)))
+    switch (String(value ?? '')) {
+      case 'error':
+        return 3
+      case 'warning':
+      case 'warn':
+        return 2
+      case 'info':
+        return 1
+      case 'debug':
+      case 'verbose':
+        return 0
+      default:
+        return 1
+    }
+  }
+  if (second !== null && typeof second === 'object') {
+    const d = second as { level?: unknown; message?: unknown; lineNumber?: unknown; line?: unknown; sourceId?: unknown }
+    return {
+      level: asLevel(d.level),
+      message: String(d.message ?? ''),
+      line: Number(d.lineNumber ?? d.line ?? 0) || 0,
+      sourceId: String(d.sourceId ?? ''),
+    }
+  }
+  return {
+    level: asLevel(args[1]),
+    message: String(args[2] ?? ''),
+    line: Number(args[3] ?? 0) || 0,
+    sourceId: String(args[4] ?? ''),
+  }
+}
+
+/** `[ns] {json}` → 结构化字段；不是这种形态时返回 null（普通 console 输出） */
+export function parseRendererLogPayload(message: string): Record<string, unknown> | null {
+  if (!message.startsWith(RENDERER_LOG_PREFIX)) return null
+  const body = message.slice(RENDERER_LOG_PREFIX.length).trim()
+  if (!body.startsWith('{')) return null
+  try {
+    const parsed: unknown = JSON.parse(body)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+    return parsed as Record<string, unknown>
+  } catch {
+    // 截断或非 JSON：按普通文本落盘（信息不能丢）
+    return null
+  }
+}
+
 /**
  * 创建窗口管理器。
  *
@@ -124,8 +209,75 @@ export function createWindowManager(opts: WindowManagerOptions): WindowManager {
     return url.startsWith('file://')
   }
 
+  /**
+   * 渲染进程 console → 主进程日志（见文件内「渲染进程 console → 主进程日志」一节）。
+   *
+   * 落盘策略：
+   *   · `[ns] {json}` 形态 → 用渲染进程给的事件名（合法时）与结构化字段落盘，
+   *     并打上 `rendererConsole: true`，这样 `recording.attachPort.failed` 这类
+   *     渲染侧事件在主进程日志里**可被直接检索**；
+   *   · 其余（Vue 警告、CSP 违规、未捕获异常…）→ 事件名统一为 `renderer.console`，
+   *     原文进 `message`（截断到 4000 字符）。
+   * 本函数**绝不抛错**：日志失败不能影响窗口。
+   */
+  function forwardRendererConsole(args: unknown[]): void {
+    try {
+      const parsed = parseConsoleMessageArgs(args)
+      if (!parsed.message) return
+      const text =
+        parsed.message.length > RENDERER_CONSOLE_MAX_CHARS
+          ? `${parsed.message.slice(0, RENDERER_CONSOLE_MAX_CHARS)}…（已截断 ${parsed.message.length - RENDERER_CONSOLE_MAX_CHARS} 字符）`
+          : parsed.message
+
+      const structured = parseRendererLogPayload(text)
+      const fields: Record<string, unknown> = {
+        ...(parsed.sourceId ? { source: parsed.sourceId } : {}),
+        ...(parsed.line ? { line: parsed.line } : {}),
+      }
+      let event = 'renderer.console'
+      if (structured) {
+        const name = typeof structured.event === 'string' ? structured.event : ''
+        if (isValidEventName(name)) event = name
+        Object.assign(fields, structured, { rendererConsole: true })
+        if (event === 'renderer.console') fields.rendererEvent = name || null
+      } else {
+        fields.message = text
+      }
+
+      const data = { event, ...fields }
+      if (parsed.level >= 3) (log?.error ?? log?.warn)?.call(log, event, data)
+      else if (parsed.level === 2) log?.warn?.call(log, event, data)
+      else log?.info?.call(log, event, data)
+    } catch {
+      /* 渲染进程日志转发失败：静默（日志不能反过来成为故障源） */
+    }
+  }
+
+  /**
+   * 已经装过硬化的 webContents。
+   *
+   * 同一个 webContents 会被**两条路径**各装一次：应用级 `web-contents-created`
+   * （BrowserWindow 构造时就发）与 `createMainWindow` 里的显式调用。
+   * 没有这个去重，每个监听器都会装两遍 —— 症状是**渲染进程的每条日志都落盘两次**
+   * （真机日志实证：同一条 CSP 警告 / `[vite] connecting` 成对出现）。
+   */
+  const hardenedContents = new WeakSet<object>()
+
   /** 全局硬化：每个 webContents 创建时都要装（docs/02 §3） */
   function hardenContents(contents: WebContentsLike): void {
+    if (hardenedContents.has(contents as object)) return
+    hardenedContents.add(contents as object)
+
+    try {
+      // 渲染进程 console → 主进程日志。**必须装在**：这是渲染侧唯一的落盘通路
+      // （渲染进程没有直写日志的 IPC 通道，见 app/main.ts 的契约说明）。
+      contents.on('console-message', (...args: unknown[]) => {
+        forwardRendererConsole(args)
+      })
+    } catch (e) {
+      log?.warn?.('window.harden.consoleMessage.failed', { event: 'window.harden.consoleMessage.failed', reason: String(e) })
+    }
+
     try {
       contents.setWindowOpenHandler?.(({ url }) => {
         // 外链一律交给系统浏览器，绝不在应用内开窗（防钓鱼 + 防越权）

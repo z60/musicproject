@@ -28,7 +28,7 @@
 | 请求-响应 | `invoke` | 查询与命令 | `book:list`、`canvas:updateLine` |
 | 单向高频 | `send`（渲染 → 主） | 可丢弃的高频数据 | `record:meter` |
 | 事件流 | 主 → 渲染（`webContents.send`） | 进度、状态、日志 | `task:progress`、`record:status` |
-| 零拷贝流 | `MessagePortMain` | 音频样本 | `record:attachPort` |
+| 样本流 | `MessagePortMain`（由 preload 创建并转移） | 音频样本 | `record:port` + `record:attachPort` |
 
 ---
 
@@ -198,7 +198,7 @@
 | 通道 | 模式 | 请求 | 响应 |
 |------|------|------|------|
 | `record:prepare` | invoke | `{ projectId, chapterId, mode, format: { sampleRate, bitDepth, channels }, deviceId? }` | `{ sessionId, warnings: string[] }` |
-| `record:attachPort` | invoke | `{ sessionId }` | `{ ok }`（MessagePort 由 preload 经 `record:port` 转移，不在返回值里） |
+| `record:attachPort` | invoke | `{ sessionId }` | `{ ok }`（MessagePort 由 **preload** 经 `record:port` 转移，不在返回值里；失败时明确报 no-port-received 而不是装作成功 —— docs/91 §5.2.41） |
 | `record:start` | invoke | `{ sessionId }` | `{ ok }` |
 | `record:pause` | invoke | `{ sessionId }` | `{ ok }` |
 | `record:resume` | invoke | `{ sessionId }` | `{ ok }` |
@@ -206,7 +206,7 @@
 | `record:abort` | invoke | `{ sessionId, keepFile?: boolean }` | `{ ok }` |
 | `record:punchIn` | invoke | `{ lineId, srcInMs, srcOutMs, preRollMs, postRollMs }` | `{ sessionId }` |
 | `record:mark` | send | `{ sessionId, kind: 'cut'\|'retake'\|'note', atMs }` | — |
-| `record:meter` | send | `{ sessionId, rmsDb, peakDb, frames }` | — |
+| `record:meter` | send | `{ sessionId, rmsDb, peakDb, claimedFrames }`（`claimedFrames` = 渲染侧**累计**转投帧数，主进程用它核对丢帧） | — |
 | `record:status` | event | — | `{ sessionId, state, framesWritten, durationMs, droppedFrames, diskFreeBytes }` |
 | `record:slice` | invoke | `{ sessionId, vad: VadOptions }` | `{ slices: VadSlice[] }` |
 | `record:matchSlices` | invoke | `{ sessionId, chapterId, slices: VadSlice[], useAsr? }` | `{ matches: SliceMatch[], unmatchedSlices: number[], unrecordedLines: Id[] }` |
@@ -743,8 +743,18 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.on(event, listener)
     return () => ipcRenderer.off(event, listener)     // 返回取消订阅函数
   },
-  // MessagePort 通道（录音音频）
-  attachRecordPort: (port: MessagePort) => ipcRenderer.postMessage('record:port', null, [port]),
+  // 音频样本通道（**端口在 preload 侧创建**，渲染进程只交 buffer）
+  //   attachRecordPort(): 建 MessageChannel，把 port2 转移给主进程，port1 留给 sendRecordPcm
+  //   sendRecordPcm():    把一个 50 ms 块的 PCM 交给主进程（过 contextBridge 拷贝一次，
+  //                       端口那一段也是拷贝 —— **不能带 transfer 列表**，带了主进程会收到
+  //                       `null`，见 docs/91 §5.2.43）
+  //   detachRecordPort(): 会话结束/离开页面时关掉端口
+  // ⚠️ 早期契约是 attachRecordPort(port: MessagePort)（渲染进程建端口再递进来）——
+  //    那条路走不通：contextBridge 包装过的 port 无法放进 postMessage 的 transfer 列表，
+  //    主进程静默收不到端口（docs/91 §5.2.41）。
+  attachRecordPort: () => void,
+  sendRecordPcm: (buffer: ArrayBuffer, frames: number) => boolean,
+  detachRecordPort: () => void,
   // 少量便捷方法（避免渲染进程拼路径）
   mediaUrl: (projectId: string, relPath: string) =>
     `ns-media://${encodeURIComponent(projectId)}/${relPath.split('/').map(encodeURIComponent).join('/')}`
@@ -754,8 +764,13 @@ contextBridge.exposeInMainWorld('api', {
 **约束**
 1. **白名单校验**：`invoke`/`send`/`on` 内部校验 channel 是否在契约表内，未注册的直接抛错（防止渲染进程被注入后调用任意通道）。
 2. **不暴露 `ipcRenderer` 本体**，不暴露 `require`、`process`、`fs`。
-3. **不暴露原始 `MessagePort` 之外的能力**（只 `postMessage` 转移端口）。
+3. **不把 `MessagePort` 交给渲染进程**：端口是 preload 自己建、自己转移给主进程的，
+   渲染进程只调用 `sendRecordPcm(buffer, frames)`。这既是安全边界，也是唯一可行的路径
+   （渲染进程建的 port 过不了 `contextBridge`，docs/91 §5.2.41）。
 4. `on` 必须返回取消订阅函数，否则组件卸载后会内存泄漏并重复响应。
+5. **渲染进程的日志不新开 IPC 通道**：`console.*` → `webContents` 的 `console-message`
+   事件 → 主进程 `forwardRendererConsole()` 落盘（结构化记录用单字符串
+   `'[ns] ' + JSON.stringify(payload)`，见 `src/main/bootstrap/window-manager.ts`）。
 
 ---
 

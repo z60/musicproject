@@ -64,13 +64,30 @@ function createFakeIpc(opts: { supportsPostMessage?: boolean } = {}): { ipc: Ipc
   return { ipc, spy }
 }
 
-function makeApi(opts: { supportsPostMessage?: boolean } = {}) {
+/** 假端口对：记录 preload 侧那一半收到的消息（真 MessageChannel 会让 Node 事件循环不退出） */
+function fakeChannel(): {
+  channel: { port1: unknown; port2: unknown }
+  sent: Array<{ message: unknown; transfer?: unknown[] }>
+  closed: { port1: boolean }
+} {
+  const sent: Array<{ message: unknown; transfer?: unknown[] }> = []
+  const closed = { port1: false }
+  const port1 = {
+    postMessage: (message: unknown, transfer?: unknown[]): void => { sent.push({ message, transfer }) },
+    close: (): void => { closed.port1 = true },
+  }
+  return { channel: { port1, port2: { id: 'port-2' } }, sent, closed }
+}
+
+function makeApi(opts: { supportsPostMessage?: boolean; withChannel?: boolean } = {}) {
   const { ipc, spy } = createFakeIpc(opts)
+  const fake = opts.withChannel ? fakeChannel() : null
   const api = createPreloadApi(ipc, {
     ...(opts.supportsPostMessage !== undefined ? { supportsPortTransfer: opts.supportsPostMessage } : {}),
+    ...(fake ? { createPortChannel: () => fake.channel } : {}),
     log: { warn: (event, data) => { spy.warns.push(data ? { event, data } : { event }) } },
   })
-  return { api, spy }
+  return { api, spy, fake }
 }
 
 // ---------------------------------------------------------------------------
@@ -198,24 +215,62 @@ describe('preload.on 事件订阅', () => {
 })
 
 // ---------------------------------------------------------------------------
-// attachRecordPort：录音零拷贝通道
+// attachRecordPort / sendRecordPcm：录音音频通道
 // ---------------------------------------------------------------------------
 
 describe('preload.attachRecordPort', () => {
-  it('支持时通过 postMessage 转移端口', () => {
-    const { api, spy } = makeApi({ supportsPostMessage: true })
-    const fakePort = { id: 'port-1' }
-    api.attachRecordPort(fakePort)
+  it('通道在 preload 自己这一侧创建并转移给主进程', () => {
+    const { api, spy, fake } = makeApi({ supportsPostMessage: true, withChannel: true })
+    api.attachRecordPort()
 
     assert.equal(spy.posted.length, 1)
     assert.equal(spy.posted[0]!.channel, 'record:port')
-    assert.deepEqual(spy.posted[0]!.transfer, [fakePort], '端口必须放进 transfer 列表才是转移而非拷贝')
+    assert.deepEqual(spy.posted[0]!.transfer, [fake!.channel.port2], 'preload 建的 port2 必须转移给主进程')
   })
 
   it('不支持时明确抛错（绝不静默丢弃，否则用户录完才发现没声音）', () => {
-    const { api, spy } = makeApi({ supportsPostMessage: false })
-    assert.throws(() => api.attachRecordPort({}), /不支持 MessagePort 转移/)
+    const { api, spy } = makeApi({ supportsPostMessage: false, withChannel: true })
+    assert.throws(() => api.attachRecordPort(), /不支持 MessagePort 转移/)
     assert.equal(spy.posted.length, 0)
+  })
+
+  it('sendRecordPcm：通道建立前返回 false（调用方据此中止录制，而不是"录"出空文件）', () => {
+    const { api } = makeApi({ supportsPostMessage: true, withChannel: true })
+    assert.equal(api.sendRecordPcm(new ArrayBuffer(8), 2), false)
+  })
+
+  /**
+   * 真机事故 docs/91 §5.2.43：**这条路径上不能带 transfer 列表**。
+   *
+   * 实测（Electron 31.7.0，真 Electron 跑八种载荷）：preload 侧
+   * `postMessage(payload, [transfer])` 一旦带 transfer，主进程收到的 `event.data`
+   * 恒为 `null` —— 事件照发、渲染侧不报错，但一块数据都到不了，录音永远是 0 字节。
+   * 不带 transfer 时字符串/对象/ArrayBuffer/类型化数组都完整送达（拷贝）。
+   */
+  it('sendRecordPcm：把样本放进通道，且**不得使用 transfer 列表**', () => {
+    const { api, fake } = makeApi({ supportsPostMessage: true, withChannel: true })
+    api.attachRecordPort()
+
+    const buffer = new ArrayBuffer(16)
+    assert.equal(api.sendRecordPcm(buffer, 4), true)
+    assert.equal(fake!.sent.length, 1, '样本必须真的进通道')
+    const message = fake!.sent[0]!.message as { type: string; frames: number; data: ArrayBuffer }
+    assert.equal(message.type, 'pcm')
+    assert.equal(message.frames, 4)
+    assert.equal(message.data.byteLength, 16)
+    const transfer = fake!.sent[0]!.transfer
+    assert.ok(
+      transfer === undefined || transfer.length === 0,
+      `不得带 transfer 列表（带 transfer 时主进程收到 null，docs/91 §5.2.43）；实际 ${JSON.stringify(transfer)}`,
+    )
+  })
+
+  it('detachRecordPort：关掉旧通道，之后再送样本返回 false', () => {
+    const { api, fake } = makeApi({ supportsPostMessage: true, withChannel: true })
+    api.attachRecordPort()
+    api.detachRecordPort()
+    assert.equal(fake!.closed.port1, true, '端口必须真的关掉（否则会一直挂着）')
+    assert.equal(api.sendRecordPcm(new ArrayBuffer(4), 1), false)
   })
 })
 
@@ -272,7 +327,7 @@ describe('preload 白名单规模', () => {
   it('暴露面只包含五个方法（不额外泄漏能力）', () => {
     const { api } = makeApi()
     const keys = Object.keys(api).sort()
-    assert.deepEqual(keys, ['attachRecordPort', 'invoke', 'mediaUrl', 'on', 'send'])
+    assert.deepEqual(keys, ['attachRecordPort', 'detachRecordPort', 'invoke', 'mediaUrl', 'on', 'send', 'sendRecordPcm'])
   })
 
   it('API 上不存在 ipcRenderer / require / process 之类的泄漏', () => {

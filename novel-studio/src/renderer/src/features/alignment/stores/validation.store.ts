@@ -24,6 +24,7 @@ export type IssueSeverity = 'blocking' | 'warning' | 'info'
 /** 兜底中文标签。主进程的 `alignment:issueKindLabels` 可用时以它为准（文案唯一来源） */
 export const ISSUE_KIND_FALLBACK_LABELS: Record<AlignIssueKind, string> = {
   missing_line: '缺录（画本行没有录音）',
+  unarranged_line: '有录音但未排布（重新自动排布即可归位）',
   orphan_segment: '孤儿片段（画本行已删除）',
   same_track_overlap: '同轨重叠（必须消解）',
   cross_track_overlap_warn: '跨轨重叠过大',
@@ -41,6 +42,7 @@ export const ISSUE_KIND_ORDER: AlignIssueKind[] = [
   'wrong_order',
   'same_track_overlap',
   'missing_line',
+  'unarranged_line',
   'file_missing',
   'cross_track_overlap_warn',
   'long_gap',
@@ -130,6 +132,9 @@ export const useValidationStore = defineStore('alignment/validation', () => {
     if (rows.length === 0) {
       for (const lineId of validation.missingLines ?? []) {
         push('missing_line', '该画本行还没有录音（缺录）', lineId, null)
+      }
+      for (const lineId of validation.unarrangedLines ?? []) {
+        push('unarranged_line', '该画本行有录音但不在当前方案里', lineId, null)
       }
       for (const a of validation.sameTrackOverlaps ?? []) {
         push('same_track_overlap', `同轨两段重叠 ${Math.round(a.overlapMs)} ms`, null, a.b)

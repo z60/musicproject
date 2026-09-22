@@ -279,7 +279,7 @@ describe('对轨域 · 方案管理', () => {
 // ---------------------------------------------------------------------------
 
 describe('对轨域 · 自动排布', () => {
-  it('按轨道分组、缺录上行不占时间线、总时长与 version 一起更新', async () => {
+  it('按画本 seq 全局串行、缺录行不占时间线、总时长与 version 一起更新', async () => {
     const h = await harness()
     try {
       const arr = await h.service.create('c1', 'A', 'serialize')
@@ -289,11 +289,12 @@ describe('对轨域 · 自动排布', () => {
       const tracks = new Set(result.items.map((i) => i.trackId))
       assert.deepEqual([...tracks].sort(), ['ch1', 'narration'])
       assert.equal(result.items.every((i) => i.segmentId !== ''), true)
-      // 每轨都从 0 开始（两条轨道各自独立）
-      for (const track of tracks) {
-        const first = result.items.filter((i) => i.trackId === track).sort((a, b) => a.timelineStartMs - b.timelineStartMs)[0]!
-        assert.equal(first.timelineStartMs, 0)
-      }
+      // 全章串行：l1(旁白, 0) → l2(角色, 2010+500=2510)。角色音**不能**从 0 开始，
+      // 否则渲染（adelay+amix，绝对时间）会让角色第一句和旁白第一句同时播。
+      const narr = result.items.find((i) => i.trackId === 'narration')!
+      const char = result.items.find((i) => i.trackId === 'ch1')!
+      assert.equal(narr.timelineStartMs, 0)
+      assert.equal(char.timelineStartMs, 2510, '角色行紧随前一句旁白')
       const row = h.db.prepare(`SELECT version, total_duration_ms, strategy FROM arrangements WHERE id = ?`).get(arr.id) as {
         version: number
         total_duration_ms: number
@@ -343,7 +344,10 @@ describe('对轨域 · 自动排布', () => {
       const res = await h.service.resetTrack(arr.id, 'ch1')
       const charAfter = res.items.find((i) => i.trackId === 'ch1')!
       const narrationAfter = res.items.find((i) => i.trackId === 'narration')!
-      assert.equal(charAfter.timelineStartMs, 0, '被重置的轨道回到自动位置')
+      // 单轨重置也按**全章全局**算：把其它轨的当前位置当锚点。
+      // 旁白被手工移到 1200（时长 2010）→ 角色行紧随其后：1200+2010+500 = 3710。
+      // （曾经的「该轨回到 0」是各轨独立排布的产物，会把角色音叠到最前面。）
+      assert.equal(charAfter.timelineStartMs, 3710, '被重置的轨道按全章顺序回到它该在的位置')
       assert.equal(narrationAfter.timelineStartMs, 1200, '其它轨必须原样不动')
     } finally {
       h.cleanup()
@@ -556,12 +560,13 @@ describe('对轨域 · 匹配与绑定', () => {
     }
   })
 
-  it('issueKindLabels：11 种问题的中文文案齐全（与渲染侧兜底表同口径）', async () => {
+  it('issueKindLabels：12 种问题的中文文案齐全（与渲染侧兜底表同口径）', async () => {
     const h = await harness()
     try {
       const labels = (await call(h, 'alignment:issueKindLabels', undefined)) as Record<string, string>
-      assert.equal(Object.keys(labels).length, 11)
+      assert.equal(Object.keys(labels).length, 12)
       assert.equal(labels['missing_line'], ALIGN_ISSUE_LABELS.missing_line)
+      assert.equal(labels['unarranged_line'], ALIGN_ISSUE_LABELS.unarranged_line)
       for (const value of Object.values(labels)) assert.ok(value.length > 0)
     } finally {
       h.cleanup()

@@ -32,6 +32,7 @@ import type {
   CanvasLine,
   CanvasLinePatch,
   Id,
+  LineState,
   Timestamp,
 } from '../../../../../shared/types.ts'
 import { dropUndefined } from '../../../../../shared/util/drop-undefined.ts'
@@ -421,6 +422,23 @@ export function createSqliteCanvasRepo(db: DbLike): CanvasRepo {
       const allSets = [...sets, 'rev = rev + 1', 'updated_at = ?']
       db.prepare(`UPDATE canvas_lines SET ${allSets.join(', ')} WHERE id = ?`).run(...params, ts, lineId)
       return lineFromRow(requireRow(lineId))
+    },
+
+    /**
+     * 把行推进到 `recorded`（docs/01 §210）。只前进：`recorded`/`aligned` 不动。
+     * 行不存在（或已软删除）返回 null —— **不抛错**，因为"录音成功但行已被删"是合法竞态。
+     */
+    async markLineRecorded(lineId: Id) {
+      const current = db
+        .prepare(`SELECT state FROM canvas_lines WHERE deleted_at IS NULL AND id = ?`)
+        .get(lineId) as { state: LineState } | undefined
+      if (!current) return null
+      if (current.state === 'recorded' || current.state === 'aligned') {
+        return { from: current.state, to: current.state, changed: false }
+      }
+      const ts = now()
+      db.prepare(`UPDATE canvas_lines SET state = 'recorded', rev = rev + 1, updated_at = ? WHERE id = ?`).run(ts, lineId)
+      return { from: current.state, to: 'recorded' as const, changed: true }
     },
 
     async batchUpdate(patches: Array<{ lineId: Id; patch: CanvasLinePatch }>): Promise<number> {

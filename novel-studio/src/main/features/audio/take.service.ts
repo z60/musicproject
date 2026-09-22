@@ -26,7 +26,7 @@
 import { rm } from 'node:fs/promises'
 
 import { AppError } from '../../../shared/errors.ts'
-import type { Id, Take, VoiceSegment } from '../../../shared/types.ts'
+import type { Id, LineState, Take, VoiceSegment } from '../../../shared/types.ts'
 import { computePeakDb, computeRmsDb } from '../../../shared/audio/pcm.ts'
 import type { Logger } from '../../infra/log/index.ts'
 import {
@@ -56,6 +56,12 @@ export interface TakeServiceDeps {
   segmentRepo: () => VoiceSegmentRepo
   /** 取某行的章节 id（写成品行需要它） */
   lineChapterId: (lineId: Id) => Promise<Id | null>
+  /**
+   * 成品落库后把画本行推进到 `recorded`（docs/12 §3.3 / docs/01 §210）。
+   * 与录音域同一个端口：**有成品 = 这行录过了**，状态机不能只靠录音那一侧维护
+   * （真机事故 docs/91 §5.2.44：这条通路以前完全缺失，UI 永远显示未录）。
+   */
+  markLineRecorded?: (lineId: Id) => Promise<{ from: LineState; to: LineState; changed: boolean } | null>
   newId?: (prefix: string) => Id
   now?: () => number
   log?: Pick<Logger, 'info' | 'warn' | 'error'>
@@ -128,6 +134,35 @@ export function createTakeService(deps: TakeServiceDeps): TakeService {
       filePath: saved.filePath,
       durationMs: saved.durationMs,
     })
+    /**
+     * 画本行 state → recorded（docs/12 §3.3）。失败只记日志：成品已经写好，
+     * 不能因为状态没推进就把这次「设为成品」判为失败。
+     */
+    if (deps.markLineRecorded) {
+      try {
+        const marked = await deps.markLineRecorded(lineId)
+        deps.log?.info?.('take.lineRecorded', {
+          event: 'take.lineRecorded',
+          lineId,
+          takeId: take.id,
+          changed: marked?.changed ?? false,
+          to: marked?.to ?? null,
+        })
+      } catch (e) {
+        deps.log?.warn?.('take.lineRecorded.failed', {
+          event: 'take.lineRecorded.failed',
+          lineId,
+          takeId: take.id,
+          reason: e instanceof Error ? e.message : String(e),
+        })
+      }
+    } else {
+      deps.log?.warn?.('take.lineRecorded.unwired', {
+        event: 'take.lineRecorded.unwired',
+        lineId,
+        note: '未注入 markLineRecorded：设为成品不会把画本行标成已录（docs/12 §3.3）',
+      })
+    }
     return saved
   }
 

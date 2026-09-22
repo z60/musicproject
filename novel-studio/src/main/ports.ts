@@ -28,13 +28,18 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { AppError } from '../shared/errors.ts'
-import type { AppCapabilities, AppSettings } from '../shared/types.ts'
+import type { AppCapabilities, AppSettings, LineState } from '../shared/types.ts'
 import type { HandlerDeps } from './ipc/handlers/deps.ts'
 import { createMemoryTaskStore } from './infra/queue/store.ts'
 import { TaskQueue } from './infra/queue/queue.ts'
 import type { IpcEventName, IpcEventPayload, IpcSendName, IpcSendPayload } from '../shared/ipc.ts'
 import type { Logger } from './infra/log/index.ts'
 import { createDbPort } from './db.ts'
+import { encryptSecret, decryptSecret, SECRET_PREFIX } from './infra/secure/index.ts'
+import { resolvePrimaryProvider, resolveProvider } from '../shared/ai/factory.ts'
+import { createProviderLlmReviewer } from './features/book/canvas/llm-reviewer.ts'
+import { createFetchHttpClient } from '../shared/ai/http.ts'
+import type { HttpClient } from '../shared/ai/types.ts'
 import { createBookService, type BookService } from './features/book/import/book.service.ts'
 import { createBookHandlers } from './ipc/handlers/book.ts'
 import { createChapterService } from './features/book/chapter/chapter.service.ts'
@@ -113,6 +118,11 @@ export interface BuildHandlerDepsOptions {
   }) => Promise<string | null>
   /** 退出应用（Electron app.quit / app.exit） */
   quit: (force: boolean) => void
+  /**
+   * AI Provider 探测用的 HTTP 客户端（生产默认内置 fetch）。
+   * 注入它才能在不联网的环境里验证「测试连接」的真实行为。
+   */
+  aiHttp?: HttpClient
 }
 
 /** 端口装配的结果：既返回 HandlerDeps，也返回队列与域 handler（关闭/注册时要用） */
@@ -299,6 +309,16 @@ export function buildHandlerDeps(opts: BuildHandlerDepsOptions): BuiltPorts {
     return row?.chapter_id ?? null
   }
 
+  /**
+   * 录音完成后把画本行推进到 `recorded`（docs/12 §3.3 / docs/01 §210）。
+   * 仓储方法本身保证"只前进"，这里只负责把它接到录音域（真机事故 docs/91 §5.2.44：
+   * 这一步以前完全缺失，导致录音成功但 UI 永远显示未录）。
+   */
+  async function markLineRecorded(lineId: string): Promise<{ from: LineState; to: LineState; changed: boolean } | null> {
+    // 用完整的画本行仓储（`createSqliteCanvasRepo`），不是导入域那个只写文本的窄接口
+    return createSqliteCanvasRepo(requireDbFor('record')).markLineRecorded(lineId)
+  }
+
   const analysisService = createAnalysisService({
     getDb: () => state.db,
     projectRoot: () => paths.projectRoot,
@@ -313,6 +333,7 @@ export function buildHandlerDeps(opts: BuildHandlerDepsOptions): BuiltPorts {
     takeRepo: () => createSqliteTakeRepo(requireDbFor('take')),
     segmentRepo: () => createSqliteVoiceSegmentRepo(requireDbFor('take')),
     lineChapterId,
+    markLineRecorded,
     log,
   })
   const recordService = createRecordService({
@@ -322,6 +343,7 @@ export function buildHandlerDeps(opts: BuildHandlerDepsOptions): BuiltPorts {
     takeRepo: () => createSqliteTakeRepo(requireDbFor('record')),
     segmentRepo: () => createSqliteVoiceSegmentRepo(requireDbFor('record')),
     lineChapterId,
+    markLineRecorded,
     /** 匹配切片要按行文本长度估算期望时长（docs/05 §4.2 的 charsPerSecond） */
     lineCharCounts: async (chapterId) => {
       const db = requireDbFor('record')
@@ -518,7 +540,21 @@ export function buildHandlerDeps(opts: BuildHandlerDepsOptions): BuiltPorts {
             // 这正是 docs/06 §8 的要求：「绝不因为模型缺失就阻断用户」。
             // 传一个假 provider 才是错的：那会让 `report.embeddingUsed` 说谎。
             embedProvider: null,
-            llmReviewer: null,
+            // LLM 复核（画本编辑器的「AI 复核存疑行」）：
+            // 每次生成现取设置 —— 用户可能在设置页刚改完服务商/地址/隐私开关。
+            // 没有可用配置时返回 null，由 createProviderLlmReviewer 返回空数组，
+            // 上层记 CANVAS_LLM_UNAVAILABLE 并让低置信行进待确认列表（绝不谎报 llmUsed）。
+            llmReviewer: createProviderLlmReviewer({
+              getContext: () => {
+                const ai = state.requireSettings().current().ai
+                if (!ai) return null
+                return {
+                  provider: resolveProvider(ai, { apiKey: readSecret('ai.apiKey') }),
+                  allowCloud: ai.allowSendTextToCloud,
+                  timeoutMs: ai.timeoutMs,
+                }
+              },
+            }),
             log: { info: log.info.bind(log), warn: log.warn.bind(log), error: log.error.bind(log) },
           }),
           canvasRepo,
@@ -609,6 +645,59 @@ export function buildHandlerDeps(opts: BuildHandlerDepsOptions): BuiltPorts {
     },
   })
 
+  /**
+   * 写入密钥：加密后落库（docs/04 §9）。空串 = 清除。
+   *
+   * 旧实现直接把明文交给 `setSecretRaw`，而后者又会因为 `ai.apiKey` 不在默认设置树里
+   * 而静默丢弃 —— 结果是「密钥既没加密、也没存进去」。两处都已修正。
+   */
+  function writeSecret(key: string, value: string): void {
+    const store = state.requireSettings()
+    if (value === '') {
+      store.setSecretRaw(key, '')
+      return
+    }
+    store.setSecretRaw(key, encryptSecret(value, state.electron?.safeStorage ?? null))
+  }
+
+  /**
+   * 读取并解密密钥。**只给主进程内部用**（如 provider.test），绝不返回给渲染进程。
+   *
+   * 兼容修复前写入的历史明文（无 `v1:` 前缀）：先原样返回，再顺手加密回写，
+   * 让用户的密钥不再继续裸存；平台不支持安全存储时保持明文，不阻断读取。
+   */
+  function readSecret(key: string): string | null {
+    const store = state.requireSettings()
+    const raw = store.getSecretRaw(key)
+    if (raw === null || raw === '') return null
+    const safeStorage = state.electron?.safeStorage ?? null
+
+    if (!raw.startsWith(SECRET_PREFIX)) {
+      try {
+        store.setSecretRaw(key, encryptSecret(raw, safeStorage))
+      } catch {
+        /* 加密不可用：保持明文，能力位会告知用户 */
+      }
+      return raw
+    }
+
+    try {
+      return decryptSecret(raw, safeStorage, {
+        onDecryptFailed: () => {
+          // 换机器/换用户导致解密失败 → 清除并让用户重新输入（docs/04 §9）
+          store.setSecretRaw(key, '')
+        },
+      })
+    } catch (e) {
+      log.warn('settings.secret.decryptFailed', {
+        event: 'settings.secret.decryptFailed',
+        key,
+        reason: e instanceof Error ? e.message : String(e),
+      })
+      return null
+    }
+  }
+
   const deps: HandlerDeps = {
     log,
     // ── 应用信息与路径（完整实现）──────────────────────────────────────────
@@ -649,11 +738,8 @@ export function buildHandlerDeps(opts: BuildHandlerDepsOptions): BuiltPorts {
       getAll: () => state.requireSettings().getAll(),
       get: (keys?: string[]) => state.requireSettings().get(keys),
       set: (patch: Record<string, unknown>) => state.requireSettings().set(patch),
-      setSecret: (key: string, value: string) => {
-        // 加密由 infra/secure 负责；密钥值本身不落明文（docs/04 §9）
-        const store = state.requireSettings()
-        store.setSecretRaw(key, value)
-      },
+      setSecret: (key: string, value: string) => writeSecret(key, value),
+      getSecret: (key: string) => readSecret(key),
       reset: (keys?: string[]) => state.requireSettings().reset(keys),
     },
 
@@ -693,16 +779,26 @@ export function buildHandlerDeps(opts: BuildHandlerDepsOptions): BuiltPorts {
       },
     },
 
-    // ── Provider 连通性测试（明确未实现）───────────────────────────────────
+    // ── Provider 连通性测试（真实最小请求，docs/06 §3.1 healthCheck）────────
     provider: {
-      test: async () => {
-        throw new AppError('NOT_IMPLEMENTED', {
-          params: { feature: 'AI Provider 连通性测试' },
-          details: {
-            reason: 'provider-test-not-implemented',
-            hint: '真实连通性测试需要按 provider 类型发起一次最小请求；当前只有 mock/local 提供者',
-          },
+      test: async (config) => {
+        const { apiKey: fromRequest, ...ai } = config
+        // 优先用界面上刚粘贴、还没保存的密钥；否则读已保存的密文并解密。
+        const apiKey = fromRequest && fromRequest.length > 0 ? fromRequest : readSecret('ai.apiKey')
+        // 只探**主** Provider：降级链的 healthCheck 是 some(ok)，链尾 LocalEcho 恒为 ok，
+        // 用它做连通性测试会永远显示「连接成功」—— 那就等于没有测试。
+        const provider = resolvePrimaryProvider(ai as AppSettings['ai'], {
+          apiKey,
+          http: opts.aiHttp ?? createFetchHttpClient(),
         })
+        const status = await provider.healthCheck()
+        log.info('provider.test.done', {
+          event: 'provider.test.done',
+          provider: provider.kind,
+          ok: status.ok,
+          latencyMs: status.latencyMs ?? null,
+        })
+        return { ok: status.ok, message: status.message, latencyMs: status.latencyMs }
       },
     },
 

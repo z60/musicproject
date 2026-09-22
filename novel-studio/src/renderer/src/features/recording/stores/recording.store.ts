@@ -130,6 +130,25 @@ export const useRecordingStore = defineStore('recording/session', () => {
     warnings.value = [...nextWarnings]
     marks.value = []
     stopResult.value = null
+    /**
+     * ⚠️ 会话镜像字段必须**随新会话清零**（真机事故 docs/91 §5.2.45）。
+     *
+     * `durationMs / framesWritten / droppedFrames` 走 `applyStatus` 的 **max 合并**，
+     * `reset()` 又只在"放弃会话"时调用 —— 正常停止后这些值不会归零。
+     * 后果：第二段开始瞬间 `store.durationMs` 还带着上一段的几千 ms，
+     * `useRecorder` 的「录满 3 秒仍无信号」检查在 t=0 就误触发
+     * （真机日志：每条会话开头都有一条 `recording.noSignal`，`droppedFrames`、
+     * 削波计数同理会串段）。
+     * 状态本身不在这里设 —— 等主进程 `record:status`（store 纪律 1 不受影响）。
+     */
+    framesWritten.value = 0
+    durationMs.value = 0
+    droppedFrames.value = 0
+    rmsDb.value = null
+    peakDb.value = null
+    clipping.value = false
+    clipEvents.value = 0
+    overloadBlocks.value = 0
     // 注意：这里**不设置 state** —— 等主进程的 record:status 事件
   }
 

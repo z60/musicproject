@@ -113,6 +113,7 @@ export const ARRANGE_DEFAULTS = {
  */
 export const ALIGN_ISSUE_LABELS: Record<
   | 'missing_line'
+  | 'unarranged_line'
   | 'orphan_segment'
   | 'same_track_overlap'
   | 'cross_track_overlap_warn'
@@ -126,6 +127,7 @@ export const ALIGN_ISSUE_LABELS: Record<
   string
 > = {
   missing_line: '缺录（画本行没有录音）',
+  unarranged_line: '有录音但未排布（重新自动排布即可归位）',
   orphan_segment: '孤儿片段（画本行已删除）',
   same_track_overlap: '同轨重叠（必须消解）',
   cross_track_overlap_warn: '跨轨重叠过大',
@@ -139,7 +141,13 @@ export const ALIGN_ISSUE_LABELS: Record<
 }
 
 /** 阻断项（必须处理才能导出）—— 与 `shared/arrange/validate.ts` 的 `isBlockingIssue` 一致 */
-export const ALIGN_BLOCKING_ISSUES = ['missing_line', 'same_track_overlap', 'file_missing'] as const
+export const ALIGN_BLOCKING_ISSUES = [
+  'missing_line',
+  // 有录音却没排进方案 → 渲染/导出会丢掉这段音频，和缺录一样是阻断项
+  'unarranged_line',
+  'same_track_overlap',
+  'file_missing',
+] as const
 
 /** 停顿推断表（docs/11 §2.3） */
 export const PAUSE_RULES: Array<{ label: string; match: string; pauseMs: number }> = [

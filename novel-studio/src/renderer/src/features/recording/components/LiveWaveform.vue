@@ -24,6 +24,7 @@ import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vu
 import {
   amplitudeToY,
   computeDirtyRect,
+  peakPairsToEnvelope,
   timeRangeToDirtyRect,
   timeToX,
 } from '@/shared/lib/waveform-transform.ts'
@@ -83,6 +84,12 @@ let writtenColumns = 0
 let pending = new Float32Array(0)
 let pendingLength = 0
 let sampleRateRef = 48000
+/** take 预览模式：未录音时显示当前行选中 take 的整段波形（docs/91 §5.2.46 / §5.2.47） */
+const takeMode = ref(false)
+const takeTotalMs = ref(0)
+/** take 预览时每列代表的时长（主进程 peaks 的桶宽；实时模式恒为 COLUMN_MS） */
+const takeColumnMs = ref(COLUMN_MS)
+const columnMs = (): number => (takeMode.value ? takeColumnMs.value : COLUMN_MS)
 
 let rafId: number | null = null
 let context: CanvasRenderingContext2D | null = null
@@ -90,19 +97,19 @@ let renderedNowMs = 0
 let needsFullRedraw = true
 
 const viewport = computed<Viewport>(() => {
-  const windowMs = props.windowMs > 0 ? props.windowMs : 5000
+  const windowMs = takeMode.value && takeTotalMs.value > 0 ? takeTotalMs.value : props.windowMs > 0 ? props.windowMs : 5000
   const pxPerMs = widthPx.value / windowMs
-  const nowMs = writtenColumns * COLUMN_MS
-  return { pxPerMs, scrollMs: Math.max(0, nowMs - windowMs) }
+  const nowMs = writtenColumns * columnMs()
+  // take 预览：固定从 0 开始看整段；实时：自动滚到最新
+  return { pxPerMs, scrollMs: takeMode.value ? 0 : Math.max(0, nowMs - windowMs) }
 })
 
 const elapsedMs = computed(() => writtenColumns * COLUMN_MS)
 const hasData = computed(() => writtenColumns > 0)
 const isEmptyHint = computed(() => !props.active && !hasData.value)
 
-/** 环形缓冲重建（列数变化 = 窗口长度变化） */
-function rebuildRing(): void {
-  const nextColumns = Math.max(64, Math.ceil(props.windowMs / COLUMN_MS))
+/** 环形缓冲重建（列数变化 = 窗口长度变化）；列数可由调用方指定（take 预览用整段列数） */
+function rebuildRing(nextColumns: number = Math.max(64, Math.ceil(props.windowMs / COLUMN_MS))): void {
   if (nextColumns === columnCount.value && ring.value.length) return
   columnCount.value = nextColumns
   ring.value = new Float32Array(nextColumns * 2)
@@ -129,6 +136,8 @@ function writeColumn(min: number, max: number): void {
  */
 function pushBlock(samples: Float32Array, sampleRate = props.sampleRate): void {
   if (!samples.length) return
+  // 一旦有实时采集块进来，就退出 take 预览（录音期间显示的是实时流）
+  if (takeMode.value) clearTake()
   if (sampleRate !== sampleRateRef) sampleRateRef = sampleRate
   const columnFrames = Math.max(1, Math.round((sampleRate * COLUMN_MS) / 1000))
 
@@ -179,6 +188,47 @@ function reset(): void {
     context.clearRect(0, 0, widthPx.value, canvasHeight.value)
     drawEmpty()
   }
+}
+
+/**
+ * take 预览：把主进程 `analysis:peaks` 的峰值铺进波形区（docs/91 §5.2.46 / §5.2.47）。
+ *
+ * `peaks` 是 **min/max 交替、归一化到 [-1,1]** 的数组（契约见 `analysis:peaks`），
+ * `totalMs` 是这段音频的时长（时间轴右端）。
+ *
+ * 为什么不用 `fetch(ns-media://…) + decodeAudioData`：渲染进程 CSP 是
+ * `connect-src 'self'`（docs/02 §3：渲染进程不直接访问外部资源，全部经主进程），
+ * 自定义协议的音频**读不出来** —— 真机事故 docs/91 §5.2.47 就是这么踩的。
+ */
+function showPeaks(peaks: ArrayLike<number>, totalMs: number): void {
+  const envelope = peakPairsToEnvelope(peaks)
+  const buckets = envelope.length
+  if (buckets <= 0) return
+  takeMode.value = true
+  takeTotalMs.value = Math.max(1000, Math.round(totalMs))
+  takeColumnMs.value = takeTotalMs.value / buckets
+  rebuildRing(buckets)
+  writeIndex = 0
+  writtenColumns = 0
+  pending = new Float32Array(0)
+  pendingLength = 0
+  for (const col of envelope) writeColumn(col.min, col.max)
+  renderedNowMs = 0
+  needsFullRedraw = true
+}
+
+/**
+ * 退出 take 预览并**清空画面**（回到空态）。
+ *
+ * ⚠️ 必须无条件重置：以前写成"只在 take 模式下才 reset"，于是实时波形留下的
+ * 上一次内容在切行时**永远不会被清掉**（真机反馈 docs/91 §5.2.47：
+ * 「点击下一行还未实现重置实时波形」）。
+ */
+function clearTake(): void {
+  takeMode.value = false
+  takeTotalMs.value = 0
+  takeColumnMs.value = COLUMN_MS
+  reset()
 }
 
 /** 设备像素比适配：canvas 内部分辨率 = CSS 像素 × dpr（否则高分屏上波形发虚） */
@@ -248,12 +298,13 @@ function drawRegion(x0: number, x1: number): void {
   const vp = viewport.value
   const buffer = ring.value
   if (buffer.length && writtenColumns > 0) {
-    const pxPerColumn = Math.max(1, COLUMN_MS * vp.pxPerMs)
-    const firstColumn = Math.max(0, Math.floor(vp.scrollMs / COLUMN_MS))
+    const col = columnMs()
+    const pxPerColumn = Math.max(1, col * vp.pxPerMs)
+    const firstColumn = Math.max(0, Math.floor(vp.scrollMs / col))
     const lastColumn = writtenColumns - 1
     context.fillStyle = props.clipping ? 'rgba(245, 108, 108, 0.85)' : 'rgba(64, 158, 255, 0.85)'
     for (let k = firstColumn; k <= lastColumn; k++) {
-      const x = timeToX(k * COLUMN_MS, vp)
+      const x = timeToX(k * col, vp)
       if (x + pxPerColumn < left || x > right) continue
       const ringIndex = (k % columnCount.value) * 2
       const min = buffer[ringIndex] ?? 0
@@ -377,15 +428,17 @@ function onWindowChange(event: Event): void {
   emit('window-change', value)
 }
 
-defineExpose({ pushBlock, reset })
+defineExpose({ pushBlock, reset, showPeaks, clearTake })
 </script>
 
 <template>
   <div ref="containerRef" class="ns-wave">
     <header class="ns-wave__head">
-      <span class="ns-wave__title">实时波形</span>
+      <span class="ns-wave__title">{{ takeMode ? '当前 take 波形' : '实时波形' }}</span>
       <span class="ns-wave__meta">{{ formatSampleRate(sampleRate) }} · 每列 5 ms</span>
-      <span class="ns-wave__meta">已录 {{ (elapsedMs / 1000).toFixed(1) }} s</span>
+      <span class="ns-wave__meta">
+        {{ takeMode ? `take 时长 ${(takeTotalMs / 1000).toFixed(1)} s` : `已录 ${(elapsedMs / 1000).toFixed(1)} s` }}
+      </span>
       <span v-if="clipping" class="ns-wave__meta ns-wave__meta--bad">削波</span>
       <span v-else-if="active && !paused" class="ns-wave__meta ns-wave__meta--live">采集流</span>
       <label class="ns-wave__field">
@@ -400,6 +453,7 @@ defineExpose({ pushBlock, reset })
 
     <footer class="ns-wave__foot">
       <span v-if="paused">已暂停：波形停止滚动（暂停期间不写盘）</span>
+      <span v-else-if="takeMode">显示选中／刚录制的 take 波形；没有 take 时这里为空</span>
       <span v-else-if="!active">未录音：显示上一次会话留下的波形</span>
       <span v-else>滚动显示最近 {{ windowMs / 1000 }} 秒；总时长 {{ (durationMs / 1000).toFixed(1) }} s</span>
     </footer>

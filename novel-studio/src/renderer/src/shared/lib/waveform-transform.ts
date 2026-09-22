@@ -387,3 +387,29 @@ export const TIMELINE_ZOOM_LIMITS = {
   minPxPerMs: 0.0002,
   maxPxPerMs: 2,
 } as const
+
+/** 一段音频折叠成的 min/max 列（波形显示的原始数据，不含像素信息） */
+export interface ColumnEnvelope {
+  min: number
+  max: number
+}
+
+/**
+ * `analysis:peaks` 的载荷 → min/max 列。
+ *
+ * 契约（`src/shared/ipc.ts` 的 `analysis:peaks`）：`peaks` 是 **min/max 交替、
+ * 按 int16/32767 归一化到 [-1,1]** 的数组，`totalPeaks` = 桶数 = `peaks.length / 2`。
+ *
+ * 越界值夹到 [-1,1]：理论上主进程不会给出越界值，但截断/异常数据不该让画布
+ * 画出屏幕外的柱子（`amplitudeToY` 只在 [-1,1] 上有定义）。
+ */
+export function peakPairsToEnvelope(peaks: ArrayLike<number>): ColumnEnvelope[] {
+  const buckets = Math.floor((peaks?.length ?? 0) / 2)
+  const out: ColumnEnvelope[] = []
+  for (let b = 0; b < buckets; b++) {
+    const min = Math.max(-1, Math.min(1, peaks[b * 2] ?? 0))
+    const max = Math.max(-1, Math.min(1, peaks[b * 2 + 1] ?? 0))
+    out.push({ min, max })
+  }
+  return out
+}

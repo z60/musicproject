@@ -128,7 +128,9 @@ describe('排布：顺序与 cursor 递推', () => {
     assert.deepEqual(items.map(i => i.timelineStartMs), [0, 1510, 3020])
   })
 
-  it('多轨各自从 0 开始（跨轨重叠是设计内的正常对话）', () => {
+  it('多轨按画本 seq 全局串行：角色音落在它该在的位置（不各自从 0 开始）', () => {
+    // 回归：曾经「每条轨道各自从 0 开始」，渲染是 adelay + amix（绝对时间），
+    // 于是角色第一句会和旁白第一句**同时播**——真机表现「叶海本该在中间，却跑到最前面」。
     const { items } = autoArrange({
       arrangementId: 'arr-1',
       lines: [
@@ -140,8 +142,25 @@ describe('排布：顺序与 cursor 递推', () => {
     })
     const narr = items.filter(i => i.trackId === NARRATION)
     const charA = items.filter(i => i.trackId === CHAR_A)
-    assert.deepEqual(narr.map(i => i.timelineStartMs), [0, 1510])
-    assert.deepEqual(charA.map(i => i.timelineStartMs), [0, 1510], '另一条轨也从 0 开始')
+    // n1(0) → a1(1510) → n2(3020) → a2(4530)
+    assert.deepEqual(narr.map(i => i.timelineStartMs), [0, 3020])
+    assert.deepEqual(charA.map(i => i.timelineStartMs), [1510, 4530], '角色音必须在中间，不能跑到最前面')
+    // 轨内顺序号仍按各轨自增
+    assert.deepEqual(charA.map(i => i.orderInTrack), [0, 1])
+  })
+
+  it('★★ 角色第一次出场在第 N 句 → 它的起点等于前 N-1 句的总时长（真机「叶海跑到最前面」）', () => {
+    const lines = [
+      line({ lineId: 'n1', seq: 1, trackId: NARRATION }),
+      line({ lineId: 'n2', seq: 2, trackId: NARRATION }),
+      line({ lineId: 'a1', seq: 3, trackId: CHAR_A }),
+      line({ lineId: 'n3', seq: 4, trackId: NARRATION }),
+    ]
+    const { items } = autoArrange({ arrangementId: 'arr-1', lines })
+    const yehai = items.find(i => i.lineId === 'a1')!
+    // 两句旁白各 1010 ms + 两次留白 500 ms = 3020
+    assert.equal(yehai.timelineStartMs, 3020, '叶海应出现在中间，而不是 0')
+    assert.ok(yehai.timelineStartMs > 0)
   })
 
   it('片段裁剪点参与用时计算', () => {

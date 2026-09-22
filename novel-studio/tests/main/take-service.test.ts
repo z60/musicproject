@@ -53,6 +53,8 @@ interface Harness {
   db: DatabaseSync
   take: TakeService
   handlers: ReturnType<typeof createAudioHandlers>
+  /** 「设为成品」时推进过画本行状态的记录（docs/91 §5.2.44） */
+  marked: Array<{ lineId: string; to: string }>
   cleanup: () => void
 }
 
@@ -100,6 +102,12 @@ async function harness(): Promise<Harness> {
 
   const scope = createAudioProjectScope({ getDb: () => dbLike })
 
+  /**
+   * 记录"设为成品时有没有推进画本行状态"（真机事故 docs/91 §5.2.44）。
+   * 真实现会写库；这里只记录调用，断言用。
+   */
+  const marked: Array<{ lineId: string; to: string }> = []
+
   const take = createTakeService({
     projectRoot: () => root,
     scope,
@@ -110,6 +118,16 @@ async function harness(): Promise<Harness> {
         | { chapter_id: string }
         | undefined
       return row?.chapter_id ?? null
+    },
+    markLineRecorded: async (lineId) => {
+      const before = db.prepare(`SELECT state FROM canvas_lines WHERE id = ?`).get(lineId) as { state: string } | undefined
+      if (!before) return null
+      if (before.state === 'recorded' || before.state === 'aligned') {
+        return { from: before.state as never, to: before.state as never, changed: false }
+      }
+      db.prepare(`UPDATE canvas_lines SET state = 'recorded' WHERE id = ?`).run(lineId)
+      marked.push({ lineId, to: 'recorded' })
+      return { from: before.state as never, to: 'recorded' as never, changed: true }
     },
     newId: (() => {
       let n = 0
@@ -130,6 +148,7 @@ async function harness(): Promise<Harness> {
     root,
     db,
     take,
+    marked,
     handlers: createAudioHandlers({
       analysis,
       device,
@@ -275,6 +294,28 @@ describe('Take 域 · 设为成品（take:setSelected）', () => {
 
       const rows = h.db.prepare(`SELECT COUNT(*) AS n FROM voice_segments WHERE line_id = 'l1'`).get() as { n: number }
       assert.equal(rows.n, 1)
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  /**
+   * 真机事故 docs/91 §5.2.44：设为成品同样意味着"这行录过了"，
+   * 必须把画本行推进到 recorded —— 否则画本表格永远没有 ✓。
+   * （这条通路也是用户修复"已有 take 但行状态还是 draft"的入口。）
+   */
+  it('设为成品要把画本行标成 recorded（画本表格的 ✓ / 章节进度都靠它）', async () => {
+    const h = await harness()
+    try {
+      seedTake(h, { id: 't1', seconds: 0.2, amplitude: 0.5 })
+      const before = h.db.prepare(`SELECT state FROM canvas_lines WHERE id = 'l1'`).get() as { state: string }
+      assert.notEqual(before.state, 'recorded', '前置：这一行原本不是已录')
+
+      await call(h, 'take:setSelected', { lineId: 'l1', takeId: 't1' })
+
+      const after = h.db.prepare(`SELECT state FROM canvas_lines WHERE id = 'l1'`).get() as { state: string }
+      assert.equal(after.state, 'recorded', '设为成品后画本行必须是 recorded')
+      assert.deepEqual(h.marked, [{ lineId: 'l1', to: 'recorded' }], '只推进一次')
     } finally {
       h.cleanup()
     }

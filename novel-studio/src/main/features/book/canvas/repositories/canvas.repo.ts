@@ -21,6 +21,7 @@ import type {
   CanvasLine,
   CanvasLinePatch,
   Id,
+  LineState,
   Timestamp,
 } from '../../../../../shared/types.ts'
 import { definedKeys, dropUndefined } from '../../../../../shared/util/drop-undefined.ts'
@@ -86,6 +87,21 @@ export interface CanvasRepo {
   updateLine(lineId: Id, patch: CanvasLinePatch, expectedRev?: number): Promise<CanvasLine>
   /** 批量更新（一个事务），返回更新行数；docs/21 的 check 约束在实现里也要保住 */
   batchUpdate(patches: Array<{ lineId: Id; patch: CanvasLinePatch }>): Promise<number>
+  /**
+   * 把画本行推进到 `recorded`（docs/01 §210 的状态机：`draft/assigned ──record──▶ recorded`）。
+   *
+   * 为什么单独开一个方法，而不是给 `CanvasLinePatch` 加一个 `state` 字段：
+   *   `state` 是**录音/对轨流程推进的结果**，不是用户在画本表格里手填的字段。
+   *   放进入参补丁，等于允许渲染进程把任意行改成任意状态（包括把 `aligned` 退回 `draft`）。
+   *   这里只允许**前进**：已经是 `recorded`/`aligned` 就不动（`changed=false`）。
+   *
+   * 真机事故 docs/91 §5.2.44：录音成功、take 与 segment 都写好了，但**没有任何地方**
+   * 写这个状态 —— 于是画本表格没有 ✓、章节进度 `recorded_count` 恒为 0、QC 统计
+   * 「已录行 0」，用户看到的就是「停止后没有把当前录制的保存」。
+   *
+   * 返回 null = 行不存在（或已软删除）。
+   */
+  markLineRecorded(lineId: Id): Promise<{ from: LineState; to: LineState; changed: boolean } | null>
   /** 软删除（docs/11 §4.7：批量删除是软删除，可恢复） */
   softDeleteLines(lineIds: Id[]): Promise<number>
   restoreLines(lineIds: Id[]): Promise<number>
@@ -277,6 +293,16 @@ export function createMemoryCanvasRepo(seed?: { lines?: CanvasLine[]; now?: () =
         n++
       }
       return n
+    },
+
+    async markLineRecorded(lineId) {
+      const rec = lines.get(lineId)
+      if (!rec || rec.deletedAt != null) return null
+      const from = rec.line.state
+      // 只前进：recorded / aligned 都是「已录」的终态，不许被这次录音改回去
+      if (from === 'recorded' || from === 'aligned') return { from, to: from, changed: false }
+      rec.line = { ...rec.line, state: 'recorded', rev: rec.line.rev + 1, updatedAt: now() }
+      return { from, to: 'recorded', changed: true }
     },
 
     async softDeleteLines(lineIds) {

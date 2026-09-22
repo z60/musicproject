@@ -29,8 +29,12 @@ declare global {
       send<S extends IpcSendName>(channel: S, payload: IpcSendPayload<S>): void
       /** 订阅事件，返回取消订阅函数（必须调用，否则组件卸载后泄漏） */
       on<E extends IpcEventName>(event: E, handler: (payload: IpcEventPayload<E>) => void): () => void
-      /** 把录音音频的 MessagePort 交给主进程（零拷贝通道） */
-      attachRecordPort(port: MessagePort): void
+      /** 建立录音音频通道：通道由 **preload 侧**创建，渲染进程不碰 MessagePort（docs/91 §5.2.41） */
+      attachRecordPort(): void
+      /** 送出一块 PCM 到主进程（转移 ArrayBuffer；false = 通道还没建立） */
+      sendRecordPcm(buffer: ArrayBuffer, frames: number): boolean
+      /** 关闭录音音频通道（会话结束 / 释放采集时调用） */
+      detachRecordPort(): void
       /** 构造 ns-media:// URL 以读取项目内音频（主进程侧做路径校验） */
       mediaUrl(projectId: string, relPath: string): string
     }

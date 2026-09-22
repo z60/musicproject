@@ -408,7 +408,12 @@ export type IpcEventPayload<E extends IpcEventName> = IpcEventMap[E]
 
 /** 渲染 → 主的单向发送通道（高频、可丢弃） */
 export interface IpcSendMap {
-  'record:meter': { sessionId: Id; rmsDb: number; peakDb: number; frames: number }
+  /**
+   * `claimedFrames` = 渲染侧**累计**已转投主进程的帧数（不是单块帧数）。
+   * 主进程拿它与「落盘 + 内存」的帧数核对丢帧 —— 两条通道独立，故意如此
+   * （端口整体失效时只有这条能发现，docs/91 §5.2.41）。
+   */
+  'record:meter': { sessionId: Id; rmsDb: number; peakDb: number; claimedFrames: number }
   'record:mark': { sessionId: Id; kind: 'cut' | 'retake' | 'note'; atMs: number }
 }
 

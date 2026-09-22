@@ -450,6 +450,7 @@ export function createAlignmentService(deps: AlignmentServiceDeps): AlignmentSer
         arrangementId,
         items: items.length,
         missingLines: validation.missingLines.length,
+        unarrangedLines: validation.unarrangedLines.length,
         sameTrackOverlaps: validation.sameTrackOverlaps.length,
         issues: validation.issues.length,
         totalDurationMs: validation.totalDurationMs,
@@ -515,15 +516,17 @@ export function createAlignmentService(deps: AlignmentServiceDeps): AlignmentSer
         })
         return { items: all }
       }
-      // 单轨重排：只重排这一轨，其它轨的位置保持不动（docs/13 §4.7「解锁并重排」）
+      // 单轨重排：只**替换**这一轨的条目，但排布必须按**全章全局**算。
+      // `timelineStartMs` 是绝对时间线位置（渲染用 adelay + amix），单轨若按自己从 0 排
+      // 就会和旁白/其它角色叠在一起（真机：角色音跑到最前面）。
+      // 因此对全章跑一次自动排布，只把目标轨的结果写回；其它轨的条目原地不动。
       const lines = await deps.lines.listByChapter(arrangement.chapterId)
-      const trackLines = lines.filter((l) => l.trackId === trackId)
       const byLine = new Map(all.map((it) => [it.lineId, it] as const))
       const segments = await deps.segments.listByChapter(arrangement.chapterId)
       const segById = new Map(segments.map((s) => [s.segmentId, s] as const))
       const result = autoArrange({
         arrangementId,
-        lines: trackLines.map((l) => {
+        lines: lines.map((l) => {
           const item = byLine.get(l.lineId) ?? null
           const seg = l.segmentId ? (segById.get(l.segmentId) ?? null) : null
           return {
@@ -535,15 +538,26 @@ export function createAlignmentService(deps: AlignmentServiceDeps): AlignmentSer
             srcOutMs: seg?.durationMs ?? 0,
             pauseAfterMs: l.pauseAfterMs,
             characterPauseMs: l.characterPauseMs,
-            // 重置就该丢掉人工位置（这正是「重置」的语义）
-            existing: item ? { id: item.id, timelineStartMs: item.timelineStartMs, locked: false } : null,
+            // 目标轨：重置就该丢掉人工位置（locked: false → 由全局 cursor 重算）。
+            // 其它轨：把它们的**当前位置**当作固定锚点（locked: true），
+            // 这样「重置这一轨」得到的是「相对当前时间线，这一轨本该在哪」。
+            existing: item
+              ? l.trackId === trackId
+                ? { id: item.id, timelineStartMs: item.timelineStartMs, locked: false }
+                : { id: item.id, timelineStartMs: item.timelineStartMs, locked: true }
+              : null,
           } satisfies ArrangeLineInput
         }),
         defaultPauseMs: ARRANGE_DEFAULTS.defaultPauseMs,
         defaultFadeMs: ARRANGE_DEFAULTS.defaultFadeMs,
         idFactory: () => newId('item'),
       })
-      const items = await repo.replaceItems(arrangementId, result.items, { trackId })
+      // 只写回目标轨的条目（replaceItems 的 trackId 语义 = 删这一轨再写这一轨）
+      const items = await repo.replaceItems(
+        arrangementId,
+        result.items.filter((it) => it.trackId === trackId),
+        { trackId },
+      )
       await repo.updateSummary(arrangementId, { totalDurationMs: computeChapterDuration(items) })
       deps.log?.info?.('alignment.trackReset', {
         event: 'alignment.trackReset',

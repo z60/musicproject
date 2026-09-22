@@ -162,7 +162,12 @@ async function onCountdownCancel(): Promise<void> {
 /** 开始前走倒计时（settings.audio.countdownMs；0 = 立即开始，docs/12 §3.2） */
 function requestRecord(): void {
   if (recording.diskLow) { pageNotice.value = '磁盘空间不足：请清理后重试。'; return }
-  countdown.request(settings.audio?.countdownMs ?? 0)
+  /**
+   * ⚠️ 返回值必须兑现（真机事故 docs/91 §5.2.45，与 RecordingView 同一个坑）：
+   * `countdown.request(0)` 返回 false = 没有倒计时，**必须立即开录**。
+   */
+  const counting = countdown.request(settings.audio?.countdownMs ?? 0)
+  if (!counting) void beginRecording()
 }
 async function toggleRecord(): Promise<void> {
   if (recording.isRecording) { await stopRecording(); return }

@@ -47,8 +47,10 @@ import { selfCheckHandlers } from '../../src/main/ipc/handlers/index.ts'
 import { loadMigrations } from '../../src/main/infra/db/migrations/index.ts'
 import { migrate } from '../../src/main/infra/db/migrate.ts'
 import type { DbLike } from '../../src/main/infra/db/types.ts'
-import type { IpcMainLike, IpcMainInvokeEventLike } from '../../src/main/infra/electron/types.ts'
+import type { IpcMainLike, IpcMainInvokeEventLike, SafeStorageLike } from '../../src/main/infra/electron/types.ts'
 import type { Logger } from '../../src/main/infra/log/index.ts'
+import type { HandlerDeps } from '../../src/main/ipc/handlers/deps.ts'
+import type { HttpClient, HttpRequest } from '../../src/shared/ai/types.ts'
 
 // ---------------------------------------------------------------------------
 // 测试台：真库 + 真设置 + 假 ipcMain
@@ -58,11 +60,19 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..', '..')
 
 interface Wired {
   state: AppState
+  /** 真实装配出来的 HandlerDeps（域服务 + 各端口），用于端口级测试 */
+  deps: HandlerDeps
   /** 已注册通道 → 真实注册表包装后的调用函数（内含 schema 校验与错误包装） */
   invoke: (channel: string, payload?: unknown) => Promise<IpcResult<unknown>>
   registered: string[]
   impl: ReturnType<typeof registerAllHandlers>
   cleanup: () => void
+}
+
+/** 可注入的测试替身：AI 探测用的 HTTP 客户端与 safeStorage 虚拟实现 */
+interface WireOptions {
+  aiHttp?: HttpClient
+  safeStorage?: SafeStorageLike
 }
 
 function silentLogger(): Logger {
@@ -85,7 +95,7 @@ function silentLogger(): Logger {
   return stub as unknown as Logger
 }
 
-async function wire(): Promise<Wired> {
+async function wire(options: WireOptions = {}): Promise<Wired> {
   const root = mkdtempSync(join(tmpdir(), 'ns-ports-'))
   const dbPath = join(root, 'novel-studio.db')
 
@@ -101,6 +111,10 @@ async function wire(): Promise<Wired> {
            VALUES ('c1', 'b1', 1, '第一章', 'chapter', '正文', 2, 0, 2, 'none', 0, 1, 1)`)
 
   const state = createAppState()
+  if (options.safeStorage) {
+    // 只用到 safeStorage；其余 Electron 能力在 ports 里都是 `?.` 访问，不会被触碰
+    state.electron = { safeStorage: options.safeStorage } as unknown as AppState['electron']
+  }
   state.db = db as unknown as DbLike
   state.dbPath = dbPath
   state.paths = {
@@ -138,6 +152,7 @@ async function wire(): Promise<Wired> {
     pickFiles: async () => [],
     pickSavePath: async () => null,
     quit: () => undefined,
+    ...(options.aiHttp ? { aiHttp: options.aiHttp } : {}),
   })
 
   // 假 ipcMain：只把「注册进来的监听器」记下来，调用时走注册表的真实包装
@@ -171,6 +186,7 @@ async function wire(): Promise<Wired> {
 
   return {
     state,
+    deps: built.deps,
     registered: [...listeners.keys()],
     impl,
     invoke: async (channel, payload) => {
@@ -487,6 +503,111 @@ describe('装配层接线 · 画本通道真的能跑', () => {
       })
       assert.equal(res.ok, true, JSON.stringify(res))
       assert.ok((res.data as { taskId: string }).taskId)
+    } finally {
+      w.cleanup()
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ④ AI 设置：密钥落库 + 真实「测试连接」
+// ---------------------------------------------------------------------------
+
+/** 假 safeStorage：可逆变换，便于断言「库里不是明文」 */
+function fakeSafeStorage(): SafeStorageLike {
+  return {
+    isEncryptionAvailable: () => true,
+    encryptString: (plain: string) => Buffer.from('enc:' + plain, 'utf8'),
+    decryptString: (buf: Buffer) => {
+      const s = Buffer.from(buf).toString('utf8')
+      if (!s.startsWith('enc:')) throw new Error('bad cipher')
+      return s.slice(4)
+    },
+  }
+}
+
+describe('装配层接线 · AI 密钥与连通性测试', () => {
+  it('settings:setSecret 加密落库，且 provider.test 能用解密后的密钥发请求', async () => {
+    const requests: HttpRequest[] = []
+    const http: HttpClient = {
+      request: async (req) => {
+        requests.push(req)
+        return { status: 200, ok: true, json: { data: [] } }
+      },
+    }
+    const w = await wire({ safeStorage: fakeSafeStorage(), aiHttp: http })
+    try {
+      w.deps.settings.setSecret('ai.apiKey', 'sk-secret-value')
+
+      // 1) 密文落库：库里不得出现明文
+      const row = w.state.requireDb()
+        .prepare("SELECT value, is_secret FROM settings WHERE key = 'ai.apiKey'")
+        .get() as { value: string; is_secret: number } | undefined
+      assert.ok(row, '密钥必须真的写进 settings 表')
+      assert.equal(Number(row.is_secret), 1, '密钥行必须 is_secret = 1')
+      assert.equal(row.value.includes('sk-secret-value'), false, '库里不得出现明文密钥')
+
+      // 2) 主进程内部能解密读回
+      assert.equal(w.deps.settings.getSecret('ai.apiKey'), 'sk-secret-value')
+
+      // 3) provider.test 自动带上已保存的密钥
+      const result = await w.deps.provider.test({
+        provider: 'openai-compatible',
+        baseUrl: 'http://127.0.0.1:11434/v1',
+        model: 'qwen',
+        timeoutMs: 3000,
+        maxConcurrency: 1,
+        allowSendTextToCloud: true,
+      })
+      assert.equal(result.ok, true, result.message)
+      assert.equal(requests[0]?.headers?.authorization, 'Bearer sk-secret-value')
+    } finally {
+      w.cleanup()
+    }
+  })
+
+  it('provider.test 对不可达端点如实返回 ok: false（不再永远「连接成功」）', async () => {
+    const http: HttpClient = {
+      request: async () => { throw new Error('connect ECONNREFUSED 127.0.0.1:9') },
+    }
+    const w = await wire({ aiHttp: http })
+    try {
+      const result = await w.deps.provider.test({
+        provider: 'openai-compatible',
+        baseUrl: 'http://127.0.0.1:9/v1',
+        model: 'qwen',
+        timeoutMs: 1000,
+        maxConcurrency: 1,
+        allowSendTextToCloud: false,
+      })
+      assert.equal(result.ok, false)
+      assert.match(result.message, /ECONNREFUSED/)
+    } finally {
+      w.cleanup()
+    }
+  })
+
+  it('provider.test 优先用界面刚粘贴、还没保存的密钥', async () => {
+    const requests: HttpRequest[] = []
+    const http: HttpClient = {
+      request: async (req) => {
+        requests.push(req)
+        return { status: 200, ok: true, json: { data: [] } }
+      },
+    }
+    const w = await wire({ aiHttp: http })
+    try {
+      const result = await w.deps.provider.test({
+        provider: 'openai-compatible',
+        baseUrl: 'http://127.0.0.1:11434/v1',
+        model: 'qwen',
+        timeoutMs: 3000,
+        maxConcurrency: 1,
+        allowSendTextToCloud: true,
+        apiKey: 'sk-typed-just-now',
+      })
+      assert.equal(result.ok, true)
+      assert.equal(requests[0]?.headers?.authorization, 'Bearer sk-typed-just-now')
     } finally {
       w.cleanup()
     }

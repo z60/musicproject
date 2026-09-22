@@ -7,6 +7,13 @@
     <!--
       CSP 严格模式（见 docs/02 §3）：
         · script-src 不允许 unsafe-inline/unsafe-eval
+        · **script-src 必须允许 blob:**：采集用的 AudioWorklet 处理器是用
+          `Blob → URL.createObjectURL → audioWorklet.addModule(blob:…)` 加载的
+          （自包含、不依赖打包器额外产出一个 worker 文件）。漏掉 blob: 的后果是
+          `addModule` 直接失败、**录音永远"没有声音"**：真机事故里 9 个录音会话
+          全部 0 时长被 abort，而 Chromium 把这种失败报成 `AbortError`
+          （看起来像"用户取消"），界面上什么都没说（docs/91 §5.2.40）。
+        · `worker-src 'self' blob:` 同理（AudioWorklet 在规范上归属 worker 类）
         · style-src 需要 unsafe-inline：Element Plus 与 Vue SFC 的 <style> 会注入内联样式
         · media-src/img-src 允许 blob: 与 ns-media:（录音试听与波形读取走自定义协议）
         · connect-src 'self'：渲染进程不直接访问外网，全部经主进程
@@ -17,7 +24,8 @@
       http-equiv="Content-Security-Policy"
       content="
         default-src 'self';
-        script-src 'self';
+        script-src 'self' blob:;
+        worker-src 'self' blob:;
         style-src 'self' 'unsafe-inline';
         img-src 'self' data: blob: ns-media:;
         media-src 'self' blob: ns-media:;

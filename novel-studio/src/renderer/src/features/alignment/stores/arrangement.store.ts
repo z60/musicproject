@@ -455,11 +455,27 @@ export const useArrangementStore = defineStore('alignment/arrangement', () => {
     return mixProjects.value.filter(p => p.arrangementId === id)
   })
 
-  /** 缺录行数（底部状态条与校验按钮上的角标） */
+  /**
+   * 缺录行数（底部状态条与校验按钮上的角标）。
+   *
+   * **不能只看「方案里有没有条目」**：那是「未排布」，不是「缺录」。
+   * 真机事故：一章 87 行、87 个片段全录完，但因为还没有对轨方案，
+   * 这个计数把整章都算成缺录，显示「缺录 87 行」——用户以为录音丢了。
+   *
+   * 缺录的权威定义是「没有 voice_segments」。渲染侧没有片段表，因此用两个等价信号兜底：
+   *   · 该行有 take（takelist 已加载，且选中 take 是录音域写入的权威选择）
+   *   · 画本行状态已是 recorded / aligned
+   * 两者任一成立都只是「还没排布」，交给自动排布即可。
+   */
   const missingLineCount = computed(() => {
     const hasItem = new Set(items.value.map(i => i.lineId))
     let count = 0
-    for (const line of lines.value) if (!hasItem.has(line.id)) count += 1
+    for (const line of lines.value) {
+      if (hasItem.has(line.id)) continue
+      if (takeByLine.value.has(line.id)) continue
+      if (line.state === 'recorded' || line.state === 'aligned') continue
+      count += 1
+    }
     return count
   })
 
@@ -819,15 +835,34 @@ export const useArrangementStore = defineStore('alignment/arrangement', () => {
     try {
       await loadContext(chapterId)
       const list = await loadArrangements(chapterId)
-      const target = preferredArrangementId
+      let target = preferredArrangementId
         ? list.find(a => a.id === preferredArrangementId)
         : (list.find(a => a.isDefault) ?? list[0])
+
+      // 本章已经有录音、却一份方案都没有：自动建一份默认方案。
+      // 否则对轨页只会显示「缺录 N 行」（N = 全章行数，因为没有条目），而用户其实已经录完了。
+      if (!target && takes.value.length > 0) {
+        target = await callTyped<Arrangement>('alignment:create', {
+          chapterId,
+          name: '默认方案',
+          strategy: 'serialize',
+        })
+        arrangements.value = [...arrangements.value, target]
+      }
+
       if (!target) {
         arrangement.value = null
         applyLoadedItems([])
         return
       }
       await loadArrangement(target.id)
+
+      // 方案是空的、但本章有录音：自动排布一次，让录好的片段立刻出现在时间线上。
+      // 只在「空方案」时自动跑，**绝不**在已有排布时覆盖用户的手工调整。
+      if (items.value.length === 0 && takes.value.length > 0) {
+        await autoArrange({ strategy: target.strategy, preserveLocked: false })
+      }
+
       // 只对当前方案用到的片段查 processed 路径（避免一次查全章的片段）
       const segmentIds = [...new Set(items.value.map(i => i.segmentId))]
       void loadProcessedPaths(segmentIds.slice(0, 500))

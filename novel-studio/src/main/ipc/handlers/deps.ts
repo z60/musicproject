@@ -113,8 +113,13 @@ export interface SettingsPort {
   get(keys?: string[]): AppSettings
   /** 写入补丁，返回变化的 key 列表（点分路径） */
   set(patch: Record<string, unknown>): { changedKeys: string[] }
-  /** 写入加密密钥（值经 safeStorage 加密，见 docs/04 §9） */
+  /** 写入加密密钥（值经 safeStorage 加密，见 docs/04 §9）；空串 = 清除 */
   setSecret(key: string, value: string): void
+  /**
+   * 读取并解密密钥（**仅主进程内部使用**，绝不进 IPC 返回值 →
+   * 渲染进程永远拿不到明文，docs/04 §9）。不存在或解密失败返回 null。
+   */
+  getSecret(key: string): string | null
   /** 重置为默认值 */
   reset(keys?: string[]): void
 }

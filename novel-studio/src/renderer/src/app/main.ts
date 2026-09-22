@@ -150,6 +150,13 @@ const modalFatal: ErrorBusDeps['modalFatal'] = (opts) => {
  *     Electron 的 `webContents 'console-message'` 事件把输出转发到主进程 →
  *     主进程的 electron-log 落盘。
  *
+ * ⚠️ 这条链路的**主进程一半曾经是缺的**（真机事故 docs/91 §5.2.41）：
+ *   上面这段说明写在注释里，但主进程从未注册 `console-message`，于是渲染进程的
+ *   所有输出都停在 devtools 里 —— 日志中有 738 条 `record.frameGap {written:0}`，
+ *   却没有任何一条渲染侧的 `recording.attachPort.failed`。
+ *   现在主进程侧已补齐（`window-manager.ts` 的 `forwardRendererConsole`），
+ *   并且本函数改为发**单个字符串**（见 `formatRendererLogLine`）。
+ *
  * 为什么不再往主进程 `send('log:entry', ...)`：
  *   `send()` 的通道名类型来自 `IpcSendMap`，而 `log:entry` 不在其中；
  *   硬发需要往契约里新增一条渲染 → 主的发送通道（要同时改 IPC_SEND_NAMES、preload 白名单、
@@ -158,6 +165,32 @@ const modalFatal: ErrorBusDeps['modalFatal'] = (opts) => {
  */
 const sendLogToMain: ErrorLogSink = (fields) => {
   logToConsole(fields)
+}
+
+/**
+ * 结构化渲染日志的前缀。
+ *
+ * ⚠️ 必须与主进程 `src/main/bootstrap/window-manager.ts` 的 `RENDERER_LOG_PREFIX`
+ * **逐字相同** —— 两边靠这个字面量对齐（已有源码级测试同时断言两侧）。
+ */
+export const RENDERER_LOG_PREFIX = '[ns] '
+
+/**
+ * 把一条日志编成**单个字符串**。
+ *
+ * 为什么不能 `console.error('[ns]', payload)`：Electron 的 `console-message`
+ * 只把「格式化后的文本」交给主进程，多参数里的对象会变成 Chrome 自己的
+ * 展示格式（`{event: 'x', code: 'E1'}`，单引号、无引号键），主进程 JSON.parse
+ * 不回来 —— 结构化字段（code / params / causeChain / context）就全丢了。
+ * 真机事故 docs/91 §5.2.41 的取证正是被这一点挡住的。
+ */
+export function formatRendererLogLine(payload: Record<string, unknown>): string {
+  try {
+    return RENDERER_LOG_PREFIX + JSON.stringify(payload)
+  } catch (error) {
+    // 循环引用等：宁可丢结构，也不能在"报错"的路径上再抛一个错
+    return `${RENDERER_LOG_PREFIX}${JSON.stringify({ event: 'renderer.logSerializeFailed', reason: String(error) })}`
+  }
 }
 
 function logToConsole(fields: Parameters<ErrorLogSink>[0]): void {
@@ -171,9 +204,10 @@ function logToConsole(fields: Parameters<ErrorLogSink>[0]): void {
     causeChain: fields.causeChain,
     context: fields.context,
   }
-  if (fields.level === 'error') console.error('[ns]', payload)
-  else if (fields.level === 'warn') console.warn('[ns]', payload)
-  else console.info('[ns]', payload)
+  const line = formatRendererLogLine(payload)
+  if (fields.level === 'error') console.error(line)
+  else if (fields.level === 'warn') console.warn(line)
+  else console.info(line)
 }
 
 // ---------------------------------------------------------------------------

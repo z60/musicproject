@@ -4,6 +4,7 @@
  * | kind | 含义 |
  * |------|------|
  * | missing_line             | 画本行无片段（缺录） |
+ * | unarranged_line          | 有片段但不在方案条目里（渲染会丢音频；重新自动排布） |
  * | orphan_segment           | 片段无画本行（画本删过行） |
  * | same_track_overlap       | 同轨重叠（必须修） |
  * | cross_track_overlap_warn | 跨轨重叠过大（> maxCrossTrackOverlapMs） |
@@ -102,11 +103,24 @@ export function validateArrangement(input: ValidateArrangementInput): Arrangemen
   const lineById = new Map<Id, ValidateLineInput>()
   for (const l of input.lines) lineById.set(l.lineId, l)
 
+  // 「缺录」的权威定义是**没有片段**（voice_segments，见 001_init.sql 的 v_missing_lines
+  // 与 export.service.ts）。这里**不能**用「方案里没有条目」来判缺录 —— 那是「还没排布」。
+  // 两者混同的后果（真机）：一章 87 行、87 个片段，却因为 arrangements 为空而报「缺录 87 行」。
   const missingLines: Id[] = []
+  const unarrangedLines: Id[] = []
   for (const line of input.lines) {
-    if (!itemByLine.has(line.lineId)) {
+    const hasSegment = line.segmentId != null
+    if (!hasSegment) {
       missingLines.push(line.lineId)
       pushIssue('missing_line', `第 ${line.seq} 行还没有录音（缺录）`, line.lineId, null)
+    } else if (!itemByLine.has(line.lineId)) {
+      unarrangedLines.push(line.lineId)
+      pushIssue(
+        'unarranged_line',
+        `第 ${line.seq} 行有录音但不在当前方案里：重新「自动排布」把它排进时间线，否则导出会漏掉这段音频`,
+        line.lineId,
+        null,
+      )
     }
   }
 
@@ -238,6 +252,7 @@ export function validateArrangement(input: ValidateArrangementInput): Arrangemen
 
   return {
     missingLines,
+    unarrangedLines,
     orphanSegments,
     sameTrackOverlaps,
     crossTrackOverlaps,
@@ -252,7 +267,12 @@ export function validateArrangement(input: ValidateArrangementInput): Arrangemen
 
 /** 是否是阻断级问题（UI 上红标；预检里对应 blockers） */
 export function isBlockingIssue(kind: AlignIssueKind): boolean {
-  return kind === 'missing_line' || kind === 'same_track_overlap' || kind === 'file_missing'
+  return (
+    kind === 'missing_line' ||
+    kind === 'unarranged_line' ||
+    kind === 'same_track_overlap' ||
+    kind === 'file_missing'
+  )
 }
 
 /**

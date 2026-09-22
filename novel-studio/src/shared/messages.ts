@@ -218,6 +218,17 @@ export const MESSAGES = {
     params: ['count'],
     dev: '连续 >=3 个样本 |x| >= 0.99 计一次。写入 takes.flags 加 "clip"。',
   },
+  RECORD_CAPTURE_UNAVAILABLE: {
+    title: '采集器没能启动，无法录音',
+    detail: '音频采集处理器（AudioWorklet）加载失败，本次录音不会产生任何素材。',
+    hint: '请把这条提示连同日志一并反馈；若刚更新过应用，重启一次通常即可恢复。',
+    severity: 'error', action: 'retry',
+    params: [],
+    dev:
+      'addModule(blob:) 失败。最常见成因是渲染进程 CSP 的 script-src 不允许 blob: —— ' +
+      '缺了它录音会「点了没反应、也没有声音」，而 Chromium 报的是 AbortError（看着像用户取消），' +
+      '绝不能按取消静默吞掉。见 docs/91 §5.2.40。',
+  },
   RECORD_SESSION_RECOVERED: {
     title: '已恢复上次未保存的录音',
     detail: '共「{count}」段，合计「{duration}」。',
@@ -1052,7 +1063,8 @@ const SEGMENTS: ReadonlyArray<{ segment: number; label: string; keys: readonly M
            'RECORD_SESSION_UNRECOVERABLE', 'RECORD_MONITOR_FEEDBACK', 'VAD_NO_SPEECH_FOUND',
            'TAKE_SRC_MISSING', 'TAKE_NONE_SELECTED', 'TRIM_FAILED', 'PUNCHIN_OVERLAP_INVALID',
            'PROCESS_CHAIN_EMPTY', 'PROCESS_PRESET_INVALID', 'PROCESS_ABORTED', 'DECLICK_FAILED',
-           'FILTER_UNSUPPORTED'],
+           // ⚠️ 新增消息**只能在段末追加**（否则历史错误编号会漂移，见本文件头部纪律）
+           'FILTER_UNSUPPORTED', 'RECORD_CAPTURE_UNAVAILABLE'],
   },
   {
     segment: 3, label: 'BOOK',

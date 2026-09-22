@@ -32,6 +32,7 @@ import { AppError } from '../../../shared/errors.ts'
 import type {
   AudioFormat,
   Id,
+  LineState,
   RecordStopResult,
   RecordingMode,
   RecordingSession,
@@ -77,6 +78,41 @@ export interface PcmBlock {
   data: ArrayBuffer
 }
 
+/**
+ * 把端口收到的 `data` 解释成 float32 样本。
+ *
+ * 为什么不能直接 `block.data instanceof ArrayBuffer`（事故 docs/91 §5.2.41 的"隐形杀手"）：
+ *   `MessagePortMain` 的载荷由 Electron 自己的结构化克隆反序列化，**不保证**在 Node 侧
+ *   就是 `ArrayBuffer`（也可能是类型化数组视图 / `Buffer`）。用 `instanceof` 判断、
+ *   不匹配就 `return`，表现是"一条都不写、但没有任何日志"—— 与这次事故一模一样。
+ *   所以这里既宽容（三种形态都认），又在认不出时**明确报错**。
+ */
+export function toFloat32Samples(data: unknown): Float32Array | null {
+  if (data instanceof ArrayBuffer) return data.byteLength % 4 === 0 ? new Float32Array(data) : null
+  if (ArrayBuffer.isView(data)) {
+    const view = data as ArrayBufferView
+    const usable = view.byteLength - (view.byteLength % 4)
+    if (usable <= 0) return null
+    // 4 字节对齐时零拷贝建立视图；否则先复制（`new Float32Array(buffer, offset)` 对未对齐会抛）
+    if (view.byteOffset % 4 === 0) {
+      return new Float32Array(view.buffer as ArrayBuffer, view.byteOffset, usable / 4)
+    }
+    return new Float32Array(view.buffer.slice(view.byteOffset, view.byteOffset + usable))
+  }
+  return null
+}
+
+/** 诊断用：描述一个认不出的载荷形状（不打印内容，只打印类型/长度） */
+export function describeShape(value: unknown): Record<string, unknown> {
+  if (value === null) return { kind: 'null' }
+  if (value === undefined) return { kind: 'undefined' }
+  const ctor = (value as { constructor?: { name?: string } })?.constructor?.name ?? typeof value
+  const out: Record<string, unknown> = { kind: typeof value, ctor }
+  const bytes = (value as { byteLength?: unknown }).byteLength
+  if (typeof bytes === 'number') out.byteLength = bytes
+  return out
+}
+
 /** 会话的运行时状态（**不进库**：重启后采集侧已不存在，库里的 status 才是权威） */
 interface LiveSession {
   session: RecordingSession
@@ -87,6 +123,22 @@ interface LiveSession {
   pending: Float32Array[]
   pendingFrames: number
   droppedFrames: number
+  /**
+   * 上一次 `record:meter` 采样时的缺口（帧）。
+   *
+   * 只有**连续两次采样都缺失**的帧才算真丢帧：端口（数据）与 `record:meter`
+   * （声称值）是两条独立通道，到达顺序不保证，某一块的"声称"先到、数据后到
+   * 属于正常的在途现象（几十毫秒内就补齐）；真丢帧则永远补不回来。
+   */
+  gapSample: number
+  /** 当前这一次缺口里**已确认**（并已计入 droppedFrames）的帧数，防止重复累加 */
+  gapConfirmed: number
+  /** 端口载荷形状认不出时只报一次错 */
+  portShapeWarned: boolean
+  /** 端口消息体是 null（发送侧用了 transfer 列表，docs/91 §5.2.43）时只报一次 */
+  portNullPayloadWarned: boolean
+  /** 端口第一个块只记一次日志（"端口真的在投递"的正面证据） */
+  portFirstBlockLogged: boolean
   /** 补录上下文（punch-in 用） */
   punch?: {
     takeId: Id
@@ -108,6 +160,15 @@ interface LiveSession {
  */
 export interface RecordPortLike {
   on(event: 'message', listener: (e: { data: unknown }) => void): void
+  /**
+   * **必须调用**，否则一条消息都收不到。
+   *
+   * 官方文档（MessagePorts 教程的主进程示例、`MessagePortMain.start()`）：
+   * 「MessagePortMain queues messages until the `.start()` method has been called.」
+   * 只 `on('message')` 不 `start()` 时，消息**永远停在队列里**。
+   * 真机事故 docs/91 §5.2.42 就是漏了这一句。
+   */
+  start?(): void
   close?(): void
 }
 
@@ -144,6 +205,14 @@ export interface RecordServiceDeps {
   segmentRepo: () => VoiceSegmentRepo
   /** 画本行的章节 id（写 take/segment 时要） */
   lineChapterId: (lineId: Id) => Promise<Id | null>
+  /**
+   * 录音完成后把画本行推进到 `recorded`（docs/12 §3.3 / docs/01 §210）。
+   *
+   * 实现必须**只前进**（`recorded`/`aligned` 不动），行不存在时返回 null。
+   * 未注入时服务会记 `record.lineRecorded.unwired` —— 这个缺口曾经静默了很久
+   * （录音成功但 UI 永远显示未录，真机事故 docs/91 §5.2.44）。
+   */
+  markLineRecorded?: (lineId: Id) => Promise<{ from: LineState; to: LineState; changed: boolean } | null>
   /** 某一章画本行的文本长度（匹配切片时估算期望时长） */
   lineCharCounts: (chapterId: Id) => Promise<Array<{ lineId: Id; charCount: number }>>
   slicesStore?: SliceStore
@@ -194,8 +263,11 @@ export interface RecordService {
   optimizeTrim(takeId: Id, options: TrimOptions): Promise<{ trimmedInMs: number; trimmedOutMs: number }>
   /** 单向通道 `record:mark` */
   onMark(payload: { sessionId: Id; kind: 'cut' | 'retake' | 'note'; atMs: number }): Promise<void>
-  /** 单向通道 `record:meter`（用于丢帧核对；电平本身以渲染侧为准） */
-  onMeter(payload: { sessionId: Id; rmsDb: number; peakDb: number; frames: number }): Promise<void>
+  /**
+   * 单向通道 `record:meter`（用于丢帧核对；电平本身以渲染侧为准）。
+   * `claimedFrames` 是渲染侧**累计**转投的帧数 —— 不是单块帧数（口径见 onMeter 实现）。
+   */
+  onMeter(payload: { sessionId: Id; rmsDb: number; peakDb: number; claimedFrames: number }): Promise<void>
   /** 退出/关窗时收敛所有会话（不留 open 的文件句柄） */
   closeAll(reason: string): void
 }
@@ -299,8 +371,56 @@ export function createRecordService(deps: RecordServiceDeps): RecordService {
     port.on('message', (e) => {
       try {
         const block = e.data as PcmBlock | null
-        if (!block || typeof block !== 'object' || !(block.data instanceof ArrayBuffer)) return
-        feed(s, new Float32Array(block.data))
+        if (block === null || block === undefined || typeof block !== 'object') {
+          /**
+           * `event.data === null` 不是"没有消息"，而是**载荷被丢掉了**。
+           *
+           * 真机事故 docs/91 §5.2.43 的证据链：preload 侧 `postMessage(payload, [transfer])`
+           * 只要带了 transfer 列表，主进程这边收到的 `event.data` 就恒为 `null`
+           * （事件照发，所以计时器每 50 ms 一条 null 消息；渲染侧完全不报错）。
+           * 以前这里直接 `return`，于是"录了 3 秒、盘上 0 字节"没有任何线索。
+           * 现在必须先把它记下来：这条日志如果再出现，说明通道又被打回原形。
+           */
+          if (!s.portNullPayloadWarned) {
+            s.portNullPayloadWarned = true
+            log?.error?.('record.portMessage.nullPayload', {
+              event: 'record.portMessage.nullPayload',
+              sessionId: s.session.id,
+              received: describeShape(block),
+              note: '端口消息的事件体是空值（通常是发送侧用了 transfer 列表，docs/91 §5.2.43）：这一块数据已经丢失',
+            })
+          }
+          return
+        }
+        const samples = toFloat32Samples((block as { data?: unknown }).data)
+        if (!samples) {
+          /**
+           * 认不出的载荷形状**绝不静默丢弃**。
+           * §5.2.41/§5.2.42 两次事故的教训都是"静默 return"：界面上一切正常、
+           * 盘上一个字节没有，日志里也什么都没有。
+           */
+          if (!s.portShapeWarned) {
+            s.portShapeWarned = true
+            log?.error?.('record.portMessage.unsupported', {
+              event: 'record.portMessage.unsupported',
+              sessionId: s.session.id,
+              received: describeShape((block as { data?: unknown }).data),
+              note: '音频块的 data 既不是 ArrayBuffer 也不是类型化数组视图：无法解释，按丢失处理',
+            })
+          }
+          return
+        }
+        if (!s.portFirstBlockLogged) {
+          s.portFirstBlockLogged = true
+          // 这一条是"端口真的在投递"的唯一正面证据（此前只能靠丢帧反推）
+          log?.info?.('record.portFirstBlock', {
+            event: 'record.portFirstBlock',
+            sessionId: s.session.id,
+            frames: samples.length,
+            bytes: samples.byteLength,
+          })
+        }
+        feed(s, samples)
       } catch (err) {
         log?.error?.('record.portMessageFailed', {
           event: 'record.portMessageFailed',
@@ -309,6 +429,15 @@ export function createRecordService(deps: RecordServiceDeps): RecordService {
         })
       }
     })
+    /**
+     * ⚠️ 这一句不能少（真机事故 docs/91 §5.2.42）。
+     *
+     * `MessagePortMain` 在 `start()` 之前把消息**一直排队**，只 `on('message')`
+     * 订阅是收不到的 —— 症状：`record.portAttached` 有、`record.portMissing` 没有、
+     * 渲染侧一直在发、主进程 `written` 恒为 0（本次真机日志里 `gap` 一路涨到 166528）。
+     * Electron 官方 MessagePorts 教程的主进程示例就是 `port.on('message', …)` + `port.start()`。
+     */
+    port.start?.()
   }
 
   /** 写/更新该行的成品片段（与 `take.service` 同一套文件与库语义） */
@@ -416,6 +545,11 @@ export function createRecordService(deps: RecordServiceDeps): RecordService {
         pending: [],
         pendingFrames: 0,
         droppedFrames: 0,
+        gapSample: 0,
+        gapConfirmed: 0,
+        portShapeWarned: false,
+        portNullPayloadWarned: false,
+        portFirstBlockLogged: false,
       }
       live.set(sessionId, state)
 
@@ -660,6 +794,47 @@ export function createRecordService(deps: RecordServiceDeps): RecordService {
       const segment = await materializeSegment(lineId, inserted)
       await deps.takeRepo().setSelected(lineId, takeId)
 
+      /**
+       * ⑨ 画本行 state → `recorded`（docs/12 §3.3 / docs/01 §210：
+       * `draft/assigned ──record──▶ recorded`）。
+       *
+       * 真机事故 docs/91 §5.2.44：这一步**以前根本不存在**（连仓储能力都没有），
+       * 后果是"录音成功、take/segment 都在，但画本表格没有 ✓、章节进度 recorded_count 恒为 0、
+       * QC 统计已录行 0" —— 用户看到的就是「停止后没有把当前录制的保存」。
+       *
+       * 必须在 segment 写成功**之后**推进；失败只记日志，不能因此把已经录好的 take 丢掉。
+       */
+      if (deps.markLineRecorded) {
+        try {
+          const marked = await deps.markLineRecorded(lineId)
+          log?.info?.('record.lineRecorded', {
+            event: 'record.lineRecorded',
+            sessionId,
+            lineId,
+            takeId,
+            from: marked?.from ?? null,
+            to: marked?.to ?? null,
+            changed: marked?.changed ?? false,
+          })
+        } catch (e) {
+          log?.warn?.('record.lineRecorded.failed', {
+            event: 'record.lineRecorded.failed',
+            sessionId,
+            lineId,
+            reason: e instanceof Error ? e.message : String(e),
+            note: 'take 与 segment 已写好，只是画本行状态没推进：UI 会显示成「未录」',
+          })
+        }
+      } else {
+        // 没接线就是"录完了但界面永远显示未录"这类静默缺陷，必须可见
+        log?.warn?.('record.lineRecorded.unwired', {
+          event: 'record.lineRecorded.unwired',
+          sessionId,
+          lineId,
+          note: '未注入 markLineRecorded：录音不会推进画本行状态（docs/12 §3.3）',
+        })
+      }
+
       live.delete(sessionId)
       deps.events?.emit('record:status', {
         sessionId,
@@ -779,6 +954,11 @@ export function createRecordService(deps: RecordServiceDeps): RecordService {
         pending: [],
         pendingFrames: 0,
         droppedFrames: 0,
+        gapSample: 0,
+        gapConfirmed: 0,
+        portShapeWarned: false,
+        portNullPayloadWarned: false,
+        portFirstBlockLogged: false,
         punch: {
           takeId: target.id,
           headPayload: head,
@@ -1057,21 +1237,41 @@ export function createRecordService(deps: RecordServiceDeps): RecordService {
     async onMeter(payload) {
       const s = live.get(payload.sessionId)
       if (!s) return
-      // 电平以渲染侧为准（它才是采集方）。主进程只用序号核对「声称发了多少帧」与
-      // 「实际落盘多少帧」的差额 —— 差额就是丢帧，这是 P0 指标唯一的独立证据
+      // 电平以渲染侧为准（它才是采集方）。主进程只用「声称**累计**发了多少帧」与
+      // 「实际落盘 + 仍在内存里的帧数」的差额核对丢帧 —— 差额就是丢帧，
+      // 这是 P0 指标唯一的独立证据：端口那条通道要是整体失效（本进程一个块都收不到），
+      // 只有这条独立通道能发现（真机事故 docs/91 §5.2.41 正是靠它抓到的）。
       const accounted = s.writer.framesWritten + s.pendingFrames
-      const gap = Math.floor(payload.frames) - accounted
-      if (gap > 0) {
-        s.droppedFrames += gap
+      const rawGap = Math.max(0, Math.floor(payload.claimedFrames) - accounted)
+
+      /**
+       * ⚠️ 只有**连续两次采样都缺失**的帧才算丢帧。
+       *
+       * 端口（数据）与 `record:meter`（声称值）是两条独立通道，到达顺序不保证：
+       * 某一块的"声称"先到、数据后到是正常的**在途**现象，几十毫秒内就会补齐。
+       * 真丢帧则永远补不回来 —— 下一次采样缺口依旧在。
+       *
+       * 少了这一步的后果（真机事故 docs/91 §5.2.41 复查时发现）：健康会话在开头
+       * 就可能报一次「丢帧 2304 帧」，而 docs/12 §13 要求恒为 0，用户会以为录制坏了。
+       * 另外 `gapConfirmed` 保证同一次丢失不会被反复累加（缺口持续 10 次采样也只计一次）。
+       */
+      const confirmed = Math.min(rawGap, s.gapSample)
+      const delta = confirmed - s.gapConfirmed
+      if (delta > 0) {
+        s.droppedFrames += delta
         log?.warn?.('record.frameGap', {
           event: 'record.frameGap',
           sessionId: payload.sessionId,
-          claimed: payload.frames,
+          claimed: payload.claimedFrames,
           written: s.writer.framesWritten,
           pending: s.pendingFrames,
-          gap,
+          gap: confirmed,
+          rawGap,
+          note: '缺口连续两次采样都存在，确认为丢帧（在途块不计）',
         })
       }
+      s.gapConfirmed = Math.max(0, confirmed)
+      s.gapSample = rawGap
     },
 
     closeAll(reason) {

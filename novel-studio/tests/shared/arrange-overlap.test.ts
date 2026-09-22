@@ -22,7 +22,7 @@ import {
   resolveAllSameTrackOverlaps,
   resolveOverlap,
 } from '../../src/shared/arrange/overlap.ts'
-import { prioritizeIssues, validateArrangement } from '../../src/shared/arrange/validate.ts'
+import { isBlockingIssue, prioritizeIssues, validateArrangement } from '../../src/shared/arrange/validate.ts'
 import type { ArrangementItem, TrackId } from '../../src/shared/types.ts'
 
 const NARRATION: TrackId = 'narration'
@@ -232,13 +232,28 @@ describe('对轨校验（docs/13 §5）：11 种 issue', () => {
     segmentId,
   })
 
-  it('missing_line：画本有行、没有 item（缺录）', () => {
+  it('missing_line：画本有行、没有**片段**（真缺录）', () => {
+    // 缺录的权威定义是「没有 voice_segments」——不是「方案里没有条目」。
+    // 真机事故：录完 87 行却因没有方案而报「缺录 87 行」，就是这两者被混同。
     const v = validateArrangement({
       items: [mk('a', NARRATION, 0)],
-      lines: [lineOf('a', 1, NARRATION), lineOf('b', 2, NARRATION)],
+      lines: [lineOf('a', 1, NARRATION), lineOf('b', 2, NARRATION, null)],
     })
     assert.deepEqual(v.missingLines, ['line-b'])
+    assert.deepEqual(v.unarrangedLines, [])
     assert.ok(v.issues.some(i => i.kind === 'missing_line'))
+  })
+
+  it('unarranged_line：有片段但不在方案条目里 → 不是缺录，但必须重新排布', () => {
+    const v = validateArrangement({
+      items: [mk('a', NARRATION, 0)],
+      // line-b 有 seg-b，但方案里没有它的条目（例如「排好之后又录了一行」）
+      lines: [lineOf('a', 1, NARRATION), lineOf('b', 2, NARRATION)],
+    })
+    assert.deepEqual(v.missingLines, [], '有录音就不能算缺录')
+    assert.deepEqual(v.unarrangedLines, ['line-b'])
+    assert.ok(v.issues.some(i => i.kind === 'unarranged_line'))
+    assert.equal(isBlockingIssue('unarranged_line'), true, '会被渲染/导出丢掉，必须是阻断项')
   })
 
   it('orphan_segment：item 的画本行已被删除', () => {
@@ -366,7 +381,8 @@ describe('对轨校验（docs/13 §5）：11 种 issue', () => {
   it('阻断级问题排在最前（引导模式「一条一条处理」）', () => {
     const v = validateArrangement({
       items: [mk('a', CHAR_A, 0), mk('b', CHAR_A, 800), mk('c', CHAR_A, 9000, 150)],
-      lines: [lineOf('a', 1, CHAR_A), lineOf('b', 2, CHAR_A), lineOf('c', 3, CHAR_A), lineOf('d', 4, CHAR_A)],
+      // line-d 没有片段（真缺录）；a/b/c 有片段也有条目
+      lines: [lineOf('a', 1, CHAR_A), lineOf('b', 2, CHAR_A), lineOf('c', 3, CHAR_A), lineOf('d', 4, CHAR_A, null)],
     })
     const ordered = prioritizeIssues(v)
     assert.equal(ordered[0]!.kind, 'missing_line', '缺录是阻断项，排第一')
