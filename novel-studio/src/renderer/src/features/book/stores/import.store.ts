@@ -31,7 +31,13 @@ import { call, callSafe } from '@/shared/lib/ipc.ts'
 import { cloneForIpc } from '@/shared/lib/clone.ts'
 import { AppError } from '@shared/errors.ts'
 import { BUILTIN_RULE_SETS, ENCODING_CANDIDATES, IMPORT_LIMITS, VAD_DEFAULTS } from '@shared/constants.ts'
+import {
+  chapterNumberRange as computeChapterNumberRange,
+  extractChapterNumber,
+  selectDraftsByChapterRange,
+} from '@shared/text/chapter-number.ts'
 import type {
+  Book,
   BookSourceType,
   ChapterDraft,
   ChapterKind,
@@ -198,6 +204,8 @@ interface CommitImportPayload {
   bookMeta: { title: string; author?: string | null; narrator?: string; language?: string; coverPath?: string | null }
   source: { type: BookSourceType; path?: string | null; encoding?: string | null; contentHash: string }
   drafts: ChapterDraft[]
+  /** 非空 = **追加**到这本书（不新建）；见 main 的 commitImport */
+  targetBookId?: string
   importMode?: 'text' | 'canvas'
 }
 
@@ -217,63 +225,9 @@ export function estimateDurationMs(charCount: number, charsPerSecond: number = V
   return Math.round((charCount / rate) * 1000)
 }
 
-const CN_DIGITS: Record<string, number> = {
-  零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9,
-}
-const CN_UNITS: Record<string, number> = { 十: 10, 百: 100, 千: 1000, 万: 10000 }
-
-/** 中文数字 → 数值（支持「十二」「二十三」「一千零二十」「两」） */
-function parseChineseNumber(text: string): number | null {
-  if (!text) return null
-  let total = 0
-  let section = 0
-  let digit = 0
-  let seen = false
-  for (const ch of text) {
-    if (ch in CN_DIGITS) {
-      digit = CN_DIGITS[ch]!
-      seen = true
-    } else if (ch in CN_UNITS) {
-      const unit = CN_UNITS[ch]!
-      seen = true
-      if (unit === 10000) {
-        section = (section + (digit || 0)) * unit
-        total += section
-        section = 0
-      } else {
-        section += (digit || 1) * unit
-      }
-      digit = 0
-    } else {
-      return null
-    }
-  }
-  if (!seen) return null
-  return total + section + digit
-}
-
-/**
- * 从章标题里抽出章节号（docs/10 §7.1「章节号规范化：识别一二三 / 123 / 零一二」）。
- * 识别不出返回 null（调用方按「无号」排到末尾，绝不猜）。
- */
-export function extractChapterNumber(title: string): number | null {
-  if (!title) return null
-  // 先看阿拉伯数字（第 12 章 / 12 / 012）
-  const ascii = /(\d{1,6})/.exec(title)
-  if (ascii) {
-    const n = Number(ascii[1])
-    if (Number.isFinite(n)) return n
-  }
-  // 再看中文数字：取「第…章」之间，或去掉「第/章/回/节/卷」后的连续中文数字
-  const bracket = /第\s*([零〇一二三四五六七八九十百千万两]+)\s*[章节回卷部篇]/.exec(title)
-  if (bracket) {
-    const n = parseChineseNumber(bracket[1]!)
-    if (n !== null) return n
-  }
-  const plain = /([零〇一二三四五六七八九十百千万两]{1,10})/.exec(title)
-  if (plain) return parseChineseNumber(plain[1]!)
-  return null
-}
+// 章节号解析是**零依赖纯逻辑**，单独放在 shared/text/chapter-number.ts（可单测）。
+// 这里再导出，保持既有的 `extractChapterNumber` 公开入口不变。
+export { extractChapterNumber } from '@shared/text/chapter-number.ts'
 
 /** 简易 id（crypto.randomUUID 在部分上下文不可用，必须有回退） */
 export function createLocalId(prefix: string): string {
@@ -472,6 +426,14 @@ export const useImportStore = defineStore('book/import', () => {
   const projectId = ref<string | null>(null)
   const projectHint = ref('')
   const committing = ref(false)
+  /**
+   * 非空 = 「追加到已有书籍」：本次导入的章节并入这本书，而不是新建一本。
+   * 契约上是 `book:commitImport` 的可选字段 targetBookId（见 src/shared/ipc.ts）。
+   */
+  const targetBookId = ref<string | null>(null)
+  /** Step 6 的候选目标书籍（book:list 结果，按当前项目过滤） */
+  const availableBooks = ref<Book[]>([])
+  const booksBusy = ref(false)
 
   // ---- Step 7 结果 ----
   const outcome = ref<ImportOutcome | null>(null)
@@ -554,9 +516,18 @@ export const useImportStore = defineStore('book/import', () => {
     return size > 0 && size > maxFileSizeBytes.value
   })
 
+  /** 是否处于「追加到已有书籍」模式（Step 6 的「导入到」选择） */
+  const appendMode = computed(() => targetBookId.value !== null)
+
+  /** 当前选中的目标书籍（下拉里找不到时为 null，界面据此禁用提交） */
+  const targetBook = computed<Book | null>(
+    () => availableBooks.value.find(b => b.id === targetBookId.value) ?? null,
+  )
+
   const canCommit = computed(() => {
     if (committing.value) return false
-    if (!bookMeta.value.title.trim()) return false
+    // 追加模式沿用目标书的书名，不再要求用户填
+    if (!targetBookId.value && !bookMeta.value.title.trim()) return false
     // 缺少项目上下文时**必须**判为不能提交，与上面的 blockReason（第 6 步）保持一致。
     // 原来漏了这一条，于是按钮可点、`buildCommitPayload()` 却返回 null，
     // 最终只报一句与事实不符的「后台任务执行失败」（真机事故 docs/91 §5.2.4）。
@@ -603,9 +574,10 @@ export const useImportStore = defineStore('book/import', () => {
         if (!includedCount.value && drafts.value.length > 0) return '一章都没勾选：至少勾选一章再继续'
         return null
       case 6:
-        if (!bookMeta.value.title.trim()) return '请填写书名'
+        if (targetBookId.value && targetBook.value === null) return '选中的目标书籍已不在书架里：请重新选择或改成「新建书籍」'
+        if (!targetBookId.value && !bookMeta.value.title.trim()) return '请填写书名'
         if (!projectId.value) return '缺少项目上下文：请先在书架选择一本书，或确认「设置 → 路径」里的项目根目录可用'
-        if (duplicate.value && !duplicateAcknowledged.value) return '检测到可能重复的书籍，请选择「打开已有书籍」/「作为副本导入」/「取消」'
+        if (!targetBookId.value && duplicate.value && !duplicateAcknowledged.value) return '检测到可能重复的书籍，请选择「打开已有书籍」/「作为副本导入」/「取消」'
         if (!canCommit.value) return '当前条件还不足以导入'
         return null
       default:
@@ -1102,6 +1074,27 @@ export const useImportStore = defineStore('book/import', () => {
     draftsEdited.value = true
   }
 
+  /**
+   * 章节号范围（Step 5「按范围勾选」用）。
+   * 章号取自标题（extractChapterNumber）；标题里没有章号的按**列表序号**回退，
+   * 这样「只勾选一段」在任何文档上都能用，而不会因为几章没有编号就整段落空。
+   */
+  const chapterNumberRange = computed<{ min: number; max: number; mapped: number }>(
+    () => computeChapterNumberRange(drafts.value),
+  )
+
+  /**
+   * 按章节号范围勾选：**只**勾选落在 [from, to] 内的章节，其余一律取消勾选。
+   * 章号按 extractChapterNumber 从标题解析，解析不出时回退到列表序号（与 chapterNumberRange 同口径）。
+   * @returns 勾选到的章节数（0 表示这个范围里一章都没有）
+   */
+  function selectRangeByChapterNumber(from: number, to: number): number {
+    const result = selectDraftsByChapterRange(drafts.value, from, to)
+    drafts.value = result.drafts
+    draftsEdited.value = true
+    return result.count
+  }
+
   function moveDraft(from: number, to: number): void {
     const list = [...drafts.value]
     if (from < 0 || from >= list.length) return
@@ -1299,9 +1292,42 @@ export const useImportStore = defineStore('book/import', () => {
     if (Number.isFinite(bytes) && bytes > 0) maxFileSizeBytes.value = bytes
   }
 
+  /**
+   * 拉取「可追加的目标书籍」（Step 6 的下拉）。
+   * 只保留**当前项目**内的书：跨项目追加会让 chapters.book_id 与 project 语义打架。
+   */
+  async function loadBooks(): Promise<Book[]> {
+    booksBusy.value = true
+    try {
+      const list = await callSafe('book:list', {})
+      const books = Array.isArray(list) ? (list as Book[]) : []
+      availableBooks.value = projectId.value
+        ? books.filter(b => !b.projectId || b.projectId === projectId.value)
+        : books
+      return availableBooks.value
+    } finally {
+      booksBusy.value = false
+    }
+  }
+
+  /** 选择「导入到」的目标：null = 新建书籍；非空 = 追加到该书 */
+  function setTargetBookId(id: string | null): void {
+    targetBookId.value = id && id.trim().length > 0 ? id.trim() : null
+    if (targetBookId.value) {
+      // 不会新建书，内容哈希去重就不适用了（同一本书当然会和自己的哈希一致）
+      duplicate.value = null
+      duplicateAcknowledged.value = false
+    }
+  }
+
   /** 去重检测（docs/10 §9）。哈希缺失时不做静默判断，而是明确告知「本次跳过去重」。 */
   async function checkDuplicate(): Promise<'ok' | 'hit' | 'skipped'> {
     duplicateChecked.value = true
+    // 追加模式不新建书，去重没有意义（会命中目标书自己）
+    if (targetBookId.value) {
+      duplicate.value = null
+      return 'skipped'
+    }
     if (!contentHash.value || !projectId.value) {
       duplicate.value = null
       return 'skipped'
@@ -1357,6 +1383,8 @@ export const useImportStore = defineStore('book/import', () => {
         contentHash: contentHash.value,
       },
       drafts: included,
+      // 追加模式：只传 targetBookId，主进程据此把章节接到该书末尾（见 book.service commitImport）
+      ...(targetBookId.value ? { targetBookId: targetBookId.value } : {}),
       ...(importMode.value === 'canvas' ? { importMode: 'canvas' as const } : {}),
     })
   }
@@ -1487,6 +1515,7 @@ export const useImportStore = defineStore('book/import', () => {
     duplicate.value = null
     duplicateChecked.value = false
     duplicateAcknowledged.value = false
+    targetBookId.value = null
     committing.value = false
     outcome.value = null
     taskId.value = null
@@ -1520,10 +1549,12 @@ export const useImportStore = defineStore('book/import', () => {
     includedDrafts, includedCount, totalDraftChars, includedChars, includedDurationMs,
     longestDraft, removedDrafts, removedDraftCount,
     updateDraft, setDraftTitle, toggleDraftIncluded, setAllIncluded, invertIncluded,
+    chapterNumberRange, selectRangeByChapterNumber,
     moveDraft, moveDraftBy, sortByTitleNumber, removeDraft, restoreDraft, restoreAllDrafts,
     applyTitleAffix, mergeDrafts, splitDraft, previewDraftId, previewDraft, setPreviewDraft, draftsEdited,
     // 确认与提交
     bookMeta, setBookMeta, ensureDefaultBookMeta, projectId, projectHint, setProjectContext,
+    targetBookId, targetBook, appendMode, availableBooks, booksBusy, loadBooks, setTargetBookId,
     duplicate, duplicateChecked, duplicateAcknowledged, checkDuplicate, acknowledgeDuplicate, clearDuplicate,
     canCommit, committing, commitImport, buildCommitPayload, buildTaskOptions,
     taskId, markTaskStarted, outcome, setOutcome, commitError, setCommitError, clearCommitError,

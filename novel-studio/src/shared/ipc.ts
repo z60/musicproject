@@ -159,6 +159,11 @@ export interface IpcContract {
       bookMeta: { title: string; author?: string | null; narrator?: string; language?: string; coverPath?: string | null }
       source: { type: Book['sourceType']; path?: string | null; encoding?: string | null; contentHash: string }
       drafts: ChapterDraft[]
+      /**
+       * 非空 = **追加**到这本书：把 drafts 接到目标书末尾（seq 顺延、字数/章数累加、
+       * 画本行照写、现有角色按名字复用），而不是新建一本。省略 = 新建（原行为）。
+       */
+      targetBookId?: Id
       /** 见 `book:previewSplit`：'canvas' 时 drafts.rawText 会被解析成画本行直接落库 */
       importMode?: 'text' | 'canvas'
     }

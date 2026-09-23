@@ -81,6 +81,7 @@ export interface ImportFlow {
   saveRuleSetAs: (name: string) => Promise<void>
   removeRuleSet: (id: string) => Promise<void>
   setCover: () => Promise<void>
+  onTargetBookChanged: (id: string | null) => Promise<void>
   submit: () => Promise<SubmitResult>
   openExistingBook: (bookId: string) => Promise<void>
   importAsCopy: () => Promise<SubmitResult>
@@ -208,7 +209,9 @@ export function useImportFlow(): ImportFlow {
       case 6:
         store.ensureDefaultBookMeta()
         await resolveProjectContext()
-        if (store.contentHash) await store.checkDuplicate()
+        // 「追加到已有书籍」需要目标书列表；去重只对「新建书」有意义（追加不会新建）
+        await store.loadBooks()
+        if (store.contentHash && !store.appendMode) await store.checkDuplicate()
         return
       default:
         return
@@ -309,6 +312,16 @@ export function useImportFlow(): ImportFlow {
   // ---------------------------------------------------------------------------
   // Step 6：封面与提交
   // ---------------------------------------------------------------------------
+
+  /**
+   * 切换「导入到」的目标：null = 新建书籍。
+   * 切回新建时要重新跑去重（之前追加模式跳过过），切到追加时清掉去重结果。
+   */
+  async function onTargetBookChanged(id: string | null): Promise<void> {
+    store.setTargetBookId(id)
+    if (id) return
+    if (store.contentHash) await store.checkDuplicate()
+  }
 
   async function setCover(): Promise<void> {
     const result = await callSafe('app:openFileDialog', {
@@ -579,6 +592,7 @@ export function useImportFlow(): ImportFlow {
     saveRuleSetAs,
     removeRuleSet,
     setCover,
+    onTargetBookChanged,
     submit,
     openExistingBook,
     importAsCopy,

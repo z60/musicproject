@@ -140,7 +140,45 @@ function onAffix(payload: { affix: string; position: 'prefix' | 'suffix'; action
     : `没有章节需要改动：「${payload.affix}」${payload.action === 'add' ? '已存在或没有勾选章节' : '不在已勾选章节的标题前后'}`
 }
 
+/** Step 5 范围勾选：起止章号（留空 = 用解析出的整段范围） */
+const rangeFrom = ref('')
+const rangeTo = ref('')
+
+const rangeHint = computed(() => {
+  const r = store.chapterNumberRange
+  if (r.mapped === 0) return ''
+  return `识别到的章号范围：第 ${r.min} ~ ${r.max} 章（标题里没有章号的按列表序号回退）`
+})
+
+function onSelectRange(): void {
+  const r = store.chapterNumberRange
+  const from = rangeFrom.value.trim() ? Number(rangeFrom.value) : r.min
+  const to = rangeTo.value.trim() ? Number(rangeTo.value) : r.max
+  if (!Number.isFinite(from) || !Number.isFinite(to)) {
+    notice.value = '章号范围无效：请填数字，或留空表示整段'
+    return
+  }
+  const selected = store.selectRangeByChapterNumber(from, to)
+  const lo = Math.min(from, to)
+  const hi = Math.max(from, to)
+  notice.value = selected > 0
+    ? `已只勾选第 ${lo} ~ ${hi} 章：共 ${formatInt(selected)} 章`
+    : `第 ${lo} ~ ${hi} 章里没有章节：请检查章号范围`
+}
+
 // ── Step 6：确认导入 ───────────────────────────────────────────────────────
+
+/**
+ * Step 6「导入到」：空 = 新建一本书；选了某本书 = 追加到它末尾（book:commitImport 的 targetBookId）。
+ * 切回「新建」时 flow 会重新跑去重（追加模式跳过了去重）。
+ */
+function onTargetBookChange(event: Event): void {
+  const value = (event.target as HTMLSelectElement).value
+  void flow.onTargetBookChanged(value ? value : null)
+}
+
+/** Step 7 展示的书名：追加时用目标书（bookMeta 在追加模式下不要求填） */
+const commitTitle = computed(() => store.targetBook?.title || store.bookMeta.title || '未命名作品')
 
 async function onCommit(): Promise<void> {
   notice.value = ''
@@ -344,6 +382,14 @@ const sourceSummary = computed(() => {
 
     <!-- Step 5 章节列表（人工干预） -->
     <section v-else-if="stepIndex === 5" class="wiz__panel">
+      <div class="wiz__range">
+        <span class="wiz__range-label">按章节范围勾选</span>
+        <input v-model="rangeFrom" class="wiz__input wiz__range-input" type="number" min="1" placeholder="起始章号">
+        <span class="wiz__range-tilde">~</span>
+        <input v-model="rangeTo" class="wiz__input wiz__range-input" type="number" min="1" placeholder="结束章号">
+        <button type="button" class="ns-btn ns-btn--small" :disabled="busy" @click="onSelectRange">只勾选此范围</button>
+        <span class="wiz__hint">{{ rangeHint }}</span>
+      </div>
       <ChapterPreviewTable
         :drafts="store.drafts"
         :included-count="store.includedCount"
@@ -377,7 +423,25 @@ const sourceSummary = computed(() => {
 
     <!-- Step 6 确认导入 -->
     <section v-else-if="stepIndex === 6" class="wiz__panel">
-      <div class="wiz__form">
+      <!-- 「追加到已有书籍」只在可预览来源（文件/粘贴）开放：URL 走任务通道，只能新建 -->
+      <div v-if="store.canPreview" class="wiz__target">
+        <label class="wiz__field">
+          <span>导入到</span>
+          <select class="wiz__input" :value="store.targetBookId ?? ''" :disabled="store.booksBusy" @change="onTargetBookChange">
+            <option value="">新建一本书</option>
+            <option v-for="b in store.availableBooks" :key="b.id" :value="b.id">
+              追加到：{{ b.title }}（当前 {{ formatInt(b.chapterCount) }} 章）
+            </option>
+          </select>
+        </label>
+        <p class="wiz__hint">
+          {{ store.appendMode
+            ? `本次 ${formatInt(store.includedCount)} 章会接到《${store.targetBook?.title ?? ''}》末尾，书名/作者/封面沿用原书。`
+            : '新建一本书；书架里已有书时也可以选「追加到…」，把多份画本文件合成同一本书。' }}
+        </p>
+      </div>
+
+      <div v-if="!store.appendMode" class="wiz__form">
         <label class="wiz__field">
           <span>书名 <em>*</em></span>
           <input
@@ -438,8 +502,8 @@ const sourceSummary = computed(() => {
         {{ store.projectHint || '缺少项目上下文：导入会写进主进程的默认项目；若这里一直为空，请重启应用以重建默认项目。' }}
       </p>
 
-      <!-- 去重（docs/10 §9 三选一，绝不静默选择） -->
-      <section class="wiz__dup" :class="{ 'wiz__dup--hit': store.duplicate !== null }">
+      <!-- 去重（docs/10 §9 三选一，绝不静默选择）；追加模式不会新建书，去重不适用 -->
+      <section v-if="!store.appendMode" class="wiz__dup" :class="{ 'wiz__dup--hit': store.duplicate !== null }">
         <header class="wiz__dup-head">
           <strong>重复检查</strong>
           <button type="button" class="ns-btn ns-btn--small" :disabled="!store.contentHash" @click="store.checkDuplicate()">
@@ -485,14 +549,14 @@ const sourceSummary = computed(() => {
           {{ store.committing ? '正在导入…' : '开始导入' }}
         </button>
         <span v-if="!store.canCommit" class="wiz__commit-block">{{ store.blockReason }}</span>
-        <span v-else class="wiz__hint">将写入 {{ formatInt(store.includedCount) }} 章（book:commitImport，携带第 5 步的人工调整）</span>
+        <span v-else class="wiz__hint">{{ store.appendMode ? `将追加 ${formatInt(store.includedCount)} 章到《${store.targetBook?.title ?? ''}》` : `将写入 ${formatInt(store.includedCount)} 章（book:commitImport，携带第 5 步的人工调整）` }}</span>
       </div>
 
       <!-- 走任务通道时（URL 来源 / 作为副本）显示统一进度卡 -->
       <TaskProgressCard
         v-if="store.taskId"
         :task-id="store.taskId"
-        :title="`导入《${store.bookMeta.title}》`"
+        :title="`导入《${commitTitle}》`"
         kind="book.import"
         cancelable
         retryable
@@ -508,7 +572,7 @@ const sourceSummary = computed(() => {
       <TaskProgressCard
         v-if="store.taskId && !store.outcome"
         :task-id="store.taskId"
-        :title="`导入《${store.bookMeta.title}》`"
+        :title="`导入《${commitTitle}》`"
         kind="book.import"
         cancelable
         retryable
@@ -521,7 +585,8 @@ const sourceSummary = computed(() => {
       <div v-if="store.outcome" class="wiz__done">
         <h3 class="wiz__done-title">导入完成</h3>
         <dl class="wiz__facts">
-          <div><dt>书名</dt><dd>{{ store.bookMeta.title }}</dd></div>
+          <div><dt>书名</dt><dd>{{ commitTitle }}</dd></div>
+          <div><dt>方式</dt><dd>{{ store.appendMode ? '追加到已有书籍' : '新建书籍' }}</dd></div>
           <div><dt>章节数</dt><dd>{{ formatInt(store.outcome.chapterCount) }} 章</dd></div>
           <div><dt>总字数</dt><dd>{{ formatCount(store.includedChars) }}字</dd></div>
           <div><dt>预估时长</dt><dd>{{ formatDuration(store.includedDurationMs) }}</dd></div>
@@ -699,6 +764,31 @@ const sourceSummary = computed(() => {
   color: var(--ns-text-secondary, #909399);
   font-size: 12px;
   line-height: 1.7;
+}
+.wiz__range {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--ns-border-light, #e4e7ed);
+  border-radius: 8px;
+  background: var(--ns-bg-elevated, #fff);
+}
+.wiz__range-label {
+  color: var(--ns-text-regular, #606266);
+  font-size: 12px;
+}
+.wiz__range-input {
+  width: 110px;
+}
+.wiz__range-tilde {
+  color: var(--ns-text-secondary, #909399);
+}
+.wiz__target {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 .wiz__facts {
   display: flex;

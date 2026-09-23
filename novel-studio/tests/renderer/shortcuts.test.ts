@@ -119,6 +119,20 @@ test('normalizeKeyName：认不出的键名返回 null 而不是原样返回', (
   assert.equal(normalizeKeyName(''), null)
 })
 
+test('空格键：匹配与回写都要认（默认「开始/停止录音」就是 Space）', () => {
+  // 回归：' '.trim() === '' 曾让 normalizeKeyName 返回 null，Space 永远匹配不上
+  assert.equal(normalizeKeyName(' '), 'space')
+  assert.equal(matchEvent({ key: ' ' }, 'Space'), true)
+  assert.equal(eventToShortcutString({ key: ' ' }), 'space')
+  assert.equal(parseShortcut(eventToShortcutString({ key: ' ' })).valid, true)
+  // 修饰键仍然必须完全一致
+  assert.equal(matchEvent({ key: ' ', shiftKey: true }, 'Space'), false)
+  assert.equal(matchEvent({ key: ' ' }, 'Ctrl+Space'), false)
+  // 默认表里空格绑定「开始/停止录音」
+  const hit = DEFAULT_RECORDING_SHORTCUTS.filter(b => matchEvent({ key: ' ' }, b.shortcut))
+  assert.deepEqual(hit.map(b => b.id), ['record.toggle'])
+})
+
 // ---------------------------------------------------------------------------
 // 匹配
 // ---------------------------------------------------------------------------

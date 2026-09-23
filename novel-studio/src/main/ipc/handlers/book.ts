@@ -84,6 +84,7 @@ export function createBookHandlers(book: BookService): RegisteredHandler[] {
         bookMeta: req.bookMeta,
         source: req.source,
         drafts: req.drafts as ChapterDraft[],
+        ...(req.targetBookId ? { targetBookId: req.targetBookId } : {}),
         ...(req.importMode ? { importMode: req.importMode } : {}),
       })
     }),

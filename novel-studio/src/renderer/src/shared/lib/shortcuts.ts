@@ -143,6 +143,11 @@ function invalid(raw: string, error: string): ParsedShortcut {
  */
 export function normalizeKeyName(name: string): string | null {
   if (typeof name !== 'string') return null
+  // ⚠️ 单个空格必须**在 trim 之前**特判：`' '.trim()` 会变成空串，
+  //    而浏览器里空格键的 KeyboardEvent.key 正好就是 `' '`。
+  //    少了这一步，默认的「开始/停止录音 = Space」永远匹配不上，
+  //    设置页用空格键改键也会被当成「认不出来」。
+  if (name === ' ') return 'space'
   const raw = name.trim()
   if (!raw) return null
 

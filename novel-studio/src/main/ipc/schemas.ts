@@ -536,6 +536,8 @@ export const IPC_REQ_SCHEMAS = {
       contentHash: v.string().max(128),
     }),
     drafts: v.array(ChapterDraftShape, { max: 20_000 }),
+    /** 追加到这本书（不新建）；省略 = 新建 */
+    targetBookId: OptString,
     importMode: v.optional(v.enum(['text', 'canvas'])),
   }),
   'book:importFile': v.object({ projectId: Id, filePath: v.string().max(2000), options: v.optional(LooseObject) }),

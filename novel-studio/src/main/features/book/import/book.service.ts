@@ -93,6 +93,12 @@ export interface CommitImportRequest {
     contentHash: string
   }
   drafts: ChapterDraft[]
+  /**
+   * 非空 = **追加**到这本书：章节接到目标书末尾（seq 顺延、charCount/chapterCount 累加、
+   * startOffset/endOffset 叠加已有长度），不新建书籍；画本行照写、现有角色按名字复用。
+   * 省略 = 新建一本（原行为）。
+   */
+  targetBookId?: Id
   /** 画本模式：drafts 的 rawText 会被解析成画本行直接落库 */
   importMode?: 'text' | 'canvas'
 }
@@ -603,6 +609,14 @@ export function createBookService(deps: BookServiceDeps): BookService {
       })
     }
 
+    // 追加模式：目标书必须存在。宁可报错，也不要静默新建一本 —— 用户会以为追加成功了。
+    const appendTarget = req.targetBookId ? await books.findById(req.targetBookId) : null
+    if (req.targetBookId && !appendTarget) {
+      throw new AppError('NOT_FOUND', {
+        details: { entity: 'book', bookId: req.targetBookId, reason: 'append-target-missing' },
+      })
+    }
+
     // 画本模式：把每章 rawText 解析成画本行。
     // 放在这里（而不是预览阶段）是为了不让预览载荷翻倍；预览只看章节切分。
     const scriptByChapterId = new Map<Id, ReturnType<typeof parseCanvasScript>>()
@@ -611,36 +625,57 @@ export function createBookService(deps: BookServiceDeps): BookService {
     }
 
     const now = Date.now()
-    const bookId = randomId()
+    const bookId = appendTarget ? appendTarget.id : randomId()
     const totalChars = included.reduce((s, d) => s + d.charCount, 0)
 
-    const book: Book = {
-      id: bookId,
-      projectId,
-      title: req.bookMeta.title.trim().slice(0, 200) || '未命名作品',
-      author: req.bookMeta.author ?? null,
-      narrator: req.bookMeta.narrator ?? '旁白',
-      language: req.bookMeta.language ?? 'zh-CN',
-      sourceType: req.source.type,
-      sourcePath: req.source.path ?? null,
-      encoding: req.source.encoding ?? null,
-      contentHash: req.source.contentHash,
-      charCount: totalChars,
-      chapterCount: included.length,
-      coverPath: req.bookMeta.coverPath ?? null,
-      createdAt: now,
-      updatedAt: now,
-    }
+    // 追加：seq 从目标书末尾顺延；startOffset/endOffset 是**全书绝对偏移**，要叠加已有正文长度
+    const baseSeq = appendTarget ? await chapters.nextSeq(appendTarget.id) : 1
+    const baseOffset = appendTarget
+      ? (await chapters.listByBook(appendTarget.id)).reduce((max, c) => Math.max(max, c.endOffset), 0)
+      : 0
+
+    const book: Book | null = appendTarget
+      ? null
+      : {
+          id: bookId,
+          projectId,
+          title: req.bookMeta.title.trim().slice(0, 200) || '未命名作品',
+          author: req.bookMeta.author ?? null,
+          narrator: req.bookMeta.narrator ?? '旁白',
+          language: req.bookMeta.language ?? 'zh-CN',
+          sourceType: req.source.type,
+          sourcePath: req.source.path ?? null,
+          encoding: req.source.encoding ?? null,
+          contentHash: req.source.contentHash,
+          charCount: totalChars,
+          chapterCount: included.length,
+          coverPath: req.bookMeta.coverPath ?? null,
+          createdAt: now,
+          updatedAt: now,
+        }
 
     const payload = included.map((draft, i) => {
-      const chapter = buildChapterFromDraft(draft, { bookId, seq: i + 1, timestamp: now })
+      const chapter = buildChapterFromDraft(draft, {
+        bookId,
+        seq: baseSeq + i,
+        timestamp: now,
+        baseOffset,
+      })
       if (draft.canvasScript) scriptByChapterId.set(chapter.id, draft.canvasScript)
       return { chapter, rawText: draft.rawText, text: draft.rawText }
     })
 
     await withTransaction(async (tx) => {
-      await tx.bookRepo.insert(book)
+      if (book) await tx.bookRepo.insert(book)
       await tx.chapterRepo.insertMany(payload)
+      if (appendTarget) {
+        // 追加不新建书：只累加章数与字数（书名/作者/封面/来源沿用原书）
+        await tx.bookRepo.update(appendTarget.id, {
+          chapterCount: appendTarget.chapterCount + included.length,
+          charCount: appendTarget.charCount + totalChars,
+          updatedAt: now,
+        })
+      }
     })
 
     // 画本模式：章节建好后写画本行与角色（外键可用）
@@ -663,10 +698,9 @@ export function createBookService(deps: BookServiceDeps): BookService {
       projectId,
       chapters: included.length,
       chars: totalChars,
-      sourceType: book.sourceType,
+      sourceType: req.source.type,
+      appended: appendTarget !== null,
     })
-    void books
-    void chapters
     return { bookId, chapterCount: included.length }
   }
 
@@ -883,8 +917,10 @@ function defaultSha256Hex(data: string | Uint8Array): string {
 /** drafts → Chapter（与 import.service.ts 的 buildChapter 同语义，但不需要 volumes 上下文） */
 function buildChapterFromDraft(
   draft: ChapterDraft,
-  ctx: { bookId: Id; seq: number; timestamp: number },
+  // baseOffset：追加导入时，本章偏移要叠加目标书已有正文长度（startOffset 是**全书坐标**）
+  ctx: { bookId: Id; seq: number; timestamp: number; baseOffset?: number },
 ): Chapter {
+  const shift = ctx.baseOffset ?? 0
   return {
     id: randomId(),
     bookId: ctx.bookId,
@@ -896,8 +932,8 @@ function buildChapterFromDraft(
     // commitImport 收到的是已确认的 drafts，卷标题已丢失 —— 这里保留 null 而不是编一个。
     volumeTitle: null,
     charCount: draft.charCount,
-    startOffset: draft.startOffset,
-    endOffset: draft.endOffset,
+    startOffset: draft.startOffset + shift,
+    endOffset: draft.endOffset + shift,
     canvasState: draft.canvasScript && draft.canvasScript.lines.length > 0 ? 'generated' : 'none',
     lineCount: draft.canvasScript ? draft.canvasScript.lines.length : countNonEmptyLines(draft.rawText),
     createdAt: ctx.timestamp,

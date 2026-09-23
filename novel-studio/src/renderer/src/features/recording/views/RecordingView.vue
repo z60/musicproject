@@ -14,6 +14,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import type { AppSettings, CanvasLine, Character, RecordingMode, Take } from '@shared/types.ts'
 import { RECORD_LIMITS, VAD_DEFAULTS } from '@shared/constants.ts'
+import { ROLE_FILTER_ALL, ROLE_FILTER_NARRATION, filterLinesByRole } from '@shared/canvas/role-filter.ts'
 import { AppError } from '@shared/errors.ts'
 import { call, callSafe } from '@/shared/lib/ipc.ts'
 import { reportError } from '@/shared/lib/error-bus.ts'
@@ -69,6 +70,19 @@ interface TakeListExposed { player: HTMLAudioElement | null; stop: () => void }
 const mode = ref<RecordingMode>(route.query.mode === 'continuous' ? 'continuous' : 'line_by_line')
 const lines = ref<CanvasLine[]>([])
 const characters = ref<Character[]>([])
+/**
+ * 「按角色录制」筛选：'all' = 全部行；'narration' = 只录旁白；其余是 characterId。
+ * 只决定**本页要走/要录的行**，不改画本、不改行的说话人 —— 与任务包页（docs/12 §5）同一语义。
+ */
+const roleFilter = ref<string>(ROLE_FILTER_ALL)
+/** 工作行：导航、进度、当前行一律以它为准（不筛选时就是整章） */
+/**
+ * 工作行。⚠️ 角色筛选只在**逐行模式**生效：连续模式的一段录音会按整章做 VAD 切片与匹配
+ *（continuous.store 的 runMatch 面向整章），按角色过滤只会误导「这段只属于我」。
+ */
+const workLines = computed<CanvasLine[]>(() => (
+  mode.value === 'line_by_line' ? filterLinesByRole(lines.value, roleFilter.value) : lines.value
+))
 const loading = ref(false)
 const currentIndex = ref(0)
 const activeFlags = ref<string[]>([])
@@ -87,9 +101,9 @@ const POST_ROLL_MS = 1000
 const punchTakeId = ref<string | null>(null)
 const punchInMs = ref(0)
 const punchOutMs = ref(0)
-const currentLine = computed<CanvasLine | null>(() => lines.value[currentIndex.value] ?? null)
-const prevLine = computed<CanvasLine | null>(() => (currentIndex.value > 0 ? lines.value[currentIndex.value - 1] ?? null : null))
-const nextLine = computed<CanvasLine | null>(() => lines.value[currentIndex.value + 1] ?? null)
+const currentLine = computed<CanvasLine | null>(() => workLines.value[currentIndex.value] ?? null)
+const prevLine = computed<CanvasLine | null>(() => (currentIndex.value > 0 ? workLines.value[currentIndex.value - 1] ?? null : null))
+const nextLine = computed<CanvasLine | null>(() => workLines.value[currentIndex.value + 1] ?? null)
 const charsPerSecond = computed(() => settings.recording?.vad?.charsPerSecond ?? VAD_DEFAULTS.charsPerSecond)
 const deviceOptions = computed(() => devices.inputs)
 const characterNames = computed(() => new Map(characters.value.map(character => [character.id, character])))
@@ -98,8 +112,39 @@ function speakerNameOf(line: CanvasLine | null): string {
   if (line.characterId) return characterNames.value.get(line.characterId)?.name ?? '未知角色'
   return '未指定角色'
 }
-const lineProgressText = computed(() => (lines.value.length ? `${currentIndex.value + 1}/${lines.value.length}` : ''))
-const recordedLineCount = computed(() => lines.value.filter(line => (takes.byLine[line.id] ?? []).length > 0).length)
+/** 本章有行的角色（含行数）—— 只列本章真的出现的角色，避免下拉里塞几十个没行的人 */
+const chapterCharacterOptions = computed<Array<{ id: string; name: string; count: number }>>(() => {
+  const counts = new Map<string, number>()
+  for (const line of lines.value) {
+    if (line.speakerType === 'narration' || !line.characterId) continue
+    counts.set(line.characterId, (counts.get(line.characterId) ?? 0) + 1)
+  }
+  return [...counts.entries()].map(([id, count]) => ({
+    id,
+    name: characterNames.value.get(id)?.name ?? '未知角色',
+    count,
+  }))
+})
+const narrationLineCount = computed(() => lines.value.filter(line => line.speakerType === 'narration').length)
+/** 当前筛选的展示名（进度文案与空态提示用） */
+const roleFilterLabel = computed(() => {
+  if (roleFilter.value === ROLE_FILTER_ALL) return '全部角色'
+  if (roleFilter.value === ROLE_FILTER_NARRATION) return '旁白'
+  return characterNames.value.get(roleFilter.value)?.name ?? '未知角色'
+})
+/** 切换「按角色录制」：录音中禁止（会误导）；切换后定位到该范围内第一个未录行 */
+function onRoleFilterChange(event: Event): void {
+  if (recording.isRecording || recording.isPaused) {
+    pageNotice.value = '录音中不能切换角色：请先停止本次录音。'
+    return
+  }
+  roleFilter.value = (event.target as HTMLSelectElement).value
+  releasePinnedTake()
+  const firstUnrecorded = workLines.value.findIndex(line => (takes.byLine[line.id] ?? []).length === 0)
+  currentIndex.value = firstUnrecorded > 0 ? firstUnrecorded : 0
+}
+const lineProgressText = computed(() => (workLines.value.length ? `${currentIndex.value + 1}/${workLines.value.length}` : ''))
+const recordedLineCount = computed(() => workLines.value.filter(line => (takes.byLine[line.id] ?? []).length > 0).length)
 const currentTakes = computed<Take[]>(() => (currentLine.value ? takes.takesOf(currentLine.value.id) : []))
 const visibleTakes = computed<Take[]>(() => (currentLine.value ? takes.visibleOf(currentLine.value.id) : []))
 const selectedTake = computed<Take | null>(() => (currentLine.value ? takes.selectedOf(currentLine.value.id) : null))
@@ -135,9 +180,11 @@ async function loadAll(): Promise<void> {
     ])
     lines.value = page.lines ?? []
     characters.value = chars ?? []
+    // 拉整章 take：进度（含按角色筛选后的进度）才准，否则只有走过的行才有 byLine
+    await takes.loadByChapter(chapterId)
   } finally { loading.value = false }
-  // 起录时定位到第一个未录行（docs/12 §3.3）
-  const firstUnrecorded = lines.value.findIndex(line => (takes.byLine[line.id] ?? []).length === 0)
+  // 起录时定位到第一个未录行（docs/12 §3.3）；有角色筛选时只在筛选范围内找
+  const firstUnrecorded = workLines.value.findIndex(line => (takes.byLine[line.id] ?? []).length === 0)
   currentIndex.value = firstUnrecorded > 0 ? firstUnrecorded : 0
 }
 watch(currentLine, (line) => {
@@ -193,13 +240,13 @@ function moveLine(delta: number): void {
   if (!canJump()) return
   releasePinnedTake()
   const next = currentIndex.value + delta
-  if (next >= 0 && next < lines.value.length) currentIndex.value = next
+  if (next >= 0 && next < workLines.value.length) currentIndex.value = next
 }
 /** 下一行 = 下一个未录行（不是序号 +1），避免在已录区域反复跳（docs/12 §3.3） */
 function nextUnrecordedLine(): void {
   if (!canJump()) return
-  for (let i = currentIndex.value + 1; i < lines.value.length; i++) {
-    if ((takes.byLine[lines.value[i]!.id] ?? []).length === 0) { currentIndex.value = i; return }
+  for (let i = currentIndex.value + 1; i < workLines.value.length; i++) {
+    if ((takes.byLine[workLines.value[i]!.id] ?? []).length === 0) { currentIndex.value = i; return }
   }
   moveLine(1)
 }
@@ -510,7 +557,7 @@ onBeforeUnmount(() => {
       <div>
         <h2 class="ns-rec__title">{{ session.breadcrumb || '录音' }}</h2>
         <p class="ns-rec__sub">
-          行进度 {{ lineProgressText || UNKNOWN }} · 章进度 {{ formatProgressRatio(recordedLineCount, lines.length) }} ·
+          行进度 {{ lineProgressText || UNKNOWN }} · {{ roleFilterLabel }}进度 {{ formatProgressRatio(recordedLineCount, workLines.length) }} ·
           {{ recording.isRecording ? '录制中' : recording.isPaused ? '已暂停' : '空闲' }}
           · 已录 {{ formatDuration(recording.durationMs, { showMs: true }) }}
         </p>
@@ -522,6 +569,19 @@ onBeforeUnmount(() => {
           :disabled="recording.isRecording || recording.isPaused" @click="mode = 'continuous'">连续</button>
         <button type="button" class="ns-rec__mode" @click="router.push('/recording/task')">任务包</button>
         <button type="button" class="ns-rec__mode" @click="router.push('/recording/continuous')">切片确认</button>
+      </div>
+      <!-- 按角色录制：只走/只录该角色的行（docs/12 §5 的轻量版，不改画本）；连续模式不适用 -->
+      <div v-if="mode === 'line_by_line'" class="ns-rec__row">
+        <label class="ns-rec__field"><span>录制角色</span>
+          <select class="ns-rec__control" :value="roleFilter"
+            :disabled="recording.isRecording || recording.isPaused" @change="onRoleFilterChange">
+            <option value="all">全部角色（{{ formatInt(lines.length) }} 行）</option>
+            <option value="narration">旁白（{{ formatInt(narrationLineCount) }} 行）</option>
+            <option v-for="item in chapterCharacterOptions" :key="item.id" :value="item.id">
+              {{ item.name }}（{{ formatInt(item.count) }} 行）
+            </option>
+          </select>
+        </label>
       </div>
       <div class="ns-rec__row">
         <label class="ns-rec__field"><span>输入设备</span>
@@ -561,6 +621,9 @@ onBeforeUnmount(() => {
 
     <!-- 本章没有画本行时只给一句引导：录音的前提是画本已生成（docs/11） -->
     <p v-if="!loading && !lines.length" class="ns-rec__note">本章还没有画本行：请先在画本编辑页生成画本，再回来录音。</p>
+    <p v-else-if="!loading && !workLines.length" class="ns-rec__note">
+      当前筛选「{{ roleFilterLabel }}」在本章没有行：请换一个角色，或选「全部角色」。
+    </p>
 
     <!-- 主区：左（当前行）/ 中（波形 + 电平）/ 右（take 列表） -->
     <div v-else class="ns-rec__layout">
