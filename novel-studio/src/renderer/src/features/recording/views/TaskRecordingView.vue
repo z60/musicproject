@@ -23,6 +23,7 @@ import EmptyState from '@/shared/ui/EmptyState.vue'
 import LoadingBlock from '@/shared/ui/LoadingBlock.vue'
 import CountdownOverlay from '../components/CountdownOverlay.vue'
 import LinePromptCard from '../components/LinePromptCard.vue'
+import { buildLineContext } from '@shared/canvas/context-window.ts'
 import TakeCompareDialog from '../components/TakeCompareDialog.vue'
 import TakeFlagsPanel from '../components/TakeFlagsPanel.vue'
 import TakeList from '../components/TakeList.vue'
@@ -81,8 +82,14 @@ const myLines = computed(() => lines.value.filter((line) => {
 const recordedLineIds = computed(() => new Set(Object.keys(takes.byLine).filter(id => (takes.byLine[id] ?? []).length > 0)))
 const workLines = computed(() => (onlyUnrecorded.value ? myLines.value.filter(line => !recordedLineIds.value.has(line.id)) : myLines.value))
 const currentLine = computed<CanvasLine | null>(() => workLines.value[currentIndex.value] ?? null)
-const prevLine = computed<CanvasLine | null>(() => (currentIndex.value > 0 ? workLines.value[currentIndex.value - 1] ?? null : null))
 const nextLine = computed<CanvasLine | null>(() => workLines.value[currentIndex.value + 1] ?? null)
+/** 上下文取**整章**里当前行的前后各 2 行（含当前行）—— 别把别的角色的相邻行漏掉 */
+const chapterIndexOfCurrentLine = computed(() => {
+  const id = currentLine.value?.id
+  if (!id) return -1
+  return lines.value.findIndex(line => line.id === id)
+})
+const contextLines = computed(() => buildLineContext(lines.value, chapterIndexOfCurrentLine.value, 2, 2))
 const currentTakes = computed<Take[]>(() => (currentLine.value ? takes.takesOf(currentLine.value.id) : []))
 const visibleTakes = computed<Take[]>(() => (currentLine.value ? takes.visibleOf(currentLine.value.id) : []))
 const selectedTake = computed<Take | null>(() => (currentLine.value ? takes.selectedOf(currentLine.value.id) : null))
@@ -342,7 +349,7 @@ onBeforeUnmount(() => {
 
     <div v-else class="ns-task__layout">
       <section class="ns-task__col">
-        <LinePromptCard :line="currentLine" :prev-line="prevLine" :next-line="nextLine" readonly
+        <LinePromptCard :line="currentLine" :context="contextLines" :speaker-name-of="speakerNameOf" readonly
           :speaker-name="speakerNameOf(currentLine)" :line-progress="currentLinePosition()"
           :take-count="currentTakes.length" :has-selected-take="selectedTake !== null"
           @edit="onEditRequest" @report="onReportText" />

@@ -318,7 +318,15 @@ export interface CreateDbPortOptions {
   /** 当前连接（恢复期间会被关闭再重开，因此是取值函数而不是句柄） */
   getDb: () => DbLike | null
   dbPath: string
-  backupDir: string
+  /**
+   * 备份目录。
+   *
+   * **应当传取值函数**：用户在「设置 → 路径 → 备份目录」改过之后，备份与列备份都必须
+   * 跟着走，而不是继续写到启动时算出来的默认目录（真机反馈 docs/91 §5.2.48：
+   * 「点击备份按钮，备份的数据不在所选的文件夹下面」）。
+   * 传字符串仍然支持（迁移前的启动期备份等场景）。
+   */
+  backupDir: string | (() => string)
   log: Logger
   /** 关闭当前连接（恢复流程要求先关；带打开的连接替换库文件会立刻损坏） */
   closeForRestore: () => void
@@ -334,15 +342,18 @@ export interface CreateDbPortOptions {
  * 「设置 → 备份」面板打开时发生，同步读不会影响交互。
  */
 export function createDbPort(opts: CreateDbPortOptions): DbPortLike {
+  /** 每次调用现取：设置里改过备份目录后必须立刻生效 */
+  const resolveBackupDir = (): string => (typeof opts.backupDir === 'function' ? opts.backupDir() : opts.backupDir)
   return {
     async backup(): Promise<{ path: string }> {
       const db = opts.getDb()
       if (!db) throw new AppError('DB_NOT_OPEN', { details: { op: 'backup' } })
-      await fsp.mkdir(opts.backupDir, { recursive: true })
-      await pruneBackups(opts.backupDir, opts.log)
+      const backupDir = resolveBackupDir()
+      await fsp.mkdir(backupDir, { recursive: true })
+      await pruneBackups(backupDir, opts.log)
       const res = await backupDatabase(db, backupFileName(new Date()), {
         reason: 'manual',
-        dir: opts.backupDir,
+        dir: backupDir,
       })
       opts.log.info('db.backup.done', { event: 'db.backup.done', path: res.path, sizeBytes: res.sizeBytes })
       return { path: res.path }
@@ -351,9 +362,10 @@ export function createDbPort(opts: CreateDbPortOptions): DbPortLike {
     listBackups(): ReturnType<DbPortLike['listBackups']> {
       const out: ReturnType<DbPortLike['listBackups']> = []
       try {
-        for (const name of readdirSync(opts.backupDir)) {
+        const backupDir = resolveBackupDir()
+        for (const name of readdirSync(backupDir)) {
           if (!name.endsWith('.db')) continue
-          const full = join(opts.backupDir, name)
+          const full = join(backupDir, name)
           let sizeBytes = 0
           let createdAt = 0
           try {

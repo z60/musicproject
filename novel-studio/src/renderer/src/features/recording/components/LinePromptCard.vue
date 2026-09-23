@@ -24,12 +24,15 @@ import { recordingMessage } from '../stores/recording.store.ts'
 const props = withDefaults(defineProps<{
   /** 当前要录的行（未加载出来时为 null） */
   line: CanvasLine | null
-  /** 上下文：前一行 */
-  prevLine?: CanvasLine | null
-  /** 上下文：后一行 */
-  nextLine?: CanvasLine | null
-  /** 说话人显示名（角色名或「旁白」），由页面解析后传入，避免组件里跨域查角色表 */
+  /**
+   * 上下文窗口：当前行前后各若干行（**含当前行本身**）。
+   * 由页面用 `buildLineContext` 按**整章**下标算好，界面把 `current` 的那条框出来。
+   */
+  context?: Array<{ line: CanvasLine; offset: number; current: boolean }>
+  /** 说话人显示名（当前行；角色名或「旁白」），由页面解析后传入，避免组件里跨域查角色表 */
   speakerName?: string
+  /** 上下文里任意行的说话人显示名（不传则退化成「旁白 / 角色」） */
+  speakerNameOf?: ((line: CanvasLine) => string) | null
   /** 行进度展示（如 `42/87`） */
   lineProgress?: string
   /** 预计朗读时长（毫秒）—— 由页面按字数/语速/情绪系数算好传入 */
@@ -44,9 +47,9 @@ const props = withDefaults(defineProps<{
   /** 该行是否被标记「本轮跳过」（docs/12 §3.3） */
   skipped?: boolean
 }>(), {
-  prevLine: null,
-  nextLine: null,
+  context: () => [],
   speakerName: '旁白',
+  speakerNameOf: null,
   lineProgress: '',
   estimatedDurationMs: null,
   charsPerSecond: 4.2,
@@ -107,10 +110,10 @@ const estimatedText = computed(() => {
 /** 字里挑多音字不做自动替换，只在有 pronunciation 提示时显示（docs/11 §5） */
 const pronunciation = computed(() => props.line?.pronunciation ?? null)
 
-function contextLine(line: CanvasLine | null | undefined): string {
-  if (!line) return UNKNOWN
-  const speaker = line.speakerType === 'narration' ? '旁白' : '角色'
-  return `${line.seq} (${speaker}) ${line.text}`
+/** 上下文里每一行的说话人：优先用页面传入的解析器（能显示真实角色名） */
+function contextSpeaker(line: CanvasLine): string {
+  if (props.speakerNameOf) return props.speakerNameOf(line)
+  return line.speakerType === 'narration' ? '旁白' : '角色'
 }
 </script>
 
@@ -163,9 +166,17 @@ function contextLine(line: CanvasLine | null | undefined): string {
       </dl>
 
       <div class="ns-prompt__context">
-        <span class="ns-prompt__context-label">上下文</span>
-        <p class="ns-prompt__context-line">{{ contextLine(prevLine) }}</p>
-        <p class="ns-prompt__context-line">{{ contextLine(nextLine) }}</p>
+        <span class="ns-prompt__context-label">上下文（前 2 / 后 2，当前行已框出）</span>
+        <p
+          v-for="item in context"
+          :key="item.line.id"
+          class="ns-prompt__context-line"
+          :class="{ 'is-current': item.current }"
+        >
+          <span class="ns-prompt__context-seq">{{ item.line.seq }}</span>
+          <span class="ns-prompt__context-speaker">{{ contextSpeaker(item.line) }}</span>
+          <span class="ns-prompt__context-text">{{ item.line.text }}</span>
+        </p>
       </div>
 
       <footer class="ns-prompt__actions">
@@ -284,6 +295,24 @@ function contextLine(line: CanvasLine | null | undefined): string {
   color: var(--ns-text-secondary, #909399);
   font-size: 13px;
   line-height: 1.6;
+}
+/* 当前录制行在上下文里也要"被框起来"，否则眼睛要在提示卡与上下文之间来回找 */
+.ns-prompt__context-line.is-current {
+  margin-top: 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--ns-primary, #409eff);
+  border-radius: 4px;
+  background: var(--ns-primary-light-9, #ecf5ff);
+  color: var(--ns-text-primary, #303133);
+  font-weight: 600;
+}
+.ns-prompt__context-seq {
+  margin-right: 6px;
+  color: var(--ns-text-placeholder, #c0c4cc);
+}
+.ns-prompt__context-speaker {
+  margin-right: 6px;
+  color: var(--ns-primary, #409eff);
 }
 .ns-prompt__empty {
   padding: 12px 0;

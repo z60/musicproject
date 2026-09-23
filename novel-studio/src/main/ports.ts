@@ -167,13 +167,21 @@ export function buildHandlerDeps(opts: BuildHandlerDepsOptions): BuiltPorts {
     tempRoot: join(paths.cacheDir, 'tasks'),
   })
 
+  /**
+   * `app:getPaths` 的返回值。
+   *
+   * `backupDir` 用**取值函数**：设置里改了备份目录之后，这里报告的必须是**生效值**，
+   * 否则设置页/帮助页显示的目录与实际写盘位置不一致（真机反馈 docs/91 §5.2.48）。
+   */
   const pathsRecord = {
     userData: paths.userData,
     projectRoot: paths.projectRoot,
     exportDir: paths.exportDir,
     cacheDir: paths.cacheDir,
     logDir: paths.logDir,
-    backupDir: paths.backupDir,
+    get backupDir(): string {
+      return state.settings?.current?.().paths?.backupDir || paths.backupDir
+    },
     modelDir: paths.modelDir,
     resourceDir: paths.resourceDir,
   }
@@ -619,7 +627,12 @@ export function buildHandlerDeps(opts: BuildHandlerDepsOptions): BuiltPorts {
   const dbPort = createDbPort({
     getDb: () => state.db,
     dbPath: state.dbPath ?? join(paths.userData, 'novel-studio.db'),
-    backupDir: paths.backupDir,
+    /**
+     * 备份目录**每次现取设置**（真机反馈 docs/91 §5.2.48）：用户在「设置 → 路径 →
+     * 备份目录」里选的目录必须真的生效，而不是继续写启动期算出来的默认目录。
+     * 与导出目录（`exportDir: () => …paths?.exportDir || paths.exportDir`）同一做法。
+     */
+    backupDir: () => state.requireSettings().current().paths?.backupDir || paths.backupDir,
     log,
     closeForRestore: () => {
       try {

@@ -15,6 +15,7 @@ import { useRoute, useRouter } from 'vue-router'
 import type { AppSettings, CanvasLine, Character, RecordingMode, Take } from '@shared/types.ts'
 import { RECORD_LIMITS, VAD_DEFAULTS } from '@shared/constants.ts'
 import { ROLE_FILTER_ALL, ROLE_FILTER_NARRATION, filterLinesByRole } from '@shared/canvas/role-filter.ts'
+import { buildLineContext } from '@shared/canvas/context-window.ts'
 import { AppError } from '@shared/errors.ts'
 import { call, callSafe } from '@/shared/lib/ipc.ts'
 import { reportError } from '@/shared/lib/error-bus.ts'
@@ -102,8 +103,16 @@ const punchTakeId = ref<string | null>(null)
 const punchInMs = ref(0)
 const punchOutMs = ref(0)
 const currentLine = computed<CanvasLine | null>(() => workLines.value[currentIndex.value] ?? null)
-const prevLine = computed<CanvasLine | null>(() => (currentIndex.value > 0 ? workLines.value[currentIndex.value - 1] ?? null : null))
-const nextLine = computed<CanvasLine | null>(() => workLines.value[currentIndex.value + 1] ?? null)
+/**
+ * 上下文取**整章**里当前行的前后各 2 行（不是筛选后的工作集）：
+ * 按角色录制时，别的角色的相邻行恰恰是语气衔接的关键，用工作集下标会漏掉它们。
+ */
+const chapterIndexOfCurrentLine = computed(() => {
+  const id = currentLine.value?.id
+  if (!id) return -1
+  return lines.value.findIndex(line => line.id === id)
+})
+const contextLines = computed(() => buildLineContext(lines.value, chapterIndexOfCurrentLine.value, 2, 2))
 const charsPerSecond = computed(() => settings.recording?.vad?.charsPerSecond ?? VAD_DEFAULTS.charsPerSecond)
 const deviceOptions = computed(() => devices.inputs)
 const characterNames = computed(() => new Map(characters.value.map(character => [character.id, character])))
@@ -628,7 +637,7 @@ onBeforeUnmount(() => {
     <!-- 主区：左（当前行）/ 中（波形 + 电平）/ 右（take 列表） -->
     <div v-else class="ns-rec__layout">
       <section class="ns-rec__col">
-        <LinePromptCard :line="currentLine" :prev-line="prevLine" :next-line="nextLine"
+        <LinePromptCard :line="currentLine" :context="contextLines" :speaker-name-of="speakerNameOf"
           :speaker-name="speakerNameOf(currentLine)" :line-progress="lineProgressText" :take-count="currentTakes.length"
           :estimated-duration-ms="currentLine ? Math.round(currentLine.text.length / charsPerSecond * 1000) : null"
           :chars-per-second="charsPerSecond" :has-selected-take="selectedTake !== null" @edit="router.push('/canvas')" />
