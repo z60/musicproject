@@ -12,6 +12,7 @@ import { describe, it } from 'node:test'
 
 import {
   CANVAS_CHARACTER_TABLE_HEADER,
+  blankCanvasCharacterTables,
   detectCanvasScript,
   parseCanvasScript,
   splitSpeakerTag,
@@ -201,6 +202,71 @@ describe('画本脚本解析 · 角色表', () => {
     const t = table([{ no: 1, cv: 'A', name: '甲', gender: '男', desc: 'd', lines: 1, voice: 'v', age: 20 }])
     const r = parseCanvasScript(t + '\n旁白\n' + t)
     assert.equal(r.characters.length, 1)
+  })
+})
+
+
+describe('画本脚本解析 · 角色表（列数不固定）', () => {
+  it('空单元格被丢掉导致的变列数表格（5/6/7 列）也整张吃掉、不落进正文', () => {
+    const text = [
+      '第1章 标题',
+      '序号 | CV | 角色名 | 性别 | 角色描述 | 台词数 | 音色 | 年龄',
+      '15 | 机车教练揭扬眉 | 现场解说A | 男 | 167',
+      '18 | 阡陌丨平凡 | 预备助教乙 | 无 | 龙套 | 3',
+      '19 | 5号MVP | 预备助教丙 | 无 | 1',
+      '【杨浩-嬉小天】“台词”',
+    ].join('\n')
+    const r = parseCanvasScript(text)
+    // 关键：表格行一行都不能变成旁白
+    assert.deepEqual(r.lines.map((l) => l.text), ['第1章 标题', '台词'])
+    assert.deepEqual(r.characters.map((c) => c.name), ['现场解说A', '预备助教乙', '预备助教丙'])
+    assert.equal(r.characters[0]!.cv, '机车教练揭扬眉')
+    assert.equal(r.characters[1]!.gender, '无')
+  })
+
+  it('表头只剩 6 列（音色/年龄空列被丢）也能识别整表', () => {
+    const text = [
+      '序号 | CV | 角色名 | 性别 | 角色描述 | 台词数',
+      '1 | 嬉小天 | 杨浩 | 男 | 男主 | 1645',
+      '旁白正文',
+    ].join('\n')
+    const r = parseCanvasScript(text)
+    assert.equal(r.characters.length, 1)
+    assert.equal(r.characters[0]!.name, '杨浩')
+    assert.deepEqual(r.lines.map((l) => l.text), ['旁白正文'])
+  })
+})
+
+describe('blankCanvasCharacterTables · 角色表不进正文', () => {
+  it('pipe 形态：等长抹除，正文偏移不变', () => {
+    const text = [
+      '第1章 标题',
+      '序号 | CV | 角色名 | 性别 | 角色描述 | 台词数 | 音色 | 年龄',
+      '1 | 嬉小天 | 杨浩 | 男 | 男主 | 1645 | 青叔音 | 25',
+      '【杨浩-嬉小天】“台词”',
+    ].join('\n')
+    const before = parseCanvasScript(text)
+    const blanked = blankCanvasCharacterTables(text)
+    assert.equal(blanked.length, text.length, '长度必须一致（否则偏移会错位）')
+    assert.equal(blanked.split('\n').length, text.split('\n').length, '行数必须一致')
+    const lines = blanked.split('\n')
+    assert.equal(lines[1]!.trim(), '')
+    assert.equal(lines[2]!.trim(), '')
+    assert.equal(lines[3], '【杨浩-嬉小天】“台词”', '台词行不能被误抹')
+    const after = parseCanvasScript(blanked, { chapterTitle: '第1章 标题' })
+    assert.equal(after.characters.length, 0, '正文里已无角色表')
+    assert.deepEqual(after.lines.map((l) => l.text), ['台词'])
+    assert.equal(after.lines[0]!.charStart, before.lines[1]!.charStart, '偏移必须保持')
+    assert.equal(after.lines[0]!.charEnd, before.lines[1]!.charEnd)
+  })
+
+  it('每格一行形态：整表抹掉，段落保留', () => {
+    const t = table([{ no: 1, cv: 'A', name: '甲', gender: '男', desc: 'd', lines: 1, voice: 'v', age: 20 }])
+    const text = '旁白一\n' + t + '\n旁白二'
+    const blanked = blankCanvasCharacterTables(text)
+    assert.equal(blanked.length, text.length)
+    assert.equal(blanked.includes('甲'), false)
+    assert.deepEqual(parseCanvasScript(blanked).lines.map((l) => l.text), ['旁白一', '旁白二'])
   })
 })
 

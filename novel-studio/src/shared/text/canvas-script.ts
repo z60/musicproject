@@ -5,8 +5,10 @@
  *
  *   · 台词行：【角色名-CV名】“台词”（CV 可省略，写成 【角色名】“台词”）
  *   · 旁白行：其余非空段落
- *   · 每章末尾有一张**角色表**，表头固定 8 列：
+ *   · 每章末尾有一张**角色表**，列依次是：
  *       序号 / CV / 角色名 / 性别 / 角色描述 / 台词数 / 音色 / 年龄
+ *     注意：**空单元格在转文本时会被丢掉**，所以同一张表里各行可能只有 5~8 列，
+ *     不能按「正好 8 列 / 正好 8 行」去认（实测样本里 1151 行因此漏切进了正文）。
  *
  * ### 台词不一定独占一行（真机实测的三种形态）
  *   1. 旁白在前：某某皱眉道：【克莱门特-好风长吟】“这场比赛不好踢。”
@@ -106,17 +108,29 @@ export function isInnerNote(note: string): boolean {
 // 角色表
 // ---------------------------------------------------------------------------
 
-/** 一行 pipe 表格（a | b | ...）：只有正好 8 段才当作角色表行 */
+/**
+ * 一行 pipe 表格（a | b | ...）→ 各单元格。
+ *
+ * ⚠️ **不要求列数固定**：mammoth 把 <tr> 转文本时，**空单元格会被丢掉**，
+ * 于是同一张角色表里会出现 5 / 6 / 7 / 8 列的不同行（实测样本里 1151 行因此漏切、
+ * 直接变成了旁白台词）。这里只要求至少 2 段。
+ */
 export function splitCanvasTableRow(line: string): string[] | null {
   if (!line.includes('|')) return null
   const cells = line.split('|').map((c) => c.trim())
-  return cells.length === CANVAS_CHARACTER_TABLE_HEADER.length ? cells : null
+  return cells.length >= 2 ? cells : null
 }
 
-/** 判断 8 个单元格是否就是角色表表头 */
+/**
+ * 是否是角色表表头。
+ * 只校验**前 6 列前缀**（序号 / CV / 角色名 / 性别 / 角色描述 / 台词数）：
+ * 空列被丢掉时，表头可能只剩 6 列（音色、年龄没了），按整体 8 列校验会整张漏掉。
+ */
 export function isCanvasTableHeader(cells: readonly string[]): boolean {
-  for (let k = 0; k < CANVAS_CHARACTER_TABLE_HEADER.length; k++) {
-    if (cells[k] !== CANVAS_CHARACTER_TABLE_HEADER[k]) return false
+  const required = CANVAS_CHARACTER_TABLE_HEADER.slice(0, 6)
+  if (cells.length < required.length) return false
+  for (let k = 0; k < required.length; k++) {
+    if (cells[k] !== required[k]) return false
   }
   return true
 }
@@ -127,6 +141,16 @@ function isCellHeaderAt(lines: readonly string[], i: number): boolean {
     if ((lines[i + k] ?? '').trim() !== CANVAS_CHARACTER_TABLE_HEADER[k]) return false
   }
   return true
+}
+
+/** 「每格一行」形态下，角色表结束后的下标（表头 + 若干组 8 行数据） */
+function cellTableEnd(lines: readonly string[], start: number): number {
+  let i = start + CANVAS_CHARACTER_TABLE_HEADER.length
+  while (i + CANVAS_CHARACTER_TABLE_HEADER.length <= lines.length) {
+    if (!/^\d+$/.test((lines[i] ?? '').trim())) break
+    i += CANVAS_CHARACTER_TABLE_HEADER.length
+  }
+  return i
 }
 
 /** 8 个单元格 → 角色（角色名为空则丢弃） */
@@ -147,16 +171,14 @@ function pushCharacter(cells: readonly string[], out: CanvasScriptCharacter[]): 
 
 /** 扫描「每格一行」形态的角色表，返回表格结束后的下标 */
 function scanCellTable(lines: readonly string[], start: number, out: CanvasScriptCharacter[]): number {
-  let i = start + CANVAS_CHARACTER_TABLE_HEADER.length
-  while (i + CANVAS_CHARACTER_TABLE_HEADER.length <= lines.length) {
+  const end = cellTableEnd(lines, start)
+  for (let i = start + CANVAS_CHARACTER_TABLE_HEADER.length; i < end; i += CANVAS_CHARACTER_TABLE_HEADER.length) {
     const cells = Array.from({ length: CANVAS_CHARACTER_TABLE_HEADER.length }, (_, k) =>
       (lines[i + k] ?? '').trim(),
     )
-    if (!/^\d+$/.test(cells[0] ?? '')) break
     pushCharacter(cells, out)
-    i += CANVAS_CHARACTER_TABLE_HEADER.length
   }
-  return i
+  return end
 }
 
 // ---------------------------------------------------------------------------
@@ -288,6 +310,56 @@ export function parseCanvasScript(
   }
 
   return { characters: deduped, lines: outLines }
+}
+
+/**
+ * 把角色表从**正文**里抹掉：表头与数据行的可见字符全部替换为空格，**总长度与换行位置完全不变**。
+ *
+ * 为什么用等长空格而不是删行：
+ *   · 画本行的 charStart / charEnd 是相对本章正文的偏移，删行会让所有偏移错位；
+ *   · 等长替换后偏移依旧成立，同时「CV / 角色名 / 台词数 不再出现在正文」的目标也达成。
+ *
+ * 典型用法：先对**原文**调用 parseCanvasScript 拿到角色与画本行，再对同一段原文调用本函数，
+ * 用返回的文本作为入库的章节正文（预览与画布正文都不再出现角色表）。
+ */
+export function blankCanvasCharacterTables(text: string): string {
+  const src = normalizeNewlines(text)
+  const lines = src.split('\n')
+  const blank = (idx: number): void => {
+    const line = lines[idx] ?? ''
+    if (line.length > 0) lines[idx] = ' '.repeat(line.length)
+  }
+
+  let i = 0
+  while (i < lines.length) {
+    const trimmed = (lines[i] ?? '').trim()
+
+    // 形态一：每格一行
+    if (trimmed === CANVAS_CHARACTER_TABLE_HEADER[0] && isCellHeaderAt(lines, i)) {
+      const end = cellTableEnd(lines, i)
+      for (let k = i; k < end; k++) blank(k)
+      i = end
+      continue
+    }
+
+    // 形态二：整行 pipe 连接（列数不固定，见 splitCanvasTableRow 说明）
+    const pipe = splitCanvasTableRow(trimmed)
+    if (pipe && isCanvasTableHeader(pipe)) {
+      let j = i + 1
+      while (j < lines.length) {
+        const row = splitCanvasTableRow((lines[j] ?? '').trim())
+        if (!row || !/^\d+$/.test(row[0] ?? '')) break
+        j++
+      }
+      for (let k = i; k < j; k++) blank(k)
+      i = j
+      continue
+    }
+
+    i++
+  }
+
+  return lines.join('\n')
 }
 
 export interface CanvasScriptDetection {

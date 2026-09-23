@@ -38,7 +38,7 @@ import type {
   Id,
   ImportFileProbe,
 } from '../../../../shared/types.ts'
-import { parseCanvasScript } from '../../../../shared/text/canvas-script.ts'
+import { blankCanvasCharacterTables, parseCanvasScript } from '../../../../shared/text/canvas-script.ts'
 import { BUILTIN_RULE_SETS, CANVAS_IMPORT_RULE_SET, IMPORT_LIMITS, VAD_DEFAULTS } from '../../../../shared/constants.ts'
 import { AppError, formatBytes, resolve, type DisplayableError } from '../../../../shared/errors.ts'
 import { createDecoder, detectEncoding, normalizeNewlines, stripBom, type Decoder, type EncodingSniffer } from '../../../../shared/text/encoding.ts'
@@ -603,9 +603,17 @@ export async function runImport(request: ImportRequest, deps: ImportDeps): Promi
   // 画本模式：逐章解析成「画本行 + 角色」。放在人工干预之后 —— 被取消勾选的章节不白解析。
   // 只在**真正入库**时解析：预览（persist=false）不需要画本行，否则 IPC 载荷会翻倍；
   // 向导提交时 commitImport 会再解析一次。
-  if (request.importMode === 'canvas' && request.persist !== false) {
+  if (request.importMode === 'canvas') {
+    // 画本模式：先用**原文**解析出角色与画本行（需要表格里的 CV / 角色名），
+    // 再把角色表从正文里**等长抹掉** —— 正文里不再出现「序号 | CV | 角色名 | …」，
+    // 而画本行的 charStart / charEnd 偏移依旧成立（见 blankCanvasCharacterTables）。
+    if (request.persist !== false) {
+      for (const draft of drafts) {
+        draft.canvasScript = parseCanvasScript(draft.rawText, { chapterTitle: draft.title })
+      }
+    }
     for (const draft of drafts) {
-      draft.canvasScript = parseCanvasScript(draft.rawText, { chapterTitle: draft.title })
+      draft.rawText = blankCanvasCharacterTables(draft.rawText)
     }
   }
 
