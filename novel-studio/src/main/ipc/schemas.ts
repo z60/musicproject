@@ -517,6 +517,8 @@ export const IPC_REQ_SCHEMAS = {
     text: v.optional(v.string({ max: 200_000_000, nonEmpty: false })),
     ruleSetId: OptId,
     cleanOptions: v.optional(v.record(v.boolean())),
+    /** 'canvas' = 文档本身已经是画本（【角色-CV】“台词”） */
+    importMode: v.optional(v.enum(['text', 'canvas'])),
   }),
   'book:commitImport': v.object({
     projectId: Id,
@@ -534,6 +536,7 @@ export const IPC_REQ_SCHEMAS = {
       contentHash: v.string().max(128),
     }),
     drafts: v.array(ChapterDraftShape, { max: 20_000 }),
+    importMode: v.optional(v.enum(['text', 'canvas'])),
   }),
   'book:importFile': v.object({ projectId: Id, filePath: v.string().max(2000), options: v.optional(LooseObject) }),
   'book:importText': v.object({

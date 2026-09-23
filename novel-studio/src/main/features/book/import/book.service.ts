@@ -19,6 +19,7 @@
  *      给不出文本预览（`encoding.ts` 会用 NO_DECODER_NOTE 说明）。iconv-lite 是依赖里有的。
  */
 
+import { createHash } from 'node:crypto'
 import { promises as fsp } from 'node:fs'
 
 import { AppError } from '../../../../shared/errors.ts'
@@ -33,7 +34,7 @@ import type {
 } from '../../../../shared/types.ts'
 import type { CleanOptions, CleanReportDetail } from '../../../../shared/text/clean.ts'
 import type { ChapterDraft } from '../../../../shared/types.ts'
-import { detectEncoding, type Decoder } from '../../../../shared/text/encoding.ts'
+import { detectEncoding, type Decoder, type EncodingSniffer } from '../../../../shared/text/encoding.ts'
 import type { DbLike } from '../../../infra/db/types.ts'
 import { withTransactionAsync } from '../../../infra/db/with-transaction.ts'
 import { countNonEmptyLines } from '../../../../shared/text/lines.ts'
@@ -44,12 +45,17 @@ import { createSqliteBookRepo } from './repositories/book.repo.sqlite.ts'
 import { createSqliteChapterRepo } from './repositories/chapter.repo.sqlite.ts'
 import { createSqliteProjectRepo, type ProjectRepo } from './repositories/project.repo.ts'
 import { probeFile as probeFileImpl } from './parsers/index.ts'
+import type { DocxConverter } from './parsers/docx.parser.ts'
+import type { PdfTextExtractor } from './parsers/pdf.parser.ts'
+import type { FetchLike, HtmlExtractor } from './parsers/web.parser.ts'
 import {
   runImport,
+  type CanvasImportPort,
   type ImportRequest,
   type ImportPreview,
   type ImportTxContext,
 } from './import.service.ts'
+import { parseCanvasScript } from '../../../../shared/text/canvas-script.ts'
 
 // ---------------------------------------------------------------------------
 // 依赖
@@ -64,6 +70,11 @@ export interface BookServiceDeps {
   queue?: TaskQueue
   /** 项目级覆盖设置里声明的最大文件大小 / 抓取参数 */
   importLimits?: { maxFileSizeBytes?: number }
+  /**
+   * 画本落库端口（仅在 `importMode: 'canvas'` 时使用）。
+   * 由装配层注入，让本文件不必依赖画本/角色仓储。
+   */
+  canvasImport?: CanvasImportPort
 }
 
 export interface CommitImportRequest {
@@ -82,6 +93,8 @@ export interface CommitImportRequest {
     contentHash: string
   }
   drafts: ChapterDraft[]
+  /** 画本模式：drafts 的 rawText 会被解析成画本行直接落库 */
+  importMode?: 'text' | 'canvas'
 }
 
 export interface ChapterRuleSets {
@@ -160,10 +173,17 @@ async function buildIconvDecoders(): Promise<Record<string, Decoder>> {
   const out: Record<string, Decoder> = {}
   let iconv: typeof import('iconv-lite') | null = null
   try {
-    iconv = (await import(/* @vite-ignore */ 'iconv-lite')) as unknown as typeof import('iconv-lite')
+    const mod = (await import(/* @vite-ignore */ 'iconv-lite')) as unknown as
+      | (typeof import('iconv-lite') & { default?: typeof import('iconv-lite') })
+    // CJS/ESM 互操作：Node 动态 import 一个 CJS 包时，具名导出**不保证**被识别出来，
+    // 这时函数挂在 mod.default 上（实测 encodingExists 就在 default 上）。
+    // 不兼容两种形态的后果很严重：encodingExists is not a function 会从这里抛出，
+    // 整个 buildIconvDecoders 失败 → 没有解码器 → GBK / GB18030 文本一律变成「编码不确定」。
+    iconv = typeof mod.encodingExists === 'function' ? mod : (mod.default ?? null)
   } catch {
     return out
   }
+  if (!iconv || typeof iconv.encodingExists !== 'function') return out
   const ic = iconv
   // 键名同时给大写与规范名：encoding.ts 的 createDecoder 会依次尝试
   // GB18030 / gb18030 / GB18030 / GBK，写全一点更稳
@@ -183,6 +203,124 @@ async function buildIconvDecoders(): Promise<Record<string, Decoder>> {
     if (enc === 'gb18030') out['GBK'] = decoder // gbk 的解码目标就是 gb18030（docs/10 §4.2）
   }
   return out
+}
+
+// ---------------------------------------------------------------------------
+// 可选解析依赖（注入到 runImport）
+// ---------------------------------------------------------------------------
+//
+// ⚠️ 这里曾经**一个都没注入** —— 后果是 DOCX 导入直接抛 DOCX_CORRUPT，
+// 用户看到「文档结构异常」，而根因只是 mammoth 没被接上（PDF / HTML / 嗅探同理）。
+// 这些都是运行时动态 import：包缺失或导出形态不符时返回 null，
+// 让对应格式**明确降级**（报它自己的错误码），而不是在模块加载期就炸。
+
+/** mammoth → DocxConverter */
+export async function loadDocxConverter(): Promise<DocxConverter | null> {
+  try {
+    type Convert = (input: { buffer: Buffer }) => Promise<{ value: string; messages?: unknown[] }>
+    const mod = (await import(/* @vite-ignore */ 'mammoth')) as unknown as {
+      convertToHtml?: Convert
+      default?: { convertToHtml?: Convert }
+    }
+    const mammoth = typeof mod.convertToHtml === 'function' ? mod : mod.default
+    if (!mammoth || typeof mammoth.convertToHtml !== 'function') return null
+    const convertToHtml = mammoth.convertToHtml
+    return { convertToHtml: (input) => convertToHtml(input) }
+  } catch {
+    return null
+  }
+}
+
+/** pdfjs-dist → PdfTextExtractor */
+export async function loadPdfExtractor(): Promise<PdfTextExtractor | null> {
+  try {
+    const mod = (await import(/* @vite-ignore */ 'pdfjs-dist/legacy/build/pdf.mjs')) as unknown as {
+      getDocument?: PdfTextExtractor['getDocument']
+      default?: { getDocument?: PdfTextExtractor['getDocument'] }
+    }
+    const pdfjs = typeof mod.getDocument === 'function' ? mod : mod.default
+    if (!pdfjs || typeof pdfjs.getDocument !== 'function') return null
+    const getDocument = pdfjs.getDocument
+    return { getDocument: (params) => getDocument(params) }
+  } catch {
+    return null
+  }
+}
+
+/** cheerio → HtmlExtractor（本地 HTML 文件与 URL 抓取都用它） */
+export async function loadHtmlExtractor(): Promise<HtmlExtractor | null> {
+  try {
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    const mod = (await import(/* @vite-ignore */ 'cheerio')) as unknown as {
+      load?: (html: string) => any
+      default?: { load?: (html: string) => any }
+    }
+    const cheerio = typeof mod.load === 'function' ? mod : mod.default
+    const load = cheerio?.load as ((html: string) => any) | undefined
+    if (typeof load !== 'function') return null
+    return {
+      selectText: (html, selector) => {
+        try {
+          return String(load(html)(selector).first().text() ?? '').trim()
+        } catch {
+          return ''
+        }
+      },
+      selectAttr: (html, selector, attr) => {
+        try {
+          const value = load(html)(selector).first().attr(attr)
+          return value === undefined || value === null ? null : String(value)
+        } catch {
+          return null
+        }
+      },
+      extractBodyText: (html, remove) => {
+        try {
+          const $ = load(html)
+          for (const selector of remove) $(selector).remove()
+          const texts = $('body')
+            .find('p, br, div, h1, h2, h3, h4, li')
+            .map((_i: number, el: any) => $(el).text())
+            .get() as string[]
+          return texts.join('\n')
+        } catch {
+          return ''
+        }
+      },
+    }
+  } catch {
+    return null
+  }
+}
+
+/** chardet → EncodingSniffer */
+export async function loadEncodingSniffer(): Promise<EncodingSniffer | null> {
+  try {
+    type Detect = (buf: Buffer) => { encoding?: string; confidence?: number } | null
+    const mod = (await import(/* @vite-ignore */ 'chardet')) as unknown as {
+      detect?: Detect
+      default?: { detect?: Detect }
+    }
+    const chardet = typeof mod.detect === 'function' ? mod : mod.default
+    if (!chardet || typeof chardet.detect !== 'function') return null
+    const detect = chardet.detect
+    return {
+      detect: (buf) => {
+        const hit = detect(buf)
+        if (!hit || typeof hit.encoding !== 'string') return null
+        return [{ encoding: hit.encoding, confidence: typeof hit.confidence === 'number' ? hit.confidence : 0 }]
+      },
+    }
+  } catch {
+    return null
+  }
+}
+
+/** 运行时 fetch（Node 18+ / Electron 内置）；没有就返回 undefined（URL 导入明确降级） */
+export function loadFetchImpl(): FetchLike | undefined {
+  const candidate = (globalThis as { fetch?: unknown }).fetch
+  if (typeof candidate !== 'function') return undefined
+  return candidate.bind(globalThis) as unknown as FetchLike
 }
 
 // ---------------------------------------------------------------------------
@@ -235,6 +373,16 @@ export function createBookService(deps: BookServiceDeps): BookService {
   /** 组装 runImport 的依赖（每次调用现取，保证用的是当前库） */
   async function importDeps(): Promise<Parameters<typeof runImport>[1]> {
     const r = repos()
+    // 可选解析依赖：动态 import，缺失/形态不符时返回 null（对应格式明确降级）。
+    // 这里**必须**注入 mammoth，否则 DOCX 一律抛 DOCX_CORRUPT（「文档结构异常」）——
+    // 这正是真机上「选了 docx 点下一步解析失败」的根因。
+    const [docxConverter, pdfExtractor, htmlExtractor, sniffer] = await Promise.all([
+      loadDocxConverter(),
+      loadPdfExtractor(),
+      loadHtmlExtractor(),
+      loadEncodingSniffer(),
+    ])
+    const fetchImpl = loadFetchImpl()
     return {
       bookRepo: r.books,
       chapterRepo: r.chapters,
@@ -242,9 +390,15 @@ export function createBookService(deps: BookServiceDeps): BookService {
       readFile: (p: string) => fsp.readFile(p),
       statFile: async (p: string) => ({ size: (await fsp.stat(p)).size }),
       decoders: await decoders(),
+      ...(docxConverter ? { docxConverter } : {}),
+      ...(pdfExtractor ? { pdfExtractor } : {}),
+      ...(htmlExtractor ? { htmlExtractor } : {}),
+      ...(sniffer ? { sniffer } : {}),
+      ...(fetchImpl ? { fetchImpl } : {}),
       sha256: (data) => defaultSha256Hex(data),
       newId: () => randomId(),
       now: () => Date.now(),
+      ...(deps.canvasImport ? { canvasImport: deps.canvasImport } : {}),
     }
   }
 
@@ -323,6 +477,28 @@ export function createBookService(deps: BookServiceDeps): BookService {
 
   async function detectEncodingOf(filePath: string, sampleBytes?: number): Promise<EncodingDetection> {
     const buf = await readHead(filePath, sampleBytes ?? 64 * 1024)
+
+    // DOCX / PDF 是**二进制容器**：字节层面根本没有「文本编码」这回事，
+    // 正文由 mammoth / pdfjs 以 Unicode 提取（落库时按 UTF-8 写）。
+    // 对它们做编码嗅探只会得到垃圾 —— 实测 DOCX 头（PK\x03\x04…）被判成
+    // UTF-16BE、置信度 0.16、needsUserChoice=true，于是向导第 2 步弹出
+    // 「无法确定文本编码」，把用户挡在门外。这里直接给「内部 Unicode」结果。
+    const probed = probeFileImpl({ filePath, buffer: buf })
+    if (probed.parser === 'docx' || probed.parser === 'pdf') {
+      log.info('book.detectEncoding.container', {
+        event: 'book.detectEncoding.container',
+        filePath,
+        parser: probed.parser,
+      })
+      return {
+        encoding: 'utf-8',
+        confidence: 1,
+        candidates: [],
+        bomLength: 0,
+        needsUserChoice: false,
+      }
+    }
+
     // 注入解码器与嗅探器：没有解码器时 GBK 只能给出编码名（会有 NO_DECODER_NOTE 说明）
     const det = detectEncoding(buf, { decoders: await decoders() })
     log.info('book.detectEncoding', {
@@ -340,6 +516,8 @@ export function createBookService(deps: BookServiceDeps): BookService {
     text?: string
     ruleSetId?: string | null
     cleanOptions?: Record<string, boolean>
+    /** 画本模式（文档本身已经是画本）；预览不解析画本行，交给 commitImport */
+    importMode?: 'text' | 'canvas'
   }): Promise<{
     drafts: ChapterDraft[]
     cleanReport: CleanReportDetail
@@ -361,6 +539,7 @@ export function createBookService(deps: BookServiceDeps): BookService {
         : { type: 'paste', text: input.text ?? '', ...(input.text ? { title: '' } : {}) },
       ruleSet,
       ...(input.cleanOptions ? { cleanOptions: input.cleanOptions as CleanOptions } : {}),
+      ...(input.importMode === 'canvas' ? { importMode: 'canvas' as const } : {}),
       // 关键：只看预览，不入库（runImport 的原生能力，见 import.service.ts 第 ⑦ 步）
       persist: false,
       duplicatePolicy: 'copy',
@@ -424,6 +603,13 @@ export function createBookService(deps: BookServiceDeps): BookService {
       })
     }
 
+    // 画本模式：把每章 rawText 解析成画本行。
+    // 放在这里（而不是预览阶段）是为了不让预览载荷翻倍；预览只看章节切分。
+    const scriptByChapterId = new Map<Id, ReturnType<typeof parseCanvasScript>>()
+    if (req.importMode === 'canvas') {
+      for (const draft of included) draft.canvasScript = parseCanvasScript(draft.rawText, { chapterTitle: draft.title })
+    }
+
     const now = Date.now()
     const bookId = randomId()
     const totalChars = included.reduce((s, d) => s + d.charCount, 0)
@@ -446,16 +632,30 @@ export function createBookService(deps: BookServiceDeps): BookService {
       updatedAt: now,
     }
 
-    const payload = included.map((draft, i) => ({
-      chapter: buildChapterFromDraft(draft, { bookId, seq: i + 1, timestamp: now }),
-      rawText: draft.rawText,
-      text: draft.rawText,
-    }))
+    const payload = included.map((draft, i) => {
+      const chapter = buildChapterFromDraft(draft, { bookId, seq: i + 1, timestamp: now })
+      if (draft.canvasScript) scriptByChapterId.set(chapter.id, draft.canvasScript)
+      return { chapter, rawText: draft.rawText, text: draft.rawText }
+    })
 
     await withTransaction(async (tx) => {
       await tx.bookRepo.insert(book)
       await tx.chapterRepo.insertMany(payload)
     })
+
+    // 画本模式：章节建好后写画本行与角色（外键可用）
+    if (req.importMode === 'canvas' && deps.canvasImport) {
+      for (const item of payload) {
+        const script = scriptByChapterId.get(item.chapter.id)
+        if (!script || (script.lines.length === 0 && script.characters.length === 0)) continue
+        await deps.canvasImport.writeChapter({
+          bookId,
+          chapterId: item.chapter.id,
+          chapterTitle: item.chapter.title,
+          script,
+        })
+      }
+    }
 
     log.info('book.committed', {
       event: 'book.committed',
@@ -608,6 +808,7 @@ export function createBookService(deps: BookServiceDeps): BookService {
             source: p.source as ImportRequest['source'],
             ruleSet,
             ...(p.options.cleanOptions ? { cleanOptions: p.options.cleanOptions as CleanOptions } : {}),
+            ...(p.options.importMode === 'canvas' ? { importMode: 'canvas' as const } : {}),
             persist: true,
             // 任务包/批量导入场景默认「作为副本」，避免因为内容相同直接失败
             duplicatePolicy: 'copy',
@@ -673,9 +874,9 @@ function randomId(): string {
 }
 
 function defaultSha256Hex(data: string | Uint8Array): string {
-  // 延迟 import 太重；这里用 crypto 的同步版本（Node 内置）
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { createHash } = require('node:crypto') as typeof import('node:crypto')
+  // 顶层静态导入 createHash：主进程产物是 ESM，运行时**没有 require**。
+  // 原来写 require('node:crypto')，在 ESM 里直接 ReferenceError: require is not defined，
+  // 于是每一次导入都在算 contentHash 时炸掉（测试环境同样如此）。
   return createHash('sha256').update(data).digest('hex')
 }
 
@@ -697,8 +898,8 @@ function buildChapterFromDraft(
     charCount: draft.charCount,
     startOffset: draft.startOffset,
     endOffset: draft.endOffset,
-    canvasState: 'none',
-    lineCount: countNonEmptyLines(draft.rawText),
+    canvasState: draft.canvasScript && draft.canvasScript.lines.length > 0 ? 'generated' : 'none',
+    lineCount: draft.canvasScript ? draft.canvasScript.lines.length : countNonEmptyLines(draft.rawText),
     createdAt: ctx.timestamp,
     updatedAt: ctx.timestamp,
   }

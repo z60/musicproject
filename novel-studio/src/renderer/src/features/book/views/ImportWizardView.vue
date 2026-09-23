@@ -248,6 +248,19 @@ const sourceSummary = computed(() => {
         @pick-file="flow.pickFile()"
         @file-dropped="flow.onFileDropped"
       />
+      <!-- 导入模式：文档本身已经是画本（【角色-CV】“台词” + 角色表） -->
+      <div class="wiz__mode">
+        <el-checkbox
+          :model-value="store.importMode === 'canvas'"
+          @update:model-value="(v) => store.setImportMode(v ? 'canvas' : 'text')"
+        >
+          这份文档<strong>已经是画本</strong>（按 `【角色名-CV名】“台词”` 标注，且每章末尾有角色表）
+        </el-checkbox>
+        <p class="wiz__hint">
+          勾选后：直接按【角色-CV】把每一行写进画本，并按角色表建立角色（CV / 音色 / 年龄写进角色备注）；
+          <strong>不会</strong>再跑说话人判定。不勾选 = 普通小说，导入后再生成画本。
+        </p>
+      </div>
       <p class="wiz__hint">
         小贴士：把 TXT / DOCX / PDF 直接拖进上面的虚线框即可（本应用走磁盘路径读取，不把大文件读进界面）；
         网页地址会在确认页之后走任务通道抓取（单页 5 MB、最多 50 页）。
@@ -265,6 +278,7 @@ const sourceSummary = computed(() => {
         :busy="store.detectBusy || store.previewBusy"
         :draft-count="store.drafts.length"
         :preview-error-text="store.previewError?.message ?? null"
+        :container-format="store.probe?.kind === 'docx' || store.probe?.kind === 'pdf'"
         @select="flow.onEncodingSelected"
         @redetect="flow.reloadEncoding()"
         @reparse="flow.runPreviewNow()"

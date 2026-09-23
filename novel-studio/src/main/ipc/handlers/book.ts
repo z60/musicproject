@@ -74,6 +74,7 @@ export function createBookHandlers(book: BookService): RegisteredHandler[] {
         ...(req.text ? { text: req.text } : {}),
         ruleSetId: req.ruleSetId ?? null,
         ...(req.cleanOptions ? { cleanOptions: req.cleanOptions } : {}),
+        ...(req.importMode ? { importMode: req.importMode } : {}),
       })
     }),
 
@@ -83,6 +84,7 @@ export function createBookHandlers(book: BookService): RegisteredHandler[] {
         bookMeta: req.bookMeta,
         source: req.source,
         drafts: req.drafts as ChapterDraft[],
+        ...(req.importMode ? { importMode: req.importMode } : {}),
       })
     }),
 

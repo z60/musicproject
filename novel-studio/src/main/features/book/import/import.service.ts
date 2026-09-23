@@ -30,6 +30,7 @@ import { readFile as fsReadFile, stat as fsStat } from 'node:fs/promises'
 import type {
   Book,
   BookSourceType,
+  CanvasScriptChapter,
   Chapter,
   ChapterDraft,
   ChapterRuleSet,
@@ -37,7 +38,8 @@ import type {
   Id,
   ImportFileProbe,
 } from '../../../../shared/types.ts'
-import { BUILTIN_RULE_SETS, IMPORT_LIMITS, VAD_DEFAULTS } from '../../../../shared/constants.ts'
+import { parseCanvasScript } from '../../../../shared/text/canvas-script.ts'
+import { BUILTIN_RULE_SETS, CANVAS_IMPORT_RULE_SET, IMPORT_LIMITS, VAD_DEFAULTS } from '../../../../shared/constants.ts'
 import { AppError, formatBytes, resolve, type DisplayableError } from '../../../../shared/errors.ts'
 import { createDecoder, detectEncoding, normalizeNewlines, stripBom, type Decoder, type EncodingSniffer } from '../../../../shared/text/encoding.ts'
 import {
@@ -139,6 +141,13 @@ export interface ImportRequest {
   maxFileSizeBytes?: number
   /** 是否入库（默认 true；向导前几步可传 false 只看预览） */
   persist?: boolean
+  /**
+   * 导入模式：
+   *   · 'text'（默认）—— 普通小说；导入后由画本域做说话人判定
+   *   · 'canvas' —— 文档**已经是画本**（`【角色-CV】“台词”` + 角色表）：
+   *     直接解析成画本行与角色落库，**不再跑判定**（跑了只会把【】标记当正文）
+   */
+  importMode?: 'text' | 'canvas'
   /** 重复导入策略：error 抛 DUPLICATE_BOOK / open-existing 返回已有 id / copy 作为副本导入 */
   duplicatePolicy?: 'error' | 'open-existing' | 'copy'
   narrator?: string
@@ -201,6 +210,29 @@ export interface ImportTxContext {
   chapterRepo: ChapterRepo
 }
 
+// ---------------------------------------------------------------------------
+// 画本导入（文档本身已经是画本：`【角色-CV】“台词”`）
+// ---------------------------------------------------------------------------
+
+export interface CanvasImportWriteInput {
+  bookId: Id
+  chapterId: Id
+  chapterTitle: string
+  /** 该章解析出来的画本（行 + 角色） */
+  script: CanvasScriptChapter
+}
+
+/**
+ * 画本落库端口（由装配层注入）。
+ *
+ * 为什么用注入而不是让 import.service 直接依赖画本仓储：
+ * 导入算法的职责是「文本 → 结构化结果」，画本/角色属于**另一个域**；
+ * 直接依赖会让纯逻辑层被 SQLite 绑死（现有测试都用内存实现跑它）。
+ */
+export interface CanvasImportPort {
+  writeChapter(input: CanvasImportWriteInput): Promise<{ lines: number; characters: number }>
+}
+
 export interface ImportDeps {
   bookRepo: BookRepo
   chapterRepo: ChapterRepo
@@ -227,6 +259,8 @@ export interface ImportDeps {
   decoders?: Record<string, Decoder>
   /** 注入型嗅探器（生产：chardet） */
   sniffer?: EncodingSniffer
+  /** 画本落库端口（仅 `importMode: 'canvas'` 时使用；不注入则只导入章节、不写画本） */
+  canvasImport?: CanvasImportPort
   /** 摘要实现（默认 node:crypto 的 sha256） */
   sha256?: (data: string | Uint8Array) => string
   /** id 生成（默认 randomUUID） */
@@ -400,6 +434,9 @@ export async function runImport(request: ImportRequest, deps: ImportDeps): Promi
       )
       text = parsed.text
       headings = parsed.headings
+      // DOCX 是二进制容器：正文由 mammoth 以 Unicode 提取，落库按 UTF-8。
+      // 显式标成 utf-8，避免「预览没有 encoding」在界面被读成「编码未知」。
+      encoding = 'utf-8'
       warnings.push(...parsed.warnings)
       if (parsed.converterMessages.length > 0) {
         warnings.push(`DOCX 转换器返回 ${parsed.converterMessages.length} 条消息（详见日志）`)
@@ -410,6 +447,8 @@ export async function runImport(request: ImportRequest, deps: ImportDeps): Promi
       )
       text = parsed.text
       pdfQuality = parsed.quality
+      // 同 DOCX：PDF 文本层由 pdfjs 以 Unicode 提取，没有「文件编码」可选
+      encoding = 'utf-8'
       warnings.push(...parsed.warnings)
       if (parsed.quality.lowQuality) notices.push(resolve(new AppError('PDF_PARSE_LOW_QUALITY')))
     } else {
@@ -509,14 +548,18 @@ export async function runImport(request: ImportRequest, deps: ImportDeps): Promi
   let volumes: Array<{ index: number; title: string; startOffset: number }> = []
   let drafts: ChapterDraft[] = []
 
-  if (headings.length > 0) {
+  // 画本导入：章节结构由正文里的「第N章」定义 —— 跳过标题样式（标题层级可能把角色表
+  // 里的文本也当标题），并使用专用分章规则集（见 CANVAS_IMPORT_RULE_SET 的说明）。
+  const isCanvasImport = request.importMode === 'canvas'
+  const effectiveRuleSet = isCanvasImport ? CANVAS_IMPORT_RULE_SET : ruleSet
+  if (!isCanvasImport && headings.length > 0) {
     // docs/10 §8.2：DOCX 的标题样式是强章节边界，优先于正则
     drafts = splitByHeadings(cleanedText, headings, { charsPerSecond: VAD_DEFAULTS.charsPerSecond })
     if (drafts.length > 0) strategy = 'headings'
   }
   if (drafts.length === 0) {
     const detailed = await time('split', () =>
-      splitChaptersDetailed(cleanedText, ruleSet, {
+      splitChaptersDetailed(cleanedText, effectiveRuleSet, {
         fallback: request.fallback ?? 'none',
         fallbackOptions: request.fallbackOptions,
         charsPerSecond: VAD_DEFAULTS.charsPerSecond,
@@ -549,13 +592,22 @@ export async function runImport(request: ImportRequest, deps: ImportDeps): Promi
     }
     // docs/10 §10：分章零结果 → 进入策略选择（不是致命错误，但必须让用户决定）
     throw new AppError('NO_CHAPTER_MATCHED', {
-      details: { strategy, matchedRuleIds, ruleSetId: ruleSet.id, candidateCount },
+      details: { strategy, matchedRuleIds, ruleSetId: effectiveRuleSet.id, candidateCount },
     })
   }
 
   // ---- ⑦ 预览与人工干预 ----
   report('preview', 0.85)
   drafts = applyChapterEdits(drafts, request.chapters ?? [])
+
+  // 画本模式：逐章解析成「画本行 + 角色」。放在人工干预之后 —— 被取消勾选的章节不白解析。
+  // 只在**真正入库**时解析：预览（persist=false）不需要画本行，否则 IPC 载荷会翻倍；
+  // 向导提交时 commitImport 会再解析一次。
+  if (request.importMode === 'canvas' && request.persist !== false) {
+    for (const draft of drafts) {
+      draft.canvasScript = parseCanvasScript(draft.rawText, { chapterTitle: draft.title })
+    }
+  }
 
   const suspicion = inspectSplitSuspicion(drafts)
   if (suspicion.suspicious) {
@@ -638,13 +690,18 @@ export async function runImport(request: ImportRequest, deps: ImportDeps): Promi
     updatedAt: timestamp,
   }
 
-  const chapterPayload: ChapterWithText[] = includedDrafts.map((draft, i) => ({
-    chapter: buildChapter(draft, { bookId, seq: i + 1, timestamp, newId, volumes }),
-    // 章级原文：导入阶段与清洗后文本相同（全书级清洗前原文在 preview.rawText，
-    // 「查看被删内容」用它）；按行回溯到原始章节属后续增强，不在这里假装能行
-    rawText: draft.rawText,
-    text: draft.rawText,
-  }))
+  const scriptByChapterId = new Map<Id, CanvasScriptChapter>()
+  const chapterPayload: ChapterWithText[] = includedDrafts.map((draft, i) => {
+    const chapter = buildChapter(draft, { bookId, seq: i + 1, timestamp, newId, volumes })
+    if (draft.canvasScript) scriptByChapterId.set(chapter.id, draft.canvasScript)
+    return {
+      chapter,
+      // 章级原文：导入阶段与清洗后文本相同（全书级清洗前原文在 preview.rawText，
+      // 「查看被删内容」用它）；按行回溯到原始章节属后续增强，不在这里假装能行
+      rawText: draft.rawText,
+      text: draft.rawText,
+    }
+  })
 
   await time('persist', () =>
     deps.withTransaction(async (tx) => {
@@ -657,6 +714,28 @@ export async function runImport(request: ImportRequest, deps: ImportDeps): Promi
       await tx.chapterRepo.insertMany(chapterPayload)
     }),
   )
+
+  // ---- ⑧b 画本模式：把解析好的画本行与角色落库 ----
+  // 章节已经建好（外键可用），一行一行写；某一章失败不影响其它章已写的内容，
+  // 但**绝不静默**：异常原样上抛，由任务层记 failed。
+  if (request.importMode === 'canvas' && deps.canvasImport) {
+    let writtenLines = 0
+    let writtenCharacters = 0
+    for (const item of chapterPayload) {
+      const script = scriptByChapterId.get(item.chapter.id)
+      // 纯角色表（卷首总表）没有台词行，但角色要建 —— 所以两个都为空才跳过
+      if (!script || (script.lines.length === 0 && script.characters.length === 0)) continue
+      const written = await deps.canvasImport.writeChapter({
+        bookId,
+        chapterId: item.chapter.id,
+        chapterTitle: item.chapter.title,
+        script,
+      })
+      writtenLines += written.lines
+      writtenCharacters += written.characters
+    }
+    warnings.push(`画本导入：写入 ${writtenLines} 行画本、${writtenCharacters} 个角色`)
+  }
 
   report('persist', 1)
   return { bookId, preview, notices, warnings, duplicate: null, timings }
@@ -706,8 +785,10 @@ export function buildChapter(
     charCount: draft.charCount,
     startOffset: draft.startOffset,
     endOffset: draft.endOffset,
-    canvasState: 'none',
-    lineCount: countNonEmptyLines(draft.rawText),
+    // 画本模式：章节一建好就带着画本（行数用解析结果，而不是「非空段落数」）。
+    // 只有**真的解析出画本行**才标 generated；纯角色表（如卷首总表）不算画本。
+    canvasState: draft.canvasScript && draft.canvasScript.lines.length > 0 ? 'generated' : 'none',
+    lineCount: draft.canvasScript ? draft.canvasScript.lines.length : countNonEmptyLines(draft.rawText),
     createdAt: ctx.timestamp,
     updatedAt: ctx.timestamp,
   }

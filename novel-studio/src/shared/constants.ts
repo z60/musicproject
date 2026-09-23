@@ -522,6 +522,39 @@ export const BUILTIN_RULE_SETS: ChapterRuleSet[] = [
   },
 ]
 
+/**
+ * 画本导入专用的分章规则。
+ *
+ * **不能直接用 cn-standard**：它有一条 `^(序章|序言|序|楔子|…).*` 规则，
+ * 而画本每章末尾的角色表表头正是「**序号**」—— 会被切成一个假章；
+ * 更宽的「节/回/番外」匹配也会把角色表附近的文本误当边界。
+ * 画本文档的结构只有「第N章」（偶尔「第N卷/部/篇」）是权威的。
+ */
+export const CANVAS_IMPORT_RULE_SET: ChapterRuleSet = {
+  id: 'builtin:canvas-script',
+  name: '画本导入（仅第N章）',
+  builtin: true,
+  allowNumericOnly: false,
+  patterns: [
+    {
+      id: 'canvas-cn-chapter',
+      linePattern: '第[零一二三四五六七八九十百千万两0-9]+章.*',
+      maxLineLength: 80,
+      requireBlankAround: false,
+      titleGroup: 0,
+      kind: 'chapter',
+    },
+    {
+      id: 'canvas-cn-volume',
+      linePattern: '第[零一二三四五六七八九十百千万两0-9]+[卷部篇].*',
+      maxLineLength: 60,
+      requireBlankAround: true,
+      titleGroup: 0,
+      kind: 'volume',
+    },
+  ],
+}
+
 // ============================================================================
 // 导入清洗（docs/10 §5.1）
 // ============================================================================

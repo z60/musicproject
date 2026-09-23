@@ -135,7 +135,17 @@ export interface IpcContract {
   'book:probeFile': { req: { filePath: string }; res: ImportFileProbe }
   'book:detectEncoding': { req: { filePath: string; sampleBytes?: number }; res: EncodingDetection }
   'book:previewSplit': {
-    req: { filePath?: string; text?: string; ruleSetId?: string | null; cleanOptions?: Record<string, boolean> }
+    /**
+     * `importMode: 'canvas'`：文档本身已经是画本（【角色-CV】“台词” + 角色表），
+     * 提交入库时直接写画本行，不再跑说话人判定。
+     */
+    req: {
+      filePath?: string
+      text?: string
+      ruleSetId?: string | null
+      cleanOptions?: Record<string, boolean>
+      importMode?: 'text' | 'canvas'
+    }
     /**
      * `contentHash` 必须回传（docs/10 §9）：去重要在**提交之前**用同一个哈希查
      * `book:findDuplicate`，而 `book:commitImport` 的 `source.contentHash` 是**非空**必填。
@@ -149,6 +159,8 @@ export interface IpcContract {
       bookMeta: { title: string; author?: string | null; narrator?: string; language?: string; coverPath?: string | null }
       source: { type: Book['sourceType']; path?: string | null; encoding?: string | null; contentHash: string }
       drafts: ChapterDraft[]
+      /** 见 `book:previewSplit`：'canvas' 时 drafts.rawText 会被解析成画本行直接落库 */
+      importMode?: 'text' | 'canvas'
     }
     res: { bookId: Id; chapterCount: number }
   }

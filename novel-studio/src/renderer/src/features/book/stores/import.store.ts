@@ -163,6 +163,8 @@ interface PreviewSplitPayload {
   text?: string
   ruleSetId?: string | null
   cleanOptions?: Record<string, boolean>
+  /** 'canvas' = 文档已经是画本（提交时直接写画本行） */
+  importMode?: 'text' | 'canvas'
 }
 
 interface PreviewSplitResult {
@@ -196,6 +198,7 @@ interface CommitImportPayload {
   bookMeta: { title: string; author?: string | null; narrator?: string; language?: string; coverPath?: string | null }
   source: { type: BookSourceType; path?: string | null; encoding?: string | null; contentHash: string }
   drafts: ChapterDraft[]
+  importMode?: 'text' | 'canvas'
 }
 
 interface CommitImportResult {
@@ -440,6 +443,21 @@ export const useImportStore = defineStore('book/import', () => {
   // ---- Step 4 清洗 ----
   const cleanOptions = ref<Record<CleanOptionKey, boolean>>(buildDefaultCleanOptions())
 
+  // ---- 导入模式（来源步骤） ----
+  /**
+   * 'text'（默认）= 普通小说，导入后由画本域做说话人判定；
+   * 'canvas' = 文档**本身已经是画本**（【角色-CV】“台词” + 角色表），
+   *            导入时直接解析成画本行与角色落库，不再跑判定。
+   */
+  const importMode = ref<'text' | 'canvas'>('text')
+
+  function setImportMode(next: 'text' | 'canvas'): void {
+    importMode.value = next
+    // 模式变了，之前的解析结果不再适用
+    parsedOnce.value = false
+    drafts.value = []
+  }
+
   // ---- Step 5 人工干预 ----
   const removedDrafts = ref<RemovedDraftRecord[]>([])
   const previewDraftId = ref<string | null>(null)
@@ -662,6 +680,22 @@ export const useImportStore = defineStore('book/import', () => {
       detection.value = null
       return null
     }
+    // DOCX / PDF 是二进制容器：没有「文本编码」可选（正文由 mammoth / pdfjs 以 Unicode 提取）。
+    // 去嗅探只会把 ZIP 头判成 UTF-16BE 之类的垃圾，弹出「无法确定文本编码」挡住用户。
+    // 主进程现在也会返回同一结论，这里再兜一道，顺带省掉一次 64KB 读取。
+    const kind = probe.value?.kind
+    if (kind === 'docx' || kind === 'pdf') {
+      const synthetic: EncodingDetection = {
+        encoding: 'utf-8',
+        confidence: 1,
+        candidates: [],
+        bomLength: 0,
+        needsUserChoice: false,
+      }
+      detection.value = synthetic
+      selectedEncoding.value = 'utf-8'
+      return synthetic
+    }
     detectBusy.value = true
     try {
       const result = await call('book:detectEncoding', { filePath: filePath.value }) as EncodingDetection
@@ -695,6 +729,7 @@ export const useImportStore = defineStore('book/import', () => {
     }
     if (mode.value === 'file' && filePath.value) payload.filePath = filePath.value
     else payload.text = pasteText.value
+    if (importMode.value === 'canvas') payload.importMode = 'canvas'
     return payload
   }
 
@@ -1322,6 +1357,7 @@ export const useImportStore = defineStore('book/import', () => {
         contentHash: contentHash.value,
       },
       drafts: included,
+      ...(importMode.value === 'canvas' ? { importMode: 'canvas' as const } : {}),
     })
   }
 
@@ -1391,6 +1427,7 @@ export const useImportStore = defineStore('book/import', () => {
       language: bookMeta.value.language.trim() || undefined,
       duplicatePolicy,
       persist: true,
+      ...(importMode.value === 'canvas' ? { importMode: 'canvas' } : {}),
     })
   }
 
@@ -1442,6 +1479,7 @@ export const useImportStore = defineStore('book/import', () => {
     ruleSetNotice.value = ''
     fallbackStrategy.value = 'none'
     cleanOptions.value = buildDefaultCleanOptions()
+    importMode.value = 'text'
     removedDrafts.value = []
     previewDraftId.value = null
     draftsEdited.value = false
@@ -1476,6 +1514,8 @@ export const useImportStore = defineStore('book/import', () => {
     setFallbackStrategy,
     // 清洗
     cleanOptions, setCleanOption, resetCleanOptions, enabledCleanCount, removedLineCount,
+    // 导入模式（已是画本）
+    importMode, setImportMode,
     // 草稿
     includedDrafts, includedCount, totalDraftChars, includedChars, includedDurationMs,
     longestDraft, removedDrafts, removedDraftCount,

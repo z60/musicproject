@@ -150,6 +150,53 @@ export interface ChapterDraft {
   endOffset: number
   /** 是否勾选导入 */
   included: boolean
+  /**
+   * 「已是画本格式」的文档解析结果（仅 `importMode: 'canvas'` 时存在）。
+   * 行与角色在导入时**直接落库**，不再跑画本判定。
+   */
+  canvasScript?: CanvasScriptChapter
+}
+
+// ---------------------------------------------------------------------------
+// 画本脚本导入（文档本身已经是画本：`【角色名-CV名】“台词”`）
+// ---------------------------------------------------------------------------
+
+/** 画本脚本里的角色（来自文档中的角色表：序号/CV/角色名/性别/角色描述/台词数/音色/年龄） */
+export interface CanvasScriptCharacter {
+  name: string
+  /** CV（配音员）名 */
+  cv: string | null
+  gender: string | null
+  description: string | null
+  /** 音色，如「青叔音」 */
+  voiceType: string | null
+  /** 年龄原文（可能是数字或「中年」） */
+  ageText: string | null
+  /** 角色表里的台词数原文 */
+  lineCountText: string | null
+}
+
+/** 画本脚本里的一行 */
+export interface CanvasScriptLine {
+  /** null = 旁白 */
+  speaker: string | null
+  /** 该行的 CV（来自 `【角色-CV】`），旁白为 null */
+  cv: string | null
+  /** 实际要录的文本（已去掉【】与引号） */
+  text: string
+  /** inner = 标了（OS）/ 内心 的台词 */
+  kind: 'dialogue' | 'narration' | 'inner'
+  /** 原始整行（回溯/对照用） */
+  sourceText: string
+  /** 行内标注（如 `（OS）`）；没有则为 undefined */
+  note?: string
+  charStart: number
+  charEnd: number
+}
+
+export interface CanvasScriptChapter {
+  characters: CanvasScriptCharacter[]
+  lines: CanvasScriptLine[]
 }
 
 export interface ImportFileProbe {

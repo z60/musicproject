@@ -42,6 +42,11 @@ const props = withDefaults(defineProps<{
   draftCount?: number
   /** 解析错误（store.previewError），文案由 store/error-bus 给出，本组件只展示 */
   previewErrorText?: string | null
+  /**
+   * 二进制容器格式（DOCX / PDF）：正文由解析库以 Unicode 提取，
+   * **没有「文件编码」可选**，因此不显示候选编码表与「编码不确定」警告。
+   */
+  containerFormat?: boolean
 }>(), {
   detection: null,
   selectedEncoding: '',
@@ -51,6 +56,7 @@ const props = withDefaults(defineProps<{
   busy: false,
   draftCount: 0,
   previewErrorText: null,
+  containerFormat: false,
 })
 
 const emit = defineEmits<{
@@ -123,8 +129,14 @@ const previewOf = (preview: string): string => (preview ? preview.replace(/\s+/g
         </div>
       </header>
 
+      <!-- 二进制容器：没有编码可选，说清楚而不是丢一张乱码候选表 -->
+      <p v-if="containerFormat" class="enc__note">
+        该格式（DOCX / PDF）是二进制容器，正文由解析库以 Unicode 提取并落库为 UTF-8，
+        <strong>不需要</strong>选择文本编码。直接「下一步」即可。
+      </p>
+
       <!-- 不确定：必须人工选择（docs/10 §4.1 第 6 条） -->
-      <p v-if="needsUserChoice" class="enc__warn">
+      <p v-if="needsUserChoice && !containerFormat" class="enc__warn">
         置信度偏低，无法可靠判定编码。请在下方候选表格里挑一份「读起来是正常中文」的预览，
         选中后点「按当前设置重新解析」确认结果。
       </p>
@@ -143,7 +155,7 @@ const previewOf = (preview: string): string => (preview ? preview.replace(/\s+/g
         <button type="button" class="ns-btn ns-btn--small" :disabled="busy" @click="emit('reparse')">重试解析</button>
       </div>
 
-      <table class="enc__table">
+      <table v-if="!containerFormat" class="enc__table">
         <thead>
           <tr>
             <th class="enc__col-pick">选择</th>

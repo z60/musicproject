@@ -49,6 +49,7 @@ import { createSqliteChapterRepo } from './features/book/import/repositories/cha
 import { createSqliteCanvasRepo } from './features/book/canvas/repositories/canvas.repo.sqlite.ts'
 import { createSqliteCharacterRepo } from './features/book/canvas/repositories/character.repo.sqlite.ts'
 import { createCanvasFeature } from './features/book/canvas/index.ts'
+import { createCanvasImportPort } from './features/book/canvas/canvas-import.service.ts'
 import { createCanvasTasks } from './features/book/canvas/canvas.tasks.ts'
 import { createCanvasHandlers } from './ipc/handlers/canvas.ts'
 import { createCharacterService } from './features/book/canvas/character.service.ts'
@@ -180,11 +181,21 @@ export function buildHandlerDeps(opts: BuildHandlerDepsOptions): BuiltPorts {
   // ── 书籍导入域服务 ───────────────────────────────────────────────────────
   // 队列要拿到本域的 TaskSpec，因此**先建队列、再建服务**，最后把 specs 注册进去。
   // 反过来（先建服务）会拿不到 queue 引用，异步导入通道就永远是 NOT_IMPLEMENTED。
+  // 画本导入端口：把「已经是画本」的文档（【角色-CV】“台词”）解析结果写进
+  // 角色表与 canvas_lines。仓储每次现取（库可能在「从备份恢复」后换掉）。
+  const canvasImportPort = createCanvasImportPort({
+    getCanvasRepo: () => createSqliteCanvasRepo(state.requireDb()),
+    getCharacterRepo: () => createSqliteCharacterRepo(state.requireDb()),
+    updateChapter: async (chapterId, patch) => {
+      await createSqliteChapterRepo(state.requireDb()).update(chapterId, patch)
+    },
+  })
   const bookService = createBookService({
     getDb: () => state.db,
     projectRoot: paths.projectRoot,
     log,
     queue,
+    canvasImport: canvasImportPort,
     // 注意 `import?.maxFileSizeBytes` 里的 `?.`：**分组本身也可能不可靠**。
     // 真机事故（docs/91 §5.2.3）：库里一行 `import = null` 让整支变成 null，
     // 而这里原来只写了 `state.settings?.current().import.maxFileSizeBytes` ——
