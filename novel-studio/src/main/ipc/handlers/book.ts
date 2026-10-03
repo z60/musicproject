@@ -33,7 +33,12 @@ export interface BookHandlerDeps {
  * @param handlerDeps 通用依赖（日志等）—— 由 `registerAllHandlers` 在注册时提供，
  *                    因此这里不直接用它，保留参数是为了与其它域的签名一致。
  */
-export function createBookHandlers(book: BookService): RegisteredHandler[] {
+/** 提交导入之后的附加动作（装配层用它接「画本导入 → 补齐配音员」，见 ports.ts） */
+export interface BookHandlerHooks {
+  onCommitted?: (result: { bookId: Id; chapterCount: number }) => Promise<void>
+}
+
+export function createBookHandlers(book: BookService, hooks?: BookHandlerHooks): RegisteredHandler[] {
   return [
     // ── 书籍列表 / 详情 / 修改 / 删除 ────────────────────────────────────────
     h('book:list', async (req) => {
@@ -79,7 +84,7 @@ export function createBookHandlers(book: BookService): RegisteredHandler[] {
     }),
 
     h('book:commitImport', async (req) => {
-      return book.commitImport({
+      const result = await book.commitImport({
         projectId: req.projectId,
         bookMeta: req.bookMeta,
         source: req.source,
@@ -87,6 +92,10 @@ export function createBookHandlers(book: BookService): RegisteredHandler[] {
         ...(req.targetBookId ? { targetBookId: req.targetBookId } : {}),
         ...(req.importMode ? { importMode: req.importMode } : {}),
       })
+      // 画本模式的导入会把 CV 写进角色备注（`CV：xxx`）：顺手补齐配音员与绑定，
+      // 否则用户导入完打开「CV 表」看到的是一片空白 —— 备注里有 CV，配音员表里没有。
+      await hooks?.onCommitted?.(result)
+      return result
     }),
 
     h('book:findDuplicate', async (req) => {

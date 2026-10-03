@@ -1033,8 +1033,30 @@ export const MESSAGES = {
     severity: 'warning', action: 'contact_support',
     dev: 'process unhandledRejection。通常是漏 catch 的异步链路。',
   },
+  AUDIO_IMPORT_SOURCE_NOT_WAV: {
+    title: '这个音频的格式暂时用不了',
+    detail: '「{fileName}」实际是「{containerLabel}」，不是可以直接使用的音频。',
+    hint: '请先把它转成 WAV 再导入；或在「设置 → 音频」里配好转码工具后重新导入。',
+    severity: 'warning', action: 'open_settings',
+    params: ['fileName', 'containerLabel'],
+    dev:
+      '音频链路只处理 WAV（`audio-file.ts` 的 isWav 按内容校验，不看扩展名）。' +
+      '真机样本 5 个全是 mp3（docs/91 §5.2.49 实测）。文案里**不能写 ffmpeg**（errors.test.ts 的 UI 纪律），' +
+      '所以用户可见处只说「转码工具」，具体是 ffmpeg 写在 details.hint 里。' +
+      '等 ffmpeg 就位后这里会改成「解码 → 转 WAV」，此错误码届时用于「转码也失败」。',
+  },
+  AUDIO_IMPORT_TRANSCODE_FAILED: {
+    title: '音频转换失败，这个文件没能导入',
+    detail: '转换「{fileName}」时出错，其余文件不受影响。',
+    hint: '请在「设置 → 音频」里确认转码工具可用；文件本身损坏时也会这样。',
+    severity: 'warning', action: 'open_settings',
+    params: ['fileName'],
+    dev:
+      'ffmpeg 已探测为可用、但仍然非 0 退出（`buildDecodeToWavCommand` 跑失败）。' +
+      '常见成因：文件其实被截断/加密、或只有视频流没有音轨（`-map 0:a:0` 会失败）。' +
+      'stderr 摘录在 details.stderr 里；**不要**把 stderr 原文给用户看（含绝对路径与滤镜名）。',
+  },
 } as const satisfies Record<string, ErrorMessage>
-
 /** 语义键联合类型（代码里的自动补全来源） */
 export type MessageKey = keyof typeof MESSAGES
 
@@ -1064,7 +1086,8 @@ const SEGMENTS: ReadonlyArray<{ segment: number; label: string; keys: readonly M
            'TAKE_SRC_MISSING', 'TAKE_NONE_SELECTED', 'TRIM_FAILED', 'PUNCHIN_OVERLAP_INVALID',
            'PROCESS_CHAIN_EMPTY', 'PROCESS_PRESET_INVALID', 'PROCESS_ABORTED', 'DECLICK_FAILED',
            // ⚠️ 新增消息**只能在段末追加**（否则历史错误编号会漂移，见本文件头部纪律）
-           'FILTER_UNSUPPORTED', 'RECORD_CAPTURE_UNAVAILABLE'],
+           'FILTER_UNSUPPORTED', 'RECORD_CAPTURE_UNAVAILABLE', 'AUDIO_IMPORT_SOURCE_NOT_WAV',
+           'AUDIO_IMPORT_TRANSCODE_FAILED'],
   },
   {
     segment: 3, label: 'BOOK',

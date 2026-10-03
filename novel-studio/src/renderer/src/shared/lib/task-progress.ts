@@ -22,7 +22,7 @@
 
 import { computed, onScopeDispose, readonly, ref, unref, watch } from 'vue'
 import type { ComputedRef, Ref } from 'vue'
-import { on } from './ipc'
+import { call, on } from './ipc'
 
 // ---------------------------------------------------------------------------
 // 类型
@@ -271,6 +271,53 @@ export function seedTaskState(seed: {
 }
 
 /**
+ * 已经向主进程查过记录的任务 id（同一任务只查一次）。
+ *
+ * 为什么需要「补一次查询」：`task:progress` / `task:finished` 是**事件**，
+ * 订阅者晚到（关掉面板再打开、刷新页面、组件在任务结束后才挂载）就永远收不到终态 ——
+ * 界面表现为「任务一直转圈」或「按钮一直灰着」（真机现象：导入一批之后无法继续导入）。
+ * 订阅时补查一次 `task:get` 就能把终态补上。
+ */
+const recordFetched = new Set<string>()
+
+async function seedFromRecord(taskId: string): Promise<void> {
+  if (recordFetched.has(taskId)) return
+  recordFetched.add(taskId)
+  try {
+    const record = (await call('task:get', { taskId })) as {
+      kind?: string
+      status?: string
+      progress?: number
+      stage?: string | null
+      result?: unknown
+      error?: unknown
+    } | null
+    // 查不到（任务被清理）时也要给个终态，否则「按钮一直灰着」永远解不开
+    if (!record) {
+      applyFinished({ taskId, status: 'interrupted', error: { reason: 'task-record-missing' } })
+      return
+    }
+    applyProgress({
+      taskId,
+      ...(record.kind !== undefined ? { kind: record.kind } : {}),
+      progress: Number.isFinite(record.progress) ? Number(record.progress) : 0,
+      stage: record.stage ?? '',
+    })
+    if (record.status && TERMINAL.has(record.status as TaskProgressStatus)) {
+      applyFinished({
+        taskId,
+        status: record.status,
+        result: record.result ?? undefined,
+        error: record.error ?? undefined,
+      })
+    }
+  } catch {
+    // 查询失败（IPC 不可用等）不该影响事件订阅：把标记撤回，下次再试
+    recordFetched.delete(taskId)
+  }
+}
+
+/**
  * 订阅一个任务的进度。
  *
  * 用法（docs/01 §3.2 规定的唯一姿势）：
@@ -301,9 +348,15 @@ export function useTaskProgress(
   })
 
   // 让全局监听器在「有任务被观察」时才建立（不在首屏就注册无用的 IPC 监听）
-  if (taskIdRef.value) ensureListeners()
+  if (taskIdRef.value) {
+    ensureListeners()
+    // 晚到的订阅者要能拿到已经发生的终态（见 `seedFromRecord` 的说明）
+    if (!ensureRef(taskIdRef.value).value.finished) void seedFromRecord(taskIdRef.value)
+  }
   watch(taskIdRef, (id) => {
-    if (id) ensureListeners()
+    if (!id) return
+    ensureListeners()
+    if (!ensureRef(id).value.finished) void seedFromRecord(id)
   })
 
   const progress = computed(() => state.value?.progress ?? 0)

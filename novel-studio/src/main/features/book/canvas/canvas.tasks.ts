@@ -33,6 +33,8 @@ import { createSqliteCharacterRepo } from './repositories/character.repo.sqlite.
 import { buildCentroidRecord } from './repositories/character.repo.ts'
 import type { LineEmbeddingRecord } from './repositories/canvas.repo.ts'
 import { createCanvasFeature, type CanvasFeature } from './index.ts'
+import type { CharacterExtractor } from './canvas.service.ts'
+import type { EmbeddingProvider, LlmReviewer } from '../../../../shared/canvas/index.ts'
 
 /** 生成任务的载荷（**不含正文**，见文件头第 2 条） */
 export interface CanvasGenerateTaskPayload {
@@ -45,6 +47,17 @@ export interface CanvasGenerateTaskPayload {
     maxNarrationRun?: number
     maxDialogueRun?: number
   }
+}
+
+/**
+ * 批量生成任务的载荷（一条任务跑 N 章，章节管理「批量生成画本」用）。
+ * `chapterIds` 必须同属 `bookId`（入队时校验）。
+ */
+export interface CanvasGenerateBatchTaskPayload {
+  bookId: Id
+  chapterIds: Id[]
+  options: CanvasGenerateOptions
+  limits?: CanvasGenerateTaskPayload['limits']
 }
 
 /** 重算任务的载荷 */
@@ -81,10 +94,22 @@ export interface CanvasTasksDeps {
   limits?: CanvasGenerateTaskPayload['limits']
   /** 每批处理行数（默认 200，docs/11 §8） */
   batchSize?: number
+  /**
+   * 生成/重算时现取注入式能力（向量模型 / LLM 复核 / 角色抽取）。
+   * 用**工厂**而不是直接传实例：任务可能在入队后过一会儿才跑，甚至跨重启，
+   * 用户可能刚在设置里换了服务商，库也可能已被「从备份恢复」换掉。
+   */
+  providers?: () => Promise<{
+    embedProvider?: EmbeddingProvider | null
+    llmReviewer?: LlmReviewer | null
+    characterExtractor?: CharacterExtractor | null
+  }>
 }
 
 export interface CanvasTasks {
   enqueueGenerate(chapterId: Id, options: CanvasGenerateOptions): Promise<{ taskId: Id }>
+  /** 批量生成：一条任务处理 N 章（全部必须属于同一本书） */
+  enqueueGenerateBatch(chapterIds: Id[], options: CanvasGenerateOptions): Promise<{ taskId: Id }>
   enqueueRecompute(payload: CanvasRecomputeTaskPayload): Promise<{ taskId: Id }>
   taskSpecs(): Array<TaskSpec<unknown, unknown>>
 }
@@ -108,17 +133,19 @@ export function createCanvasTasks(deps: CanvasTasksDeps): CanvasTasks {
   /**
    * 按**当前**数据库句柄现建画本域（库可能在「从备份恢复」后换掉）。
    *
-   * provider 刻意传 `null`：生产环境没有 ONNX 实现（`ports.ts` 的 embedding 能力探测
-   * 恒为不可用），传 null 会走规则判定并给出 `CANVAS_EMBEDDING_UNAVAILABLE` 警告 ——
-   * 这与 `docs/06 §8`「绝不因为模型缺失就阻断用户」一致。
+   * provider 来自 `deps.providers()`（装配层注入）：本地向量模型就位就用它做向量判定，
+   * 没有则 `embedProvider=null` → 规则判定 + `CANVAS_EMBEDDING_UNAVAILABLE` 警告；
+   * LLM 复核与角色抽取同理。这与 `docs/06 §8`「绝不因为模型缺失就阻断用户」一致。
    */
-  function feature(): CanvasFeature {
+  async function feature(): Promise<CanvasFeature> {
     const db = requireDb()
+    const injected = deps.providers ? await deps.providers() : {}
     return createCanvasFeature({
       canvasRepo: createSqliteCanvasRepo(db),
       characterRepo: createSqliteCharacterRepo(db),
-      embedProvider: null,
-      llmReviewer: null,
+      embedProvider: injected.embedProvider ?? null,
+      llmReviewer: injected.llmReviewer ?? null,
+      characterExtractor: injected.characterExtractor ?? null,
       ...(deps.batchSize !== undefined ? { batchSize: deps.batchSize } : {}),
       log: {
         info: (event, fields) => log.info(event, fields),
@@ -172,6 +199,51 @@ export function createCanvasTasks(deps: CanvasTasksDeps): CanvasTasks {
       return { taskId: res.taskId }
     },
 
+
+    async enqueueGenerateBatch(chapterIds, options) {
+      const q = requireQueue()
+      const db = requireDb()
+      if (chapterIds.length === 0) {
+        throw new AppError('INVALID_PAYLOAD', { details: { reason: 'batch-without-chapters' } })
+      }
+      // 入队前确认每章存在，并保证它们属于**同一本书**（跨书批量的进度与去重都没法表达）
+      const chapters = createSqliteChapterRepo(db)
+      const bookIds = new Set<string>()
+      for (const id of chapterIds) {
+        const chapter = await chapters.findById(id)
+        if (!chapter) throw new AppError('NOT_FOUND', { details: { what: 'chapter', id } })
+        bookIds.add(chapter.bookId)
+      }
+      if (bookIds.size > 1) {
+        throw new AppError('INVALID_PAYLOAD', {
+          details: { reason: 'batch-cross-book', books: [...bookIds] },
+        })
+      }
+      const bookId = [...bookIds][0]!
+      const res = await q.enqueue(
+        'canvas.generate.batch',
+        {
+          bookId,
+          chapterIds: [...chapterIds],
+          options,
+          ...(deps.limits ? { limits: deps.limits } : {}),
+        },
+        {
+          priority: 0,
+          projectId: bookId,
+          // 同一本书重复点「批量生成」应合并成一条，而不是排队跑两遍
+          dedupeKey: `canvas.generate.batch:${bookId}`,
+        },
+      )
+      log.info('canvas.generateBatch.enqueued', {
+        event: 'canvas.generateBatch.enqueued',
+        taskId: res.taskId,
+        bookId,
+        chapters: chapterIds.length,
+        deduped: res.deduped,
+      })
+      return { taskId: res.taskId }
+    },
     async enqueueRecompute(payload) {
       const q = requireQueue()
       const chapter = await createSqliteChapterRepo(requireDb()).findById(payload.chapterId)
@@ -207,7 +279,7 @@ export function createCanvasTasks(deps: CanvasTasksDeps): CanvasTasks {
             const text = (await createSqliteChapterRepo(db).getText(p.chapterId))?.text ?? ''
 
             ctx.report(0.05, 'load')
-            const result = await feature().generateChapter({
+            const result = await (await feature()).generateChapter({
               bookId: chapter.bookId,
               chapterId: p.chapterId,
               chapterTitle: chapter.title,
@@ -255,6 +327,88 @@ export function createCanvasTasks(deps: CanvasTasksDeps): CanvasTasks {
           },
         },
 
+
+        {
+          kind: 'canvas.generate.batch' as TaskKind,
+          // 与单章生成同一把串行锁：批量会逐章调向量/LLM，不该并发抢资源
+          concurrencyKey: 'embedding',
+          priority: 0,
+          maxAttempts: 1,
+          run: async (ctx, payload) => {
+            const p = payload as CanvasGenerateBatchTaskPayload
+            const db = requireDb()
+            const chapters = createSqliteChapterRepo(db)
+            const canvasRepo = createSqliteCanvasRepo(db)
+            const feat = await feature()
+            let done = 0
+            let lineCount = 0
+            const failed: string[] = []
+            const warnings: string[] = []
+            for (const chapterId of p.chapterIds) {
+              if (ctx.signal?.aborted) throw new AppError('TASK_CANCELLED')
+              const chapter = await chapters.findById(chapterId)
+              if (!chapter) {
+                failed.push(chapterId)
+                continue
+              }
+              const text = (await chapters.getText(chapterId))?.text ?? ''
+              try {
+                const result = await feat.generateChapter({
+                  bookId: chapter.bookId,
+                  chapterId,
+                  chapterTitle: chapter.title,
+                  chapterText: text,
+                  options: p.options,
+                  ...(p.limits ? { limits: p.limits } : {}),
+                  tempoFactor: 1,
+                  includeTitleLine: false,
+                  snapshot: true,
+                  ...(ctx.signal ? { signal: ctx.signal } : {}),
+                  // ⚠️ 必须把章节内部的进度接出来：否则整章（含抽取 + 判定 + AI 复核）
+                  // 跑完之前，批量任务的进度一直停在 0%（真机反馈「进度条不实时更新」）。
+                  onProgress: (progress) => ctx.report(
+                    (done + Math.min(1, Math.max(0, progress.ratio))) / p.chapterIds.length,
+                    `第 ${done + 1}/${p.chapterIds.length} 章：${progress.stage}`,
+                  ),
+                })
+                lineCount += result.lines.length
+                warnings.push(...result.warnings)
+                await syncChapterCanvasState(chapterId)
+                try {
+                  await canvasRepo.saveGenerateReport(result.report)
+                } catch (e) {
+                  log.warn('canvas.generateBatch.reportSaveFailed', {
+                    event: 'canvas.generateBatch.reportSaveFailed',
+                    chapterId,
+                    reason: e instanceof Error ? e.message : String(e),
+                  })
+                }
+              } catch (e) {
+                // 取消必须继续冒泡（任务层据此落 cancelled），其余章节失败只记一笔并继续
+                if ((e as { key?: string })?.key === 'TASK_CANCELLED') throw e
+                failed.push(chapterId)
+                log.warn('canvas.generateBatch.chapterFailed', {
+                  event: 'canvas.generateBatch.chapterFailed',
+                  chapterId,
+                  reason: e instanceof Error ? e.message : String(e),
+                })
+              }
+              done++
+              ctx.report(
+                p.chapterIds.length === 0 ? 1 : done / p.chapterIds.length,
+                `生成画本 ${done}/${p.chapterIds.length}`,
+              )
+            }
+            log.info('canvas.generateBatch.done', {
+              event: 'canvas.generateBatch.done',
+              bookId: p.bookId,
+              chapters: done,
+              failed: failed.length,
+              lines: lineCount,
+            })
+            return { bookId: p.bookId, chapters: done, failed: failed.length, lineCount, warnings }
+          },
+        },
         {
           kind: 'canvas.recompute' as TaskKind,
           concurrencyKey: 'embedding',
@@ -267,7 +421,7 @@ export function createCanvasTasks(deps: CanvasTasksDeps): CanvasTasks {
             if (!chapter) throw new AppError('NOT_FOUND', { details: { what: 'chapter', id: p.chapterId } })
 
             ctx.report(0.05, 'load')
-            const result = await feature().recomputeAttribution({
+            const result = await (await feature()).recomputeAttribution({
               bookId: chapter.bookId,
               chapterId: p.chapterId,
               scope: p.scope,

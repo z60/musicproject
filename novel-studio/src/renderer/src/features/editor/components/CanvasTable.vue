@@ -2,12 +2,15 @@
   画本编辑 · 表格视图（虚拟滚动）
   ============================================================================
   设计依据：docs/11 §4.2
-    | 序 | 状态 | 说话人 | 类型 | 文本 | 情绪 | 语速 | 停顿 | 提示 |
+    | 序 | 状态 | 说话人（CV） | 角色名 | 类型 | 文本 | 情绪 | 语速 | 停顿 | 提示 |
+    两列分工：**说话人 = 谁来念（CV）**，**角色名 = 演的是谁**；两列都**可点改** ——
+   说话人列按 CV 组织选项（一个 CV 多个角色时写成「CV（角色名）」），角色名列列出角色表。
+   选项口径在 shared/canvas/speaker-options.ts（纯函数，有测试）。
     性能要求：**5000 行下滚动 ≥ 30 fps**（虚拟滚动 + 行内文本纯文本渲染，聚焦时才挂载编辑器）
     置信度色带：≥0.85 绿、0.62~0.85 黄、<0.62 红、人工确认 蓝
 
   三条性能纪律（改代码时不要破坏）：
-    1. 绝不用 el-table 承载全部行 —— 5000 行 × 9 列 = 4.5 万个单元格，DOM 就够卡死；
+    1. 绝不用 el-table 承载全部行 —— 5000 行 × 10 列 = 5 万个单元格，DOM 就够卡死；
        这里用 @/shared/lib/virtual-list.ts 手写虚拟滚动，只渲染视口内的行（含 overscan）。
     2. 行内文本默认**纯文本**渲染（div + CSS 截断），只有双击进入编辑的那一行才挂 el-input。
     3. 滚动事件用 requestAnimationFrame 合帧，避免每个 scroll 事件都触发一次 setState。
@@ -23,6 +26,7 @@ import { CONFIDENCE_BANDS, LINE_KIND_LABELS, LINE_STATE_LABELS, SPEED_OPTIONS } 
 import { computeScrollToIndex, computeVisibleRange, indexAtOffset } from '@/shared/lib/virtual-list.ts'
 import { useEditableField } from '@/shared/lib/use-editable-field.ts'
 import { formatInt } from '@/shared/lib/format.ts'
+import RoleCell from './RoleCell.vue'
 import SpeakerCell from './SpeakerCell.vue'
 import EmotionTagPicker from './EmotionTagPicker.vue'
 import PauseControl from './PauseControl.vue'
@@ -70,6 +74,7 @@ const emit = defineEmits<{
 
 const canvas = useCanvasStore()
 
+
 /** 行高：紧凑 30 / 标准 40（与 CSS 的 --ns-row-h 保持一致） */
 const ROW_HEIGHT = computed(() => (props.density === 'compact' ? 30 : 40))
 const OVERSCAN = 6
@@ -87,6 +92,8 @@ const viewportHeight = ref(600)
 const viewportWidth = ref(1200)
 /** 说话人列宽度（可拖拽调整，docs/11 §4.2「列宽可调」） */
 const speakerWidth = ref(150)
+/** 角色名列宽度（固定；与说话人列一起回答「谁念的 / 演的是谁」） */
+const roleWidth = ref(110)
 let resizing = false
 let resizeStartX = 0
 let resizeStartWidth = 150
@@ -110,7 +117,7 @@ const visibleLines = computed(() => {
 })
 
 const gridStyle = computed(() => ({
-  gridTemplateColumns: `52px 40px ${speakerWidth.value}px 62px minmax(160px, 1fr) 104px 70px 92px 92px`,
+  gridTemplateColumns: `52px 40px ${speakerWidth.value}px ${roleWidth.value}px 62px minmax(160px, 1fr) 104px 70px 92px 92px`,
 }))
 
 const spacerStyle = computed(() => ({
@@ -412,7 +419,7 @@ function flagIcon(flag: string): string {
       <el-button size="small" text @click="emit('toggle-density')">
         行密度：{{ density === 'compact' ? '紧凑' : '标准' }}
       </el-button>
-      <span class="ns-table__toolbar-hint">拖动「说话人」列右边界可调列宽</span>
+      <span class="ns-table__toolbar-hint">「说话人」选 CV（谁念的），「角色名」选角色（演的是谁），点单元格即可改；拖动「说话人」列右边界可调列宽</span>
       <span class="ns-table__toolbar-count">
         共 {{ formatInt(total) }} 行<template v-if="canvas.selectedCount"> · 已选 {{ formatInt(canvas.selectedCount) }}</template>
       </span>
@@ -430,9 +437,10 @@ function flagIcon(flag: string): string {
       </span>
       <span class="ns-table__th">状态</span>
       <span class="ns-table__th ns-table__th--resizable">
-        说话人
+        说话人（CV）
         <i class="ns-table__resizer" title="拖动调整列宽" @mousedown="onResizeStart" />
       </span>
+      <span class="ns-table__th">角色名</span>
       <span class="ns-table__th">类型</span>
       <span class="ns-table__th">文本（双击编辑）</span>
       <span class="ns-table__th">情绪</span>
@@ -477,6 +485,15 @@ function flagIcon(flag: string): string {
               :threshold="canvas.threshold"
               @open="(id) => emit('open', id)"
               @locate="(id) => emit('locate', id)"
+              @change="(id) => emit('changed', id)"
+            />
+          </span>
+
+          <span class="ns-table__td ns-table__td--role">
+            <RoleCell
+              :line="line"
+              :readonly="readonly"
+              @open="(id) => emit('open', id)"
               @change="(id) => emit('changed', id)"
             />
           </span>
@@ -709,6 +726,14 @@ function flagIcon(flag: string): string {
   background: rgb(230 162 60 / 18%);
   color: var(--ns-warning, #e6a23c);
   font-weight: 600;
+}
+/* 角色名：这一行演的是谁。与「说话人（CV）」分列，避免「谁念的」与「演的谁」混为一谈 */
+.ns-table__td--role {
+  overflow: hidden;
+  color: var(--ns-text-primary, #303133);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .ns-table__td--kind {
   color: var(--ns-text-secondary, #909399);

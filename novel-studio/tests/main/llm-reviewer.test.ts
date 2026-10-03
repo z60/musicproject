@@ -14,7 +14,7 @@
 import { strict as assert } from 'node:assert'
 import { describe, it } from 'node:test'
 
-import { createProviderLlmReviewer } from '../../src/main/features/book/canvas/llm-reviewer.ts'
+import { createProviderCharacterExtractor, createProviderLlmReviewer } from '../../src/main/features/book/canvas/llm-reviewer.ts'
 import type { AIProvider, ChatMessage, ChatOptions } from '../../src/shared/ai/types.ts'
 import type { LlmReviewRequest } from '../../src/shared/canvas/index.ts'
 
@@ -96,5 +96,41 @@ describe('createProviderLlmReviewer', () => {
       }),
     })
     await assert.rejects(reviewer.reviewBatch(request({ items: [request().items[0]!] })))
+  })
+})
+describe('createProviderCharacterExtractor（生成画本前抽角色）', () => {
+  it('返回名字数组并去重', async () => {
+    const extractor = createProviderCharacterExtractor({
+      getContext: () => ({
+        provider: scriptedProvider(() => JSON.stringify({ names: ['萧炎', '萧炎', '药老'] })),
+        allowCloud: false,
+      }),
+    })
+    const out = await extractor.extract({ bookId: 'b1', chapterId: 'c1', chapterText: '正文', knownNames: [] })
+    assert.deepEqual(out, [{ name: '萧炎' }, { name: '药老' }])
+  })
+
+  it('把已知角色与正文送进提示词（避免重复抽已存在的角色）', async () => {
+    let seen = ''
+    const extractor = createProviderCharacterExtractor({
+      getContext: () => ({
+        provider: scriptedProvider((messages) => {
+          seen = messages.map((m) => m.content).join('\n')
+          return JSON.stringify({ names: [] })
+        }),
+        allowCloud: false,
+      }),
+    })
+    await extractor.extract({ bookId: 'b1', chapterId: 'c1', chapterText: '萧炎走进房间。', knownNames: ['药老'] })
+    assert.match(seen, /药老/)
+    assert.match(seen, /萧炎走进房间/)
+  })
+
+  it('没有可用 Provider → 返回空数组（降级到规则抽取，不抛错）', async () => {
+    const extractor = createProviderCharacterExtractor({ getContext: () => null })
+    assert.deepEqual(
+      await extractor.extract({ bookId: 'b1', chapterId: 'c1', chapterText: '正文', knownNames: [] }),
+      [],
+    )
   })
 })

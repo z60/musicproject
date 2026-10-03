@@ -16,7 +16,10 @@
  *   `src/main/index.ts` 的 `record:port` 监听里（端口是 transferable，不能走 invoke 返回值）。
  */
 
+import { AppError } from '../../../shared/errors.ts'
 import type { AnalysisService } from '../../features/audio/analysis.service.ts'
+import type { AudioImportService } from '../../features/audio/import.service.ts'
+import type { AudioImportTasks } from '../../features/audio/import.tasks.ts'
 import type { DeviceService } from '../../features/audio/device.service.ts'
 import type { RecordService } from '../../features/audio/record.service.ts'
 import type { TakeService } from '../../features/audio/take.service.ts'
@@ -27,6 +30,10 @@ export interface AudioHandlerDeps {
   device: DeviceService
   take: TakeService
   record: RecordService
+  /** 「按说话人导入音频」（docs/91 §5.2.49） */
+  importService: AudioImportService
+  /** 导入的**后台任务**入口（`record:importStart`）；不注入时该通道抛 TASK_QUEUE_UNAVAILABLE */
+  importTasks?: AudioImportTasks
   log: {
     info(event: string, fields?: Record<string, unknown>): void
     warn(event: string, fields?: Record<string, unknown>): void
@@ -141,6 +148,76 @@ export function createAudioHandlers(deps: AudioHandlerDeps): RegisteredHandler[]
     h('record:acceptSlices', async (req) => deps.record.acceptSlices(req.sessionId, req.accepted)),
 
     h('record:optimizeTrim', async (req) => deps.record.optimizeTrim(req.takeId, req.options)),
+
+    // ── 按说话人导入音频（docs/91 §5.2.49）────────────────────────────────────
+    // 三步分离：扫描/规划**只读**，执行单独一步且必须显式 confirm。
+    h('record:importScanCanvas', async (req) => {
+      return deps.importService.scanCanvas({
+        projectId: req.projectId,
+        bookId: req.bookId,
+        canvasPath: req.canvasPath,
+      })
+    }),
+
+    h('record:importScanFiles', async (req) => {
+      return deps.importService.scanAudioFiles({
+        dir: req.dir,
+        recursive: req.recursive === true,
+      })
+    }),
+
+    h('record:importPlan', async (req) => {
+      return deps.importService.buildPlan({
+        projectId: req.projectId,
+        bookId: req.bookId,
+        canvasPath: req.canvasPath,
+        files: req.files,
+      })
+    }),
+
+    /**
+     * **新版入口**：把导入交给后台任务（真机需求：「导入变为后台的一个任务」）。
+     *
+     * 与 `record:importApply` 的区别：这里立刻返回 taskId，向导可以关掉，
+     * 进度/取消/重试走任务体系；最终结果由 `task:result` 取。
+     * 旧的同步通道保留（脚本与测试仍在用），但 UI 只走这一条。
+     */
+    h('record:importStart', async (req) => {
+      if (req.confirm !== true) {
+        throw new AppError('INVALID_PAYLOAD', {
+          details: { reason: 'import-confirm-required', hint: '写库操作必须显式确认' },
+        })
+      }
+      if (!deps.importTasks) {
+        throw new AppError('TASK_QUEUE_UNAVAILABLE', { details: { reason: 'audio-import-task-unavailable' } })
+      }
+      return deps.importTasks.enqueueApply({
+        projectId: req.projectId,
+        bookId: req.bookId,
+        ...(req.canvasPath ? { canvasPath: req.canvasPath } : {}),
+        files: req.files,
+        ...(req.onlyFiles !== undefined ? { onlyFiles: req.onlyFiles } : {}),
+        ...(req.skipNeedsReview !== undefined ? { skipNeedsReview: req.skipNeedsReview } : {}),
+      })
+    }),
+    
+    h('record:importApply', async (req) => {
+      // schema 已保证 `confirm === true`；这里再挡一次是**纵深防御**：
+      // 若将来有人把 schema 改成 `v.boolean()`，写库仍然不会被静默放行。
+      if (req.confirm !== true) {
+        throw new AppError('INVALID_PAYLOAD', {
+          details: { reason: 'import-confirm-required', hint: '写库操作必须显式确认' },
+        })
+      }
+      return deps.importService.applyImport({
+        projectId: req.projectId,
+        bookId: req.bookId,
+        canvasPath: req.canvasPath,
+        files: req.files,
+        ...(req.onlyFiles !== undefined ? { onlyFiles: req.onlyFiles } : {}),
+        ...(req.skipNeedsReview !== undefined ? { skipNeedsReview: req.skipNeedsReview } : {}),
+      })
+    }),
   ]
 }
 
@@ -177,9 +254,19 @@ export const RECORD_CHANNELS: readonly string[] = [
   'record:optimizeTrim',
 ]
 
+/** 「按说话人导入音频」的 4 个通道（docs/91 §5.2.49） */
+export const RECORD_IMPORT_CHANNELS: readonly string[] = [
+  'record:importScanCanvas',
+  'record:importScanFiles',
+  'record:importPlan',
+  'record:importApply',
+  'record:importStart',
+]
+
 export const AUDIO_CHANNELS: readonly string[] = [
   ...ANALYSIS_CHANNELS,
   ...DEVICE_CHANNELS,
   ...TAKE_CHANNELS,
   ...RECORD_CHANNELS,
+  ...RECORD_IMPORT_CHANNELS,
 ]

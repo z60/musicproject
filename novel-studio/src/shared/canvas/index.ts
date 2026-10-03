@@ -157,3 +157,30 @@ export type {
   QualityCheckOptions,
   QualitySegmentRef,
 } from './quality.ts'
+
+// ---------------------------------------------------------------------------
+// 画本文本解析（docx-canvas.ts）—— 「按说话人导入音频」的输入
+// ---------------------------------------------------------------------------
+// 只导出**纯逻辑**：读 .docx（mammoth）在主进程侧完成，本目录保持零依赖。
+export {
+  extractChapterNoFromTitle,
+  listCharacters,
+  listCvs,
+  linesByCharacter,
+  linesByCv,
+  narrationLines,
+  normalizeName,
+  parseCanvasText,
+  parseChapterTitle,
+  splitSpeakerMarker,
+  stripQuotes,
+} from './docx-canvas.ts'
+export type {
+  CanvasLineOwner,
+  CanvasParsedLine,
+  CanvasParseWarning,
+  CanvasRosterEntry,
+  CanvasSpeakerSegment,
+  LineRef,
+  ParsedCanvas,
+} from './docx-canvas.ts'

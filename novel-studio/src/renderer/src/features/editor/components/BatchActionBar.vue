@@ -92,7 +92,9 @@ const flagToAdd = ref<string | null>(null)
 const flagToRemove = ref<string | null>(null)
 
 const emotionOptions = computed(() => [...EMOTIONS])
-const characterOptions = computed(() => characters.activeCharacters)
+// 可指派的角色**不含「旁白」**：旁白走 `characterId = null`（见 characters.store.assignableCharacters）。
+// 把旁白角色的 id 写进行里会让 speakerType 变成 'character'，录音页的旁白筛选会失效。
+const characterOptions = computed(() => characters.assignableCharacters)
 
 // ── 执行器：统一「先确认、再执行、后汇总」────────────────────────────────────
 interface PendingAction {

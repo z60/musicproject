@@ -38,7 +38,7 @@ import type {
   Id,
   ImportFileProbe,
 } from '../../../../shared/types.ts'
-import { blankCanvasCharacterTables, parseCanvasScript } from '../../../../shared/text/canvas-script.ts'
+import { blankCanvasCharacterTables, parseCanvasScript, speakerContextOf } from '../../../../shared/text/canvas-script.ts'
 import { BUILTIN_RULE_SETS, CANVAS_IMPORT_RULE_SET, IMPORT_LIMITS, VAD_DEFAULTS } from '../../../../shared/constants.ts'
 import { AppError, formatBytes, resolve, type DisplayableError } from '../../../../shared/errors.ts'
 import { createDecoder, detectEncoding, normalizeNewlines, stripBom, type Decoder, type EncodingSniffer } from '../../../../shared/text/encoding.ts'
@@ -608,12 +608,23 @@ export async function runImport(request: ImportRequest, deps: ImportDeps): Promi
     // 再把角色表从正文里**等长抹掉** —— 正文里不再出现「序号 | CV | 角色名 | …」，
     // 而画本行的 charStart / charEnd 偏移依旧成立（见 blankCanvasCharacterTables）。
     if (request.persist !== false) {
+      // ⚠️ 两遍解析：角色表常只在「前言」章（见 book.service 的说明）——
+      // 逐章解析时其它章没有表，`【CV-角色】` 的顺序无从判断，角色会被建成 CV。
+      const firstPass = drafts.map((d) => parseCanvasScript(d.rawText, { chapterTitle: d.title }))
+      const speakerContext = speakerContextOf(firstPass.flatMap((s) => s.characters))
       for (const draft of drafts) {
-        draft.canvasScript = parseCanvasScript(draft.rawText, { chapterTitle: draft.title })
+        draft.canvasScript = parseCanvasScript(draft.rawText, {
+          chapterTitle: draft.title,
+          speakerContext,
+        })
       }
-    }
-    for (const draft of drafts) {
-      draft.rawText = blankCanvasCharacterTables(draft.rawText)
+      // ⚠️ 抹除角色表**只能在入库前做**，不能在预览（persist=false）阶段做：
+      // 向导提交时会把预览的 drafts **再发回主进程重新解析**（commitImport），
+      // 若预览时已把表抹成空格，提交时就汇总不出角色表，`【CV-角色】` 又会被当成
+      // 「角色名-CV名」，整本书的角色被建成 CV（真机故障）。
+      for (const draft of drafts) {
+        draft.rawText = blankCanvasCharacterTables(draft.rawText)
+      }
     }
   }
 

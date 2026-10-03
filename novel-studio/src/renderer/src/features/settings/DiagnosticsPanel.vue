@@ -57,8 +57,6 @@ const props = withDefaults(defineProps<{
 
 const emit = defineEmits<{
   saveState: [state: SaveState]
-  /** 请求父级重新拉取能力探测（settings.refreshCapabilities()） */
-  refresh: []
 }>()
 
 const settings = useSettingsStore()
@@ -173,6 +171,25 @@ async function onLogLevelChange(): Promise<void> {
 async function loadInfo(): Promise<void> {
   const loaded = await callSafe('app:getInfo', undefined)
   if (loaded) info.value = loaded as AppInfo
+}
+
+/**
+ * 重新探测 ffmpeg 与模型能力（**真的重跑**）。
+ *
+ * 走 `app:refreshCapabilities`：主进程重新 spawn `ffmpeg -version / -filters / -encoders`
+ * 并重读模型清单，通常 1~3 秒 —— 所以按钮要 loading。
+ * 以前这里调的是 `app:getCapabilities`（只读快照），用户改了 ffmpeg 路径后点它
+ * 看到的还是旧结果（docs/91 §5.2.51 ④）。
+ */
+const capabilitiesBusy = ref(false)
+
+async function refreshCapabilities(): Promise<void> {
+  capabilitiesBusy.value = true
+  try {
+    await settings.refreshCapabilities()
+  } finally {
+    capabilitiesBusy.value = false
+  }
 }
 
 async function loadStats(): Promise<void> {
@@ -307,7 +324,7 @@ onBeforeUnmount(() => {
         <el-tag size="small" :type="ffmpeg?.available ? 'success' : 'danger'">
           {{ ffmpeg?.available ? '可用' : '不可用' }}
         </el-tag>
-        <el-button size="small" @click="emit('refresh')">重新探测</el-button>
+        <el-button size="small" :loading="capabilitiesBusy" @click="refreshCapabilities">重新探测</el-button>
       </header>
 
       <dl class="ns-kv">

@@ -227,6 +227,12 @@ export const useCanvasStore = defineStore('editor/canvas', () => {
    */
   const reportIsFresh = ref(false)
   const generateTaskId = ref<Id | null>(null)
+  /**
+   * 生成完成后的「版本号」（每次生成结束 +1）。
+   * 视图据此重载**角色表** —— 生成会先抽取角色再判定，
+   * 不重载角色表的话，说话人列解析不出新角色（显示「未知角色」）。
+   */
+  const generationVersion = ref(0)
   const generateProgress = ref<{ stage: string; processed: number; total: number } | null>(null)
 
   // ---- 试听（抽屉与队列共用同一条音频）-------------------------------------
@@ -1008,6 +1014,8 @@ export const useCanvasStore = defineStore('editor/canvas', () => {
       if (!finished) return
       // freshReport：这次刷新出来的报告正是「刚生成」的产物 → 允许弹一次降级提示
       await load(chapterId.value, { force: true, freshReport: true })
+      // 生成会新增角色（Step 3 抽取）：通知视图重载角色表，否则说话人列解析不出新角色
+      generationVersion.value++
     },
   )
 
@@ -1086,7 +1094,7 @@ export const useCanvasStore = defineStore('editor/canvas', () => {
     issues, issueLineIds, issuesByLineId, issueCounts, issuesLoading, loadIssueList, autoFixIssue,
     // 生成
     generateReport, generateTaskId, generateProgress, reportIsFresh, startGenerate, loadReport,
-    subscribeGenerationProgress, recomputeAttribution,
+    subscribeGenerationProgress, recomputeAttribution, generationVersion,
     // 试听
     playbackLineId, playbackUrl, playbackDurationMs, playbackTakeId, playbackError,
     loadPlayback, clearPlayback, setProjectId, currentProjectId,

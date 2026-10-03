@@ -56,7 +56,8 @@
 | `app:openFolderDialog` | invoke | `{ title?, defaultPath? }` | `{ path | null }` |
 | `app:openFileDialog` | invoke | `{ title?, filters?[], multi? }` | `{ paths: string[] }` |
 | `app:saveFileDialog` | invoke | `{ title?, defaultPath?, filters?[] }` | `{ path | null }` |
-| `app:getCapabilities` | invoke | — | `{ ffmpeg: {...}, models: {...}, secureStorage: boolean, embedding: {...} }` |
+| `app:getCapabilities` | invoke | — | `{ ffmpeg: {...}, models: {...}, secureStorage: boolean, embedding: {...} }`（读**启动期快照**，不探测；窗口加载与设置页打开都会调它） |
+| `app:refreshCapabilities` | invoke | — | 同上。**真的重新探测**（重跑 `ffmpeg -version / -filters / -encoders` + 重读模型清单），完成后广播 `app:capabilitiesChanged`；设置页的「重新探测」按钮走这一条 |
 | `app:quit` | invoke | `{ force?: boolean }` | `{ ok }` |
 | `app:diagnostics` | invoke | — | `{ reportPath }`（导出诊断包） |
 
@@ -122,7 +123,7 @@
 
 ### 4.4 角色与配音员（`character` / `voiceActor`）
 
-> 表格已与代码契约（`src/shared/ipc.ts`）对齐；本域 **14 个通道全部已实现**
+> 表格已与代码契约（`src/shared/ipc.ts`）对齐；本域 **15 个通道全部已实现**
 > （`handlers/character.ts` + `features/book/canvas/character.service.ts`）。
 
 | 通道 | 模式 | 请求 | 响应 |
@@ -141,6 +142,7 @@
 | `voiceActor:unbind` | invoke | `{ characterId, actorId }` | `{ ok }` |
 | `voiceActor:workload` | invoke | `{ bookId }` | `ActorWorkload[]` |
 | `voiceActor:bindings` | invoke | `{ bookId }` | `Array<{ characterId, actorId, isPrimary }>` |
+| `voiceActor:syncFromCanvas` | invoke | `{ bookId, force? }` | `{ createdActors, boundCharacters, matchedCharacters, skipped }` |
 
 **实现口径（实现与文档不一致时以这里为准）**
 
@@ -158,15 +160,23 @@
   这里如实返回 0，而不是拿估算时长冒充（docs/91 有登记）。
 - `voiceActor:delete` 是**物理删除**并连带解除绑定（表里没有软删除列）；
   画本行不受影响 —— 被台词引用的是**角色**，配音员不被内容引用。
+  「旁白」角色（书内名为「旁白」的角色行，见 docs/11 §6.1）按 `speaker_type='narration'`
+  取行，而不是按 `character_id` —— 旁白行的 `character_id` 恒为 null。
 - `voiceActor:workload` 的口径：只统计**台词行**（已归属到角色的行），
   一个角色绑多个配音员时每个配音员都算全额（备选也要能录），
   **0 负载的配音员也会出现在结果里**（他才是最该被分配的人）。
+- `voiceActor:syncFromCanvas` 从**角色备注**里的 `CV：xxx` 反推配音员与绑定：
+  `Character` 没有独立 CV 列，画本导入把 CV 写进 `note`（`CV：阿翼爱热闹｜音色：…`），
+  不反推的话 CV 表永远是空表。它是**幂等**的：已存在的（角色, 配音员）不重复绑定；
+  占位备注（`CV：未知` / `-`）不建配音员；已有主配音员的角色**不抢主位**
+  （人工指派优先）。`force` 省略时为**自动模式**：只在这个项目从未自动同步过时执行，
+  否则用户刚在 CV 表里取消勾选（解绑）的绑定会在下一次刷新时自己长回来。
 
 ### 4.5 录音（`record` / `device` / `take` / `analysis`）
 
 > 表格已与代码契约（`src/shared/ipc.ts`）对齐（`record:reslice` / `take:updateTrim` 这两个
 > 早期草稿名**不在契约里**，已删；对轨域真正用的是 `record:optimizeTrim`）。
-> **实现状态**：`analysis:*`（3）、`device:*`（3）、`take:*`（6）、`record:*`（12）
+> **实现状态**：`analysis:*`（3）、`device:*`（3）、`take:*`（6）、`record:*`（17，含 4 个 `record:import*` 与新增的 `record:importStart`）
 > **全部已实现**（`handlers/audio.ts` + `features/audio/*.service.ts`）。
 > 本域已无占位通道，见 docs/91 §5.2.17–§5.2.20。
 
@@ -212,6 +222,20 @@
 | `record:matchSlices` | invoke | `{ sessionId, chapterId, slices: VadSlice[], useAsr? }` | `{ matches: SliceMatch[], unmatchedSlices: number[], unrecordedLines: Id[] }` |
 | `record:acceptSlices` | invoke | `{ sessionId, accepted: SliceMatch[] }` | `{ createdTakes, createdSegments }` |
 | `record:optimizeTrim` | invoke | `{ takeId, options: TrimOptions }` | `{ trimmedInMs, trimmedOutMs }` |
+| `record:importScanCanvas` | invoke | `{ projectId, bookId, canvasPath? }` | `AudioImportCanvasScan` |
+| `record:importScanFiles` | invoke | `{ dir, recursive? }` | `AudioImportCandidate[]` |
+| `record:importPlan` | invoke | `{ projectId, bookId, canvasPath?, files }` | `{ plan, scan }` |
+| **`record:importStart`** | invoke | 与 `record:importApply` 同一载荷（`confirm` 必须 `true`） | `{ taskId }` |
+| `record:importApply` | invoke | 同上（**同步版**，脚本/测试保留） | `AudioImportApplyResult` |
+
+**实现口径（按说话人导入音频）**
+
+- **UI 只走 `record:importStart`**：导入是后台任务（kind `audioImport.apply`），
+  立刻返回 `taskId`；进度看 `task:progress`，结果用 `task:result` 取。
+  这样用户提交后可以关掉向导，任务中心继续跑（真机需求「导入变为后台的一个任务」）。
+  同步的 `record:importApply` 保留给脚本与测试，两者跑的是**同一个服务方法**。
+- 任务串行（`concurrencyKey: 'audio-import'`）、`maxAttempts: 1`（写 take 不幂等，
+  自动重试会在用户不知情时写两遍）；去重键 `audioImport.apply:{bookId}`。
 | `take:listByLine` | invoke | `{ lineId }` | `Take[]` |
 | `take:listByChapter` | invoke | `{ chapterId }` | `Take[]` |
 | `take:setSelected` | invoke | `{ lineId, takeId }` | `VoiceSegment` |

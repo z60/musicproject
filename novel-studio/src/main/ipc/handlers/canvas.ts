@@ -321,6 +321,19 @@ export function createCanvasHandlers(deps: CanvasHandlerDeps): RegisteredHandler
       return deps.tasks.enqueueGenerate(req.chapterId, req.options)
     }),
 
+    // 批量生成画本：**一条任务**跑 N 章（章节管理用它，避免 N 张进度卡 + N 条任务）
+    h('canvas:generateBatch', async (req) => {
+      const ctx = deps.ctx()
+      if (req.chapterIds.length === 0) {
+        throw new AppError('INVALID_PAYLOAD', {
+          details: { op: 'canvas:generateBatch', reason: 'empty-chapterIds' },
+        })
+      }
+      // 逐章确认存在：否则用户拿到的是「排上队但注定失败」的任务
+      for (const chapterId of req.chapterIds) await requireChapter(ctx, chapterId)
+      return deps.tasks.enqueueGenerateBatch(req.chapterIds, req.options)
+    }),
+
     h('canvas:recomputeAttribution', async (req) => {
       if (req.scope === 'selection' && (!req.lineIds || req.lineIds.length === 0)) {
         // 契约允许 lineIds 可选，但「只重算选中的行」缺了选中集就是无意义的范围
@@ -357,5 +370,6 @@ export const CANVAS_CHANNELS: readonly string[] = [
   'canvas:snapshotCreate',
   'canvas:exportText',
   'canvas:generate',
+  'canvas:generateBatch',
   'canvas:recomputeAttribution',
 ]

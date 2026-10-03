@@ -17,8 +17,12 @@ import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { call, callSafe } from '@/shared/lib/ipc.ts'
 import { describeExtractResult, shouldWidenToBook } from '@/shared/lib/extract-scope.ts'
+import { parseCvFromNote, speakerDisplayName } from '@shared/canvas/character-display.ts'
+import { isNarrationRoleName, NARRATION_ROLE_NAME } from '@shared/canvas/narration-role.ts'
+import { buildCvPickerOptions, buildRolePickerOptions } from '@shared/canvas/speaker-options.ts'
 import type {
   ActorWorkload,
+  CanvasLine,
   Character,
   CharacterCandidate,
   CharacterStats,
@@ -119,6 +123,17 @@ export const useCharactersStore = defineStore('editor/characters', () => {
     return map
   })
 
+  /**
+   * 可**指派到台词行**的角色：排除「旁白」。
+   *
+   * 为什么：旁白在角色表里有一行只是为了挂 CV 绑定，**台词行的 characterId 永远是 null**
+   * （见 narration-role.ts）。如果把旁白角色的 id 写进行里，`speakerType` 会从 `narration`
+   * 翻成 `character`，录音页的「按角色录制 · 旁白」、对轨的旁白轨、混音的旁白通道条
+   * 就都认不出这些行了。指派旁白一律走 `characterId = null`（界面上的「旁白（无角色）」）。
+   */
+  const assignableCharacters = computed(() =>
+    activeCharacters.value.filter(c => !isNarrationRoleName(c.name)))
+
   /** 未绑定配音员的角色数（配音员面板与任务包导出前的提示，docs/11 §6.1） */
   const unboundCount = computed(() =>
     activeCharacters.value.filter(c => (bindingsByCharacter.value.get(c.id) ?? []).length === 0).length)
@@ -127,6 +142,66 @@ export const useCharactersStore = defineStore('editor/characters', () => {
   function nameOf(characterId: Id | null | undefined): string {
     if (!characterId) return '未分配'
     return characterById.value.get(characterId)?.name ?? '未知角色'
+  }
+  /**
+   * 角色的 CV（配音员）名，取不到返回 null。来源按优先级：
+   *   1. 绑定的**主配音员**（`voiceActor:bindings`，角色面板里指派的那位）；
+   *   2. 角色备注里的 `CV：xxx`（画本导入时写进去的 —— `Character` 没有独立 CV 列，
+   *      见 `canvas-import.service.buildScriptCharacterNote`）。
+   */
+  function cvNameOf(characterId: Id | null | undefined): string | null {
+    if (!characterId) return null
+    const actor = primaryActorOf(characterId)
+    if (actor?.name) return actor.name
+    return parseCvFromNote(characterById.value.get(characterId)?.note)
+  }
+
+  /**
+   * 说话人显示名：**有 CV 显示 CV，没有 CV 显示角色名**（docs：配音员看到的是谁来念）。
+   * 找不到角色时退回 `nameOf`（它会给「未知角色」而不是 uuid）。
+   */
+  function displayNameOf(characterId: Id | null | undefined): string {
+    if (!characterId) return '未分配'
+    return speakerDisplayName(nameOf(characterId), cvNameOf(characterId))
+  }
+
+  /**
+   * 「说话人（CV）」列的下拉选项：**按 CV 组织**（一个 CV 一个角色时标签就是 CV 名，
+   * 一个 CV 多个角色时写成「CV（角色名）」）。整表共用一个计算结果 ——
+   * 5000 行 × 每个单元格现算一遍是纯浪费。
+   */
+  const cvPickerOptions = computed(() =>
+    buildCvPickerOptions({
+      characters: activeCharacters.value,
+      bindings: bindings.value,
+      actors: actors.value,
+    }))
+
+  /** 「角色名」列的下拉选项：就是角色表（旁白排最前） */
+  const rolePickerOptions = computed(() => buildRolePickerOptions({ characters: activeCharacters.value }))
+
+  /**
+   * 书内的「旁白」角色（见 `@shared/canvas/narration-role.ts`）。
+   *
+   * 旁白在角色表里有一行，**只为了能挂 CV**（「旁白由语心草读」）；
+   * 旁白行的 `characterId` 仍然是 null。
+   */
+  const narrationCharacter = computed(() =>
+    activeCharacters.value.find(c => isNarrationRoleName(c.name)) ?? null)
+
+  /** 旁白行的「说话人」显示名：绑了 CV 显示 CV，否则「旁白」（与角色行同一条口径） */
+  const narrationDisplayName = computed(
+    () => speakerDisplayName(NARRATION_ROLE_NAME, cvNameOf(narrationCharacter.value?.id)),
+  )
+
+  /**
+   * 「角色名」列的显示名：**演的是谁**（角色），与说话人列的 CV 口径互补。
+   * 音效行标「音效」；旁白/未指派标「旁白」（旁白不是普通角色，见 narration-role.ts）。
+   */
+  function roleNameOf(line: Pick<CanvasLine, 'kind' | 'speakerType' | 'characterId'>): string {
+    if (line.kind === 'sfx_note') return '音效'
+    if (line.speakerType === 'narration' || !line.characterId) return NARRATION_ROLE_NAME
+    return nameOf(line.characterId)
   }
 
   function colorOf(characterId: Id | null | undefined): string {
@@ -168,6 +243,10 @@ export const useCharactersStore = defineStore('editor/characters', () => {
     loading.value = true
     lastError.value = null
     try {
+      // 画本的 CV 只写在角色备注里（`CV：xxx`）：先补齐配音员与绑定，CV 表才有内容。
+      // 自动模式（force 省略）只在这个项目从未自动同步过时生效，
+      // 所以「在 CV 表里取消勾选解绑」不会被下一次刷新撤销。
+      if (projectId.value) await syncActorsFromCanvas(false)
       const [list, bindingList] = await Promise.all([
         call('character:list', { bookId: bid, includeArchived: includeArchived.value }) as Promise<Character[]>,
         call('voiceActor:bindings', { bookId: bid }) as Promise<CharacterBinding[]>,
@@ -187,6 +266,29 @@ export const useCharactersStore = defineStore('editor/characters', () => {
   async function setIncludeArchived(next: boolean): Promise<void> {
     includeArchived.value = next
     await load(bookId.value)
+  }
+
+  /**
+   * 从画本备注补齐配音员（`voiceActor:syncFromCanvas`）。
+   *
+   * `force=false`（默认）= 自动模式：只在这个项目从未自动同步过时执行 ——
+   * 面板每次加载都强行重绑的话，用户刚解绑的绑定会自己长回来。
+   * 用户在 CV 表里点「从画本同步 CV」时才传 `true`（明确的重新同步意图）。
+   */
+  async function syncActorsFromCanvas(force = true): Promise<{ createdActors: number; boundCharacters: number; matchedCharacters: number; skipped: boolean } | null> {
+    if (!bookId.value) return null
+    const result = await callSafe('voiceActor:syncFromCanvas', { bookId: bookId.value, force }) as {
+      createdActors: number
+      boundCharacters: number
+      matchedCharacters: number
+      skipped: boolean
+    } | null
+    if (!result?.skipped) {
+      // 同步可能新增了绑定：重取一次，否则界面上的「配音员」列还是旧的
+      if ((result?.boundCharacters ?? 0) > 0) await refreshBindings()
+      if ((result?.createdActors ?? 0) > 0) await loadActors()
+    }
+    return result
   }
 
   async function loadActors(): Promise<void> {
@@ -396,9 +498,10 @@ export const useCharactersStore = defineStore('editor/characters', () => {
     characters, actors, bindings, workload, stats, candidates,
     loading, extracting, extractNote, includeArchived, bookId, projectId, lastError,
     attributionDirty, centroidTaskId,
-    activeCharacters, characterById, actorById, bindingsByCharacter, colorByCharacter, unboundCount,
-    nameOf, colorOf, statsOf, primaryActorOf,
-    load, setIncludeArchived, loadActors, loadWorkload, loadStats, loadAllStats,
+    activeCharacters, assignableCharacters, characterById, actorById, bindingsByCharacter, colorByCharacter, unboundCount,
+    nameOf, cvNameOf, displayNameOf, roleNameOf, colorOf, statsOf, primaryActorOf, narrationCharacter, narrationDisplayName,
+    cvPickerOptions, rolePickerOptions,
+    load, setIncludeArchived, loadActors, loadWorkload, loadStats, loadAllStats, syncActorsFromCanvas,
     saveCharacter, archive,
     previewMerge, mergeCharacters,
     extract, addCandidate, dismissCandidate,

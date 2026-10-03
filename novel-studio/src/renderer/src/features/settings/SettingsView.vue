@@ -1806,7 +1806,6 @@ const bitDepthHint = computed(() => `采集固定用 float32（${AUDIO_DEFAULTS.
               :embedding="settings.capabilities?.embedding ?? null"
               :model-dir="s.paths.modelDir ?? pathsInfo?.modelDir ?? ''"
               :highlight-keys="highlightKeys"
-              @refresh="settings.refreshCapabilities()"
               @save-state="onChildSaveState"
             />
           </template>
@@ -1850,7 +1849,6 @@ const bitDepthHint = computed(() => `采集固定用 float32（${AUDIO_DEFAULTS.
             <DiagnosticsPanel
               :paths="pathsInfo"
               :highlight-keys="highlightKeys"
-              @refresh="settings.refreshCapabilities()"
               @save-state="onChildSaveState"
             />
           </template>

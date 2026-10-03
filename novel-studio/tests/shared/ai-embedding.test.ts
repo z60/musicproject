@@ -48,6 +48,11 @@ import {
   validateEmbeddingOutput,
 } from '../../src/shared/ai/embedding/onnx-provider.ts'
 import { computeEmbeddingContentHash } from '../../src/shared/ai/usage.ts'
+import type {
+  OnnxSessionLike,
+  OnnxTensorFactoryLike,
+  TokenizerLike,
+} from '../../src/shared/ai/embedding/onnx-provider.ts'
 
 const A = '我萧炎，从来不会认输。'
 const B = '他缓缓抬起头，眼中闪过一丝狠厉。'
@@ -275,6 +280,64 @@ describe('ONNX Provider 骨架 · 只做真实可做的那部分', () => {
         return true
       },
     )
+  })
+
+
+  it('注入真实运行时后真的推理：CLS 池化 + L2 归一化 + 批量', async () => {
+    const dim = 4
+    const fakeTokenizer = {
+      async encode(texts: string[]) {
+        const batch = texts.length
+        const seq = 2
+        return {
+          inputIds: new Array(batch * seq).fill(1),
+          attentionMask: new Array(batch * seq).fill(1),
+          dims: [batch, seq],
+        }
+      },
+    }
+    const fakeTensors = {
+      create: (type: string, data: Float32Array, dims: readonly number[]) => ({ type, data, dims }),
+    }
+    const fakeSession = {
+      inputNames: ['input_ids', 'attention_mask'],
+      outputNames: ['last_hidden_state'],
+      async run(feeds: Record<string, { dims: readonly number[] }>) {
+        const dims = feeds['input_ids']?.dims ?? [0, 0]
+        const batch = dims[0] ?? 0
+        const seq = dims[1] ?? 0
+        const data = new Float32Array(batch * seq * dim)
+        for (let b = 0; b < batch; b++) {
+          const base = b * seq * dim
+          data[base] = b === 0 ? 3 : 0
+          data[base + 1] = b === 0 ? 4 : 5
+        }
+        return { last_hidden_state: { type: 'float32', data, dims: [batch, seq, dim] } }
+      },
+    }
+    const provider = createOnnxEmbeddingProvider({
+      modelId: 'bge-small-zh-v1.5',
+      dim,
+      pooling: 'cls',
+      warmup: false,
+      session: fakeSession as unknown as OnnxSessionLike,
+      tokenizer: fakeTokenizer as unknown as TokenizerLike,
+      tensors: fakeTensors as unknown as OnnxTensorFactoryLike,
+    })
+    const out = await provider.embed(['甲', '乙'])
+    assert.equal(out.length, 2)
+    assert.equal(out[0]!.length, dim)
+    // CLS = [3,4,0,0] → L2 归一化 → [0.6, 0.8, 0, 0]
+    assert.ok(Math.abs(out[0]![0]! - 0.6) < 1e-5, String(out[0]![0]))
+    assert.ok(Math.abs(out[0]![1]! - 0.8) < 1e-5, String(out[0]![1]))
+    // 第二条 CLS = [0,5,0,0] → [0,1,0,0]
+    assert.ok(Math.abs(out[1]![1]! - 1) < 1e-5, String(out[1]![1]))
+    let sumSq = 0
+    for (const v of out[0]!) sumSq += v * v
+    const norm = Math.sqrt(sumSq)
+    assert.ok(Math.abs(norm - 1) < 1e-5, `L2 归一化失败：${norm}`)
+    const health = await provider.healthCheck()
+    assert.equal(health.ok, true, health.message)
   })
 
   it('输入张量名从 session.inputNames 读；缺必需输入名 → MODEL_LOAD_FAILED', () => {

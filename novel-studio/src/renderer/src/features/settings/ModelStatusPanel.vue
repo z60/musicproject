@@ -19,7 +19,7 @@
 -->
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { useSettingsStore } from '@/app/store/settings.store.ts'
 import { callSafe } from '@/shared/lib/ipc.ts'
 import { isAppError } from '@shared/errors.ts'
@@ -51,8 +51,6 @@ const props = withDefaults(defineProps<{
 
 const emit = defineEmits<{
   saveState: [state: SaveState]
-  /** 请求父级重新拉取能力探测（settings.refreshCapabilities()） */
-  refresh: []
 }>()
 
 const settings = useSettingsStore()
@@ -133,6 +131,24 @@ async function openModelFolder(model: ModelStatus): Promise<void> {
   if (!model.filePath) return
   await callSafe('app:showItemInFolder', { path: model.filePath })
 }
+
+/**
+ * 重新探测（**真的重跑**，不是重读快照）。
+ *
+ * 走 `app:refreshCapabilities`：主进程会重新 spawn `ffmpeg -version / -filters / -encoders`
+ * 并重读模型清单，通常 1~3 秒，所以按钮要带 loading —— 以前它调的是
+ * `app:getCapabilities`（只读快照），点了等于什么都没发生，也就没有等待的必要。
+ */
+const refreshing = ref(false)
+
+async function refreshCapabilities(): Promise<void> {
+  refreshing.value = true
+  try {
+    await settings.refreshCapabilities()
+  } finally {
+    refreshing.value = false
+  }
+}
 </script>
 
 <template>
@@ -144,7 +160,7 @@ async function openModelFolder(model: ModelStatus): Promise<void> {
         <span class="ns-models__counts">
           就绪 {{ ready.length }} · 缺失 {{ missing.length }} · 校验失败 {{ broken.length }}
         </span>
-        <el-button size="small" @click="emit('refresh')">重新探测</el-button>
+        <el-button size="small" :loading="refreshing" @click="refreshCapabilities">重新探测</el-button>
       </header>
 
       <p class="ns-models__note" :class="{ 'is-bad': !vectorUsable }">
@@ -198,8 +214,9 @@ async function openModelFolder(model: ModelStatus): Promise<void> {
       </el-table>
 
       <p v-else class="ns-models__note">
-        尚未拿到模型清单（app:getCapabilities 未返回 models）；点「重新探测」重试，
-        若仍然为空，请到「日志与诊断」查看诊断包中的记录。
+        还没拿到模型清单 —— `resources/models/models.json` 没读到，或里面没有任何模型登记项。
+        点「重新探测」重试；若仍然为空，请到「日志与诊断」看诊断包里的
+        `models.manifest.unavailable` / `models.verified` 记录。
       </p>
     </section>
 

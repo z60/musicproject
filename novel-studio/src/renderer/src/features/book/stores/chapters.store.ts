@@ -374,7 +374,9 @@ export const useChaptersStore = defineStore('book/chapters', () => {
     const canvas = settings.settings?.canvas
     return {
       useEmbedding: settings.embeddingReady,
-      useLlm: false,
+      // AI 复核与 AI 角色抽取共用这个开关。没有可用 Provider 时适配器返回空数组，
+      // 不会假装成功（attribution 会记 CANVAS_LLM_UNAVAILABLE 并把行放进待确认）。
+      useLlm: true,
       contextWindow: canvas?.contextWindow ?? CANVAS_DEFAULTS.contextWindow,
       threshold: canvas?.attributionThreshold ?? CANVAS_DEFAULTS.attributionThreshold,
       margin: canvas?.attributionMargin ?? CANVAS_DEFAULTS.attributionMargin,
@@ -389,30 +391,50 @@ export const useChaptersStore = defineStore('book/chapters', () => {
    * 每章登记一个 taskId，进度全部交给全局 TaskProgressCard。
    * 返回成功提交的章节数；失败逐条静默收集（由调用方汇总提示，避免刷屏）。
    */
+  /** 批量生成的任务 id（一条任务跑 N 章）。单章仍走 `canvasTasks` 的逐章卡。 */
+  const batchCanvasTaskId = ref<string | null>(null)
+
   async function generateCanvas(
     chapterIds: string[],
     options?: CanvasGenerateOptions,
   ): Promise<{ submitted: number; failed: string[] }> {
     const opts = options ?? defaultGenerateOptions()
-    const failed: string[] = []
-    let submitted = 0
-    for (const chapterId of chapterIds) {
+    if (chapterIds.length === 0) return { submitted: 0, failed: [] }
+
+    // 单章：逐章任务 + 一张卡（保持既有交互）
+    if (chapterIds.length === 1) {
+      const chapterId = chapterIds[0]!
       try {
         const result = await call('canvas:generate', { chapterId, options: opts }, { onError: 'silent' }) as { taskId: string }
-        if (result?.taskId) {
-          canvasTasks.value = {
-            ...canvasTasks.value,
-            [chapterId]: { taskId: result.taskId, bookId: bookId.value ?? '' },
-          }
-          submitted++
-        } else {
-          failed.push(chapterId)
+        if (!result?.taskId) return { submitted: 0, failed: [chapterId] }
+        canvasTasks.value = {
+          ...canvasTasks.value,
+          [chapterId]: { taskId: result.taskId, bookId: bookId.value ?? '' },
         }
+        return { submitted: 1, failed: [] }
       } catch {
-        failed.push(chapterId)
+        return { submitted: 0, failed: [chapterId] }
       }
     }
-    return { submitted, failed }
+
+    // 多章：**一条**批量任务。逐章入队会让章节管理堆 N 张进度卡（真机表现为
+    // 「一直弹出进度为 0 的标签」），任务中心也会被 N 条记录淹没。
+    try {
+      const result = await call(
+        'canvas:generateBatch',
+        { chapterIds: [...chapterIds], options: opts },
+        { onError: 'silent' },
+      ) as { taskId: string }
+      if (!result?.taskId) return { submitted: 0, failed: [...chapterIds] }
+      batchCanvasTaskId.value = result.taskId
+      return { submitted: chapterIds.length, failed: [] }
+    } catch {
+      return { submitted: 0, failed: [...chapterIds] }
+    }
+  }
+
+  function clearBatchCanvasTask(): void {
+    batchCanvasTaskId.value = null
   }
 
   /** 某章已提交的生成任务 id（视图据此渲染 TaskProgressCard） */
@@ -473,6 +495,7 @@ export const useChaptersStore = defineStore('book/chapters', () => {
     bookId.value = null
     keyword.value = ''
     canvasTasks.value = {}
+    batchCanvasTaskId.value = null
     workloads.value = []
     busyIds.value = []
     lastError.value = null
@@ -485,6 +508,7 @@ export const useChaptersStore = defineStore('book/chapters', () => {
     load, reload, updateChapter, rename, setKind, setVolumeTitle,
     reorder, moveBy, merge, split, remove,
     defaultGenerateOptions, generateCanvas, taskIdOf, clearCanvasTask,
+    batchCanvasTaskId, clearBatchCanvasTask,
     loadWorkload, refreshProgress, reset,
   }
 })

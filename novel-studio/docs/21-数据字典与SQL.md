@@ -925,6 +925,23 @@ PRAGMA wal_checkpoint(TRUNCATE);
 | ASR（可选） | `ggml-small.bin` | 待实测 | 待填 | 见模型卡 | 待填 |
 | Embedding | `model.onnx`（bge-small-zh-v1.5 量化版） | 待实测 | 待填 | 见模型卡 | 待填 |
 | Embedding 分词 | `tokenizer.json` | 待实测 | 待填 | 同上 | 待填 |
-| ffmpeg | `ffmpeg(.exe)` | 待实测 | 待填 | **优先 LGPL 构建** | 待填 |
+| ffmpeg | `ffmpeg(.exe)` + `ffprobe(.exe)` | 待实测 | 待填 | **优先 LGPL 构建** | 待填 |
+| ffmpeg 授权文本 | `LICENSE` / `README.txt`（与二进制同目录） | 35 KB / 45 KB | — | 随构建方（GPLv3） | 上游原文，随包分发 |
 
-> **发布门禁**：本表未填实（含许可确认）不得打包发布。
+> **发布门禁**：本表未填实（含许可确认）不得打包发布。ffmpeg 的 `LICENSE` / `README.txt`
+> 必须与二进制一起放进 `resources/bin/`（会随 `extraResources` 进安装包），否则分发时缺少授权文本。
+
+### 16.1 开发期实际使用的二进制（**非发布件**，发布前必须替换）
+
+本机当前放的是构建方打包的 **full build（GPLv3）**，仅供开发与验证；
+发布件按上表要求换成 **LGPL** 构建，因此下面这一组数值**不得**直接搬进发布登记表。
+
+| 文件 | 尺寸（字节） | SHA-256 |
+|------|--------------|---------|
+| `resources/bin/ffmpeg.exe` | 227 823 104 | `589E50B766D251AFDF181DD664D40BD94407E200B019989FD7468C7D118A28D0` |
+| `resources/bin/ffprobe.exe` | 227 621 376 | `02264DFA4F56BAAA31E443ECE8AA16D397F6B008200E7FD184D22B9009E75FD3` |
+
+- 版本：`ffmpeg version 9.0.2-full_build-www.gyan.dev`（`--enable-gpl --enable-version3`，静态构建）
+- 来源：`ffmpeg-9.0.2-full_build.7z`（gyan.dev，下载后放 `~/Downloads`；解压时只取了 `bin/ffmpeg.exe`、`bin/ffprobe.exe`、`LICENSE`、`README.txt`）
+- 已验证的必需滤镜：`loudnorm` `afftdn` `deesser` `equalizer` `acompressor` `alimiter` `sidechaincompress` `amix` `concat` `atempo` `highpass` `lowpass`（另有 `ebur128` `astats`）；编码器 `libmp3lame` `aac` 在位 —— 明细见 `91` §1.3
+- `resources/bin/*` 被 `.gitignore` 忽略，所以这些文件不进仓库（也因此**没有**版本历史可查，数值以本表为准）

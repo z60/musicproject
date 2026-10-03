@@ -518,8 +518,47 @@ export interface MediaProtocolDeps {
   log?: { warn: (event: string, fields: Record<string, unknown>) => void; info?: (event: string, fields: Record<string, unknown>) => void }
   /** 解析相对路径 → 绝对路径（生产传 infra/fs 的 resolveProjectPath） */
   resolve: (projectId: string, relPath: string) => string
-  /** 读文件（默认 node:fs/promises） */
-  readFile?: (absPath: string) => Promise<Buffer>
+  /** 文件大小（Range 响应要用它算 `Content-Range`；默认 node:fs/promises stat） */
+  statFile?: (absPath: string) => Promise<{ size: number }>
+  /** 按字节区间开流（默认 node:fs createReadStream；可选，便于单测注入） */
+  openStream?: (absPath: string, start: number, end: number) => Promise<ReadableStream<Uint8Array>>
+}
+
+export interface ByteRange {
+  /** 起始字节（含） */
+  start: number
+  /** 结束字节（含） */
+  end: number
+}
+
+/**
+ * 解析 `Range: bytes=…` 请求头（HTTP 单区间语义）。
+ *
+ * 返回值：`null` = 没有 Range（整段返回 200）；`'invalid'` = 语法/范围不可满足（回 416）；
+ * 否则给出**闭区间**字节范围（回 206）。
+ *
+ * 为什么必须有它：`<audio>` 播放**必须能 seek**。大文件（导入的整段 WAV 动辄上百 MB）
+ * 如果服务端不支持 Range，浏览器就无法定位到中间位置 —— 表现就是「导入的音频放不出来」。
+ * 多区间请求（`bytes=0-1,3-4`）一律判为 invalid：返回 416 让客户端退回整段请求，
+ * 这比返回一个「只满足第一段」的响应更不容易让播放器误解。
+ */
+export function parseByteRange(header: string | null | undefined, size: number): ByteRange | 'invalid' | null {
+  if (typeof header !== 'string' || header.trim() === '') return null
+  const matched = /^bytes=(\d*)-(\d*)$/.exec(header.trim())
+  if (!matched) return 'invalid'
+  const [, rawStart = '', rawEnd = ''] = matched
+  if (rawStart === '' && rawEnd === '') return 'invalid'
+  if (rawStart === '') {
+    // `bytes=-500`：最后 500 字节（后缀区间）
+    const suffix = Number(rawEnd)
+    if (!Number.isFinite(suffix) || suffix <= 0 || size <= 0) return 'invalid'
+    return { start: Math.max(0, size - suffix), end: size - 1 }
+  }
+  const start = Number(rawStart)
+  if (!Number.isFinite(start) || start >= size) return 'invalid'
+  const end = rawEnd === '' ? size - 1 : Math.min(Number(rawEnd), size - 1)
+  if (!Number.isFinite(end) || end < start) return 'invalid'
+  return { start, end }
 }
 
 export const MEDIA_SCHEME = 'ns-media'
@@ -544,7 +583,21 @@ export function registerMediaProtocol(deps: MediaProtocolDeps): void {
   if (!protocol?.handle) {
     throw new AppError('INTERNAL', { details: { reason: 'protocol-unavailable' } })
   }
-  const readFile = deps.readFile ?? (async (p: string) => (await import('node:fs/promises')).readFile(p))
+  const statFile = deps.statFile ?? (async (p: string) => await (await import('node:fs/promises')).stat(p))
+  /**
+   * 按区间开字节流。
+   *
+   * 为什么不再 `readFile` 整个文件：导入的整段 WAV 有一百多 MB，
+   * 每次 Range 请求都把它整个读进内存（浏览器 seek 会发多次请求）会让主进程卡死 ——
+   * 真机上表现为「音频放不出来」。流式返回只读需要的那几个字节。
+   */
+  const openStream = deps.openStream ?? (async (p: string, start: number, end: number) => {
+    const [{ createReadStream }, { Readable }] = await Promise.all([
+      import('node:fs'),
+      import('node:stream'),
+    ])
+    return Readable.toWeb(createReadStream(p, { start, end })) as ReadableStream<Uint8Array>
+  })
 
   protocol.handle(MEDIA_SCHEME, async (request) => {
     const url = new URL(request.url)
@@ -553,10 +606,35 @@ export function registerMediaProtocol(deps: MediaProtocolDeps): void {
     const relPath = decodeURIComponent(url.pathname.replace(/^\/+/, ''))
     // 逃逸校验在 resolve 里完成（infra/fs/paths.ts 的 resolveProjectPath 命中即抛 PATH_ESCAPE_BLOCKED）
     const abs = deps.resolve(projectId, relPath)
-    const data = await readFile(abs)
-    return new Response(new Uint8Array(data), {
-      status: 200,
-      headers: { 'content-type': contentTypeOf(abs) },
+    const { size } = await statFile(abs)
+    const baseHeaders = { 'content-type': contentTypeOf(abs), 'accept-ranges': 'bytes' }
+    const rangeHeader = request.headers?.get?.('Range') ?? null
+    const range = parseByteRange(rangeHeader, size)
+    if (range === 'invalid') {
+      deps.log?.warn?.('protocol.media.rangeInvalid', {
+        event: 'protocol.media.rangeInvalid',
+        rangeHeader,
+        size,
+        relPath,
+      })
+      return new Response(null, { status: 416, headers: { 'content-range': `bytes */${size}` } })
+    }
+    if (size === 0) {
+      return new Response(new Uint8Array(0), { status: 200, headers: { ...baseHeaders, 'content-length': '0' } })
+    }
+    if (!range) {
+      return new Response(await openStream(abs, 0, size - 1), {
+        status: 200,
+        headers: { ...baseHeaders, 'content-length': String(size) },
+      })
+    }
+    return new Response(await openStream(abs, range.start, range.end), {
+      status: 206,
+      headers: {
+        ...baseHeaders,
+        'content-length': String(range.end - range.start + 1),
+        'content-range': `bytes ${range.start}-${range.end}/${size}`,
+      },
     })
   })
   deps.log?.info?.('protocol.media.registered', { event: 'protocol.media.registered', scheme: MEDIA_SCHEME })

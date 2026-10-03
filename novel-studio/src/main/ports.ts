@@ -9,9 +9,10 @@
  *   应用也就起不来。本文件就是那个装配点。
  *
  * ### 每一端口的实现程度（**如实标注，不假装**）
- *   完整实现：`log` / `env` / `settings` / `db` / `events` / `sends` / `tasks`（内存存储）
- *   部分实现：`capabilities`（ffmpeg 与模型来自启动期探测，embedding 固定不可用 ——
- *             没有 ONNX 推理实现，见 docs/91 §3）
+ *   完整实现：`log` / `env` / `settings` / `db` / `events` / `sends` / `tasks`（内存存储）/
+ *             `capabilities`（ffmpeg + 模型 + embedding 都是**真实探测**：
+ *             启动期跑一次，`refresh()` 会整套重跑并广播 `app:capabilitiesChanged` ——
+ *             实现集中在 `capabilities.ts`，见 docs/91 §5.2.52）
  *   明确未实现：`diagnostics`（导出诊断包需要 zip 写入实现）、
  *             `provider`（真实连通性测试需要 provider HTTP 调用）
  *
@@ -29,15 +30,16 @@ import { join } from 'node:path'
 
 import { AppError } from '../shared/errors.ts'
 import type { AppCapabilities, AppSettings, LineState } from '../shared/types.ts'
-import type { HandlerDeps } from './ipc/handlers/deps.ts'
+import type { EventPort, HandlerDeps } from './ipc/handlers/deps.ts'
 import { createMemoryTaskStore } from './infra/queue/store.ts'
 import { TaskQueue } from './infra/queue/queue.ts'
+import type { QueueEventSink } from './infra/queue/types.ts'
 import type { IpcEventName, IpcEventPayload, IpcSendName, IpcSendPayload } from '../shared/ipc.ts'
 import type { Logger } from './infra/log/index.ts'
 import { createDbPort } from './db.ts'
 import { encryptSecret, decryptSecret, SECRET_PREFIX } from './infra/secure/index.ts'
 import { resolvePrimaryProvider, resolveProvider } from '../shared/ai/factory.ts'
-import { createProviderLlmReviewer } from './features/book/canvas/llm-reviewer.ts'
+import { createProviderCharacterExtractor, createProviderLlmReviewer, type LlmReviewContext } from './features/book/canvas/llm-reviewer.ts'
 import { createFetchHttpClient } from '../shared/ai/http.ts'
 import type { HttpClient } from '../shared/ai/types.ts'
 import { createBookService, type BookService } from './features/book/import/book.service.ts'
@@ -51,18 +53,23 @@ import { createSqliteCharacterRepo } from './features/book/canvas/repositories/c
 import { createCanvasFeature } from './features/book/canvas/index.ts'
 import { createCanvasImportPort } from './features/book/canvas/canvas-import.service.ts'
 import { createCanvasTasks } from './features/book/canvas/canvas.tasks.ts'
+import { loadLocalEmbeddingProvider } from './features/ai/embedding-loader.ts'
+import type { EmbeddingProvider } from '../shared/ai/types.ts'
 import { createCanvasHandlers } from './ipc/handlers/canvas.ts'
 import { createCharacterService } from './features/book/canvas/character.service.ts'
 import { createCharacterHandlers } from './ipc/handlers/character.ts'
 import { createAnalysisService } from './features/audio/analysis.service.ts'
 import { createDeviceService } from './features/audio/device.service.ts'
 import { createAudioProjectScope } from './features/audio/project-scope.ts'
+import { readAudioFile } from './features/audio/audio-file.ts'
 import { createAlignmentService } from './features/audio/alignment.service.ts'
 import { createAlignmentHandlers } from './ipc/handlers/alignment.ts'
 import { createSqliteArrangementRepo } from './features/audio/repositories/arrangement.repo.sqlite.ts'
 import { createRenderTasks } from './features/audio/render.tasks.ts'
 import { createAlignmentLineQueries, createAlignmentSegmentQueries } from './features/audio/alignment.queries.ts'
 import { createFfmpegRunner } from './infra/media/ffmpeg-runner.ts'
+import { refreshCapabilities, unavailableFfmpegCapabilities } from './capabilities.ts'
+import { ffprobePathFor } from './paths.ts'
 import { createPresetService } from './features/audio/preset.service.ts'
 import { createProcessService } from './features/audio/process.service.ts'
 import { createProcessTasks } from './features/audio/process.tasks.ts'
@@ -85,13 +92,17 @@ import { createSqlitePackageRepo } from './features/book/package/repositories/pa
 import { createRecordService, type RecordPortLike, type RecordService } from './features/audio/record.service.ts'
 import { createTakeService } from './features/audio/take.service.ts'
 import { createAudioHandlers } from './ipc/handlers/audio.ts'
+import { createAudioImportTasks } from './features/audio/import.tasks.ts'
+import { createAsrRunner } from './features/audio/asr-runner.ts'
 import { createSqliteAudioMetricsRepo } from './features/audio/repositories/audio-metrics.repo.ts'
 import { createSqliteRecordingSessionRepo } from './features/audio/repositories/recording-session.repo.sqlite.ts'
 import { createSqliteTakeRepo } from './features/audio/repositories/take.repo.sqlite.ts'
 import { createSqliteVoiceSegmentRepo } from './features/audio/repositories/voice-segment.repo.ts'
+import { createAudioImportService, createDurationProbe } from './features/audio/import.service.ts'
 import { createSqliteVoiceActorRepo } from './features/book/canvas/repositories/voice-actor.repo.sqlite.ts'
 import { createSqliteBookRepo } from './features/book/import/repositories/book.repo.sqlite.ts'
 import { CANVAS_DEFAULTS, TRIM_DEFAULTS } from '../shared/constants.ts'
+import { extractChapterNoFromTitle } from '../shared/canvas/index.ts'
 import type { RegisteredHandler } from './ipc/handlers/deps.ts'
 import type { AppState } from './app-state.ts'
 import type { ProcessChain } from '../shared/types.ts'
@@ -124,6 +135,15 @@ export interface BuildHandlerDepsOptions {
    * 注入它才能在不联网的环境里验证「测试连接」的真实行为。
    */
   aiHttp?: HttpClient
+  /**
+   * 主 → 渲染的事件出口（任务进度、能力变更、录音状态……）。
+   *
+   * **必须由入口注入**：真机事故 docs/91 §5.2.62 —— 这里以前没有这个参数，
+   * `TaskQueue` 拿到的是 `events: undefined`，于是 `ctx.report()` 与 `task:finished`
+   * **从来没有推到渲染进程**：所有任务的进度条永远 0%、永远不结束。
+   * 事件出口不能「装配层看着办」——它是任务进度的唯一通路。
+   */
+  events: EventPort
 }
 
 /** 端口装配的结果：既返回 HandlerDeps，也返回队列与域 handler（关闭/注册时要用） */
@@ -160,9 +180,29 @@ export function buildHandlerDeps(opts: BuildHandlerDepsOptions): BuiltPorts {
   // 生产用的 SQLite 任务存储尚未实现（docs/91 §3 有登记），
   // 用内存存储的后果只是「重启后任务列表为空」，而不是给出错误的任务状态。
   // 真正跑起来的任务（如导出）仍然会正常工作，只是历史记录不留存。
+  /**
+   * 任务事件出口：把队列的进度/终态翻成 IPC 事件推给渲染进程。
+   *
+   * ⚠️ 这里就是「进度条不动」的分界线：不接上它，`ctx.report()` 再怎么调也没人收到。
+   * `task:finished` 标 `durable`（docs/20 §7「不丢终态」）：窗口不在时落待补发队列。
+   */
+  const queueEvents: QueueEventSink = {
+    progress: (payload) => opts.events.emit('task:progress', payload),
+    /**
+     * 队列给的 `error` 已经是 `toSerialized(appErr)` 的 JSON 结果，但它的类型是 `unknown`
+     * （队列不认识 `SerializedAppError`，那是契约层的概念）。这里按契约形状转一次。
+     */
+    finished: (payload) =>
+      opts.events.emit(
+        'task:finished',
+        payload as IpcEventPayload<'task:finished'>,
+        { durable: true },
+      ),
+  }
   const queue = new TaskQueue({
     specs: [], // 各域的 TaskSpec 由对应域注册；当前无实现域，因此为空
     store: createMemoryTaskStore(),
+    events: queueEvents,
     log: { info: log.info.bind(log), warn: log.warn.bind(log), error: log.error.bind(log) },
     tempRoot: join(paths.cacheDir, 'tasks'),
   })
@@ -242,6 +282,25 @@ export function buildHandlerDeps(opts: BuildHandlerDepsOptions): BuiltPorts {
   }
 
   /**
+   * 把库里的 JSON 文本列安全地解析成字符串数组。
+   *
+   * 为什么不用裸 `JSON.parse`：这些列是**用户数据**，
+   * 真实库里有 `null`、空串、被截断的 JSON。裸解析会让整个导入流程
+   * 因为一条脏数据而整体失败 —— 而它只影响「角色别名」这一个可选信息。
+   * 所以：解析失败就当作「没有别名」，不影响主流程。
+   */
+  function safeJsonStringArray(text: string | null | undefined): string[] {
+    if (!text) return []
+    try {
+      const v: unknown = JSON.parse(text)
+      if (!Array.isArray(v)) return []
+      return v.filter((x): x is string => typeof x === 'string')
+    } catch {
+      return []
+    }
+  }
+
+  /**
    * 画本段设置（质检阈值、默认停顿等）。
    *
    * 取值级兜底（`?? CANVAS_DEFAULTS`）不是多余防御：真机事故（docs/91 §5.2.3）
@@ -255,6 +314,42 @@ export function buildHandlerDeps(opts: BuildHandlerDepsOptions): BuiltPorts {
 
   // 画本域任务（生成画本 / 重算判定）：与导入域同一套做法 —— 队列先建好，
   // 再把本域的 TaskSpec 注册进去，然后才能入队。
+  /**
+   * 本地向量模型（bge-small-zh-v1.5）：**懒加载并缓存**。
+   * 模型文件缺失 / 原生模块加载失败 → 返回 null，画本判定自动降级为规则判定
+   * （docs/06 §8「绝不因为模型缺失就阻断用户」），并把原因记进日志。
+   */
+  let embeddingProviderCache: { modelId: string; provider: EmbeddingProvider | null } | null = null
+  async function resolveEmbeddingProvider(): Promise<EmbeddingProvider | null> {
+    const modelId = 'bge-small-zh-v1.5'
+    if (embeddingProviderCache?.modelId === modelId) return embeddingProviderCache.provider
+    const loaded = await loadLocalEmbeddingProvider({
+      modelsDir: paths.modelDir,
+      modelId,
+      log: { info: (event, fields) => log.info(event, fields) },
+    })
+    if (!loaded.available) {
+      log.warn('ai.embedding.unavailable', { event: 'ai.embedding.unavailable', modelId, reason: loaded.reason })
+    }
+    embeddingProviderCache = { modelId, provider: loaded.provider }
+    return loaded.provider
+  }
+
+  /** 画本域的 AI 上下文：每次现取设置（用户可能在设置页刚改完服务商 / 地址 / 隐私开关） */
+  function canvasAiContext(): LlmReviewContext | null {
+    const ai = state.requireSettings().current().ai
+    if (!ai) return null
+    return {
+      provider: resolveProvider(ai, { apiKey: readSecret('ai.apiKey') }),
+      allowCloud: ai.allowSendTextToCloud,
+      timeoutMs: ai.timeoutMs,
+    }
+  }
+
+  /** LLM 复核（画本存疑行 / 生成时的 AI 复核） */
+  const canvasLlmReviewer = createProviderLlmReviewer({ getContext: canvasAiContext })
+  /** AI 角色抽取：生成画本前「先抽角色、再判定台词归属」用 */
+  const canvasCharacterExtractor = createProviderCharacterExtractor({ getContext: canvasAiContext })
   const canvasTasks = createCanvasTasks({
     getDb: () => state.db,
     queue,
@@ -264,6 +359,14 @@ export function buildHandlerDeps(opts: BuildHandlerDepsOptions): BuiltPorts {
       shortLineChars: canvasSettings().shortLineChars,
       maxNarrationRun: canvasSettings().maxNarrationRun,
     },
+    // 生成/重算任务**现取**注入式能力：本地向量模型（懒加载）+ 设置里的 LLM 复核。
+    // 之前这里是硬编码 null（生成时排队跑，拿不到 ctx 里的 provider），
+    // 于是「AI 复核存疑行」「向量判定」在点「生成画本」时全都失效。
+    providers: async () => ({
+      embedProvider: await resolveEmbeddingProvider(),
+      llmReviewer: canvasLlmReviewer,
+      characterExtractor: canvasCharacterExtractor,
+    }),
   })
   for (const spec of canvasTasks.taskSpecs()) queue.registerSpec(spec)
 
@@ -288,6 +391,11 @@ export function buildHandlerDeps(opts: BuildHandlerDepsOptions): BuiltPorts {
       const book = await createSqliteBookRepo(db).findById(bookId)
       if (!book) return []
       return createSqliteVoiceActorRepo(db).listByProject(book.projectId)
+    },
+    projectIdOfBook: async (bookId) => {
+      const db = requireDbFor('character')
+      const book = await createSqliteBookRepo(db).findById(bookId)
+      return book?.projectId ?? null
     },
     queue,
     log,
@@ -355,6 +463,7 @@ export function buildHandlerDeps(opts: BuildHandlerDepsOptions): BuiltPorts {
     markLineRecorded,
     log,
   })
+
   const recordService = createRecordService({
     projectRoot: () => paths.projectRoot,
     scope: audioScope,
@@ -390,7 +499,10 @@ export function buildHandlerDeps(opts: BuildHandlerDepsOptions): BuiltPorts {
         ...(settings.recording?.vad ? { vad: settings.recording.vad } : {}),
       }
     },
-    events: { emit: (event, payload) => eventsPort?.emit(event as IpcEventName, payload as never) },
+    events: {
+      emit: (event: string, payload: Record<string, unknown>, emitOpts?: { durable?: boolean }) =>
+        eventsPort?.emit(event as IpcEventName, payload as never, emitOpts),
+    },
     log,
   })
 
@@ -399,8 +511,245 @@ export function buildHandlerDeps(opts: BuildHandlerDepsOptions): BuiltPorts {
   // （`capabilities.ffmpeg.path`），未探到时交给 PATH —— 不硬编码绝对路径。
   const ffmpegRunner = createFfmpegRunner({
     ffmpegPath: () => state.capabilities?.ffmpeg.path ?? 'ffmpeg',
+    // ffprobe 从 ffmpeg 路径**同目录派生**（paths.ts 的 `ffprobePathFor`）：
+    // 用户在设置里只填一次路径，两个二进制跟着走。M4B 验收与导入时长探测走的就是它 ——
+    // 派生路径不存在时 runner 会退回 PATH，不会因为「只拷了 ffmpeg.exe」而整条链路 ENOENT。
+    ffprobePath: () => ffprobePathFor(state.capabilities?.ffmpeg.path),
     log: { info: log.info.bind(log), warn: log.warn.bind(log) },
   })
+
+  /**
+   * 「按说话人导入音频」（docs/91 §5.2.49）。
+   *
+   * ### 为什么这里的只读查询用**直接 SQL**，而不复用画本域的仓储
+   *   服务只需要三样东西：章节（章节号→id）、画本行、角色。
+   *   画本域的服务（canvas / character）是围绕**编辑操作**设计的
+   *   （rev 乐观锁、批量补丁、向量重算……）。把那些拉进来会让
+   *   导入这条纯只读链路背上大量无关依赖，也更容易触发循环依赖。
+   *   只读 SQL 更直白，且与 `alignment.queries.ts` 的既有做法一致。
+   *
+   * ### 读 .docx 用 mammoth（**动态** import）
+   *   与 `db.ts` 对 `better-sqlite3` 的处理同一理由：本仓库的测试与脚本
+   *   要在没有该依赖的环境里跑（纯逻辑 + 内存仓储），静态 import 会让
+   *   任何 import 本模块的测试在加载期就炸。
+   */
+  /**
+   * ASR（音频转文字）引擎：导入时优先走「识别文本强制对齐」。
+   *
+   * 引擎与模型都**不由本项目分发**（上百 MB、许可证各异）：
+   * 放在 `resources/bin/whisper-cli[.exe]` 与 `resources/models/whisper/ggml-*.bin`，
+   * 或在设置里填 `asr.binaryPath` / `asr.modelPath`。缺任一项时 `availability()`
+   * 会在日志里说清「缺什么、放哪里」，导入则自动退回 VAD 路径（不失败）。
+   */
+  const asrRunner = createAsrRunner({
+    ffmpeg: ffmpegRunner,
+    ffmpegAvailable: () => state.capabilities?.ffmpeg.available === true,
+    resourcePath: (relative) => join(paths.resourceDir, relative),
+    settings: () => {
+      const raw = (state.requireSettings().current() as { asr?: Record<string, unknown> }).asr ?? {}
+      return {
+        binaryPath: typeof raw.binaryPath === 'string' ? raw.binaryPath : null,
+        modelPath: typeof raw.modelPath === 'string' ? raw.modelPath : null,
+        language: typeof raw.language === 'string' ? raw.language : null,
+        threads: typeof raw.threads === 'number' ? raw.threads : null,
+        modelId: typeof raw.modelId === 'string' ? raw.modelId : null,
+      }
+    },
+    log: { info: log.info.bind(log), warn: log.warn.bind(log), error: log.error.bind(log) },
+  })
+  /**
+   * 启动时把「识别引擎能不能用」写进日志（缺什么、放哪里都在这条里）。
+   * 用户问「为什么导入还是按停顿估计」时，日志里要能直接答上。
+   */
+  {
+    const ready = asrRunner.availability()
+    if (ready.ok) {
+      log.info('asr.ready', { event: 'asr.ready', binary: ready.binary, model: ready.model })
+    } else {
+      log.info('asr.unavailable', { event: 'asr.unavailable', reason: ready.reason })
+    }
+  }
+
+  const audioImportService = createAudioImportService({
+    asr: asrRunner,
+    getDb: () => state.db,
+    projectRoot: () => paths.projectRoot,
+    scope: audioScope,
+    repos: {
+      listChapters: async (bookId) => {
+        const rows = requireDbFor('audioImport')
+          .prepare(`SELECT id, seq, title FROM chapters WHERE book_id = ? ORDER BY seq ASC`)
+          .all(bookId) as Array<{ id: string; seq: number; title: string }>
+        /**
+         * ⚠️ **必须从 `title` 解析章节号，不能用 `seq`**。
+         *
+         * `chapters.seq` 是**序号**（第几个章节）：`book.service.ts` 里是
+         * `baseSeq + i`、`import.service.ts` 里是 `i + 1`。
+         * 而文件名里的区间是**章节号**（`2221-2240`）。
+         *
+         * 真实样本那本书：章节号 2201~2300，而 `seq` 是 1~100 ——
+         * 两者完全不重合。早期实现误用 `seq`，结果是**一个章节都对不上**，
+         * 全部文件报「区间不在画本内」。
+         *
+         * `ChapterDraft` 里没有章节号字段，它只存在于标题，所以在这里解析。
+         * 解析不到时退回 `seq`：单章书 / 无编号标题的书，`seq` 至少是稳定可用的。
+         */
+        return rows.map((r) => ({
+          id: r.id,
+          no: extractChapterNoFromTitle(r.title) ?? Number(r.seq),
+          title: r.title,
+        }))
+      },
+      listLines: async (chapterId) => {
+        const rows = requireDbFor('audioImport')
+          .prepare(
+            `SELECT id, seq, speaker_type, character_id, kind, text
+               FROM canvas_lines
+              WHERE chapter_id = ? AND deleted_at IS NULL
+              ORDER BY seq ASC`,
+          )
+          .all(chapterId) as Array<{
+          id: string
+          seq: number
+          speaker_type: string
+          character_id: string | null
+          kind: string
+          text: string
+        }>
+        return rows.map((r) => ({
+          id: r.id,
+          seq: Number(r.seq),
+          speakerType: r.speaker_type === 'narration' ? ('narration' as const) : ('character' as const),
+          characterId: r.character_id,
+          kind: (r.kind === 'narration' || r.kind === 'inner' || r.kind === 'sfx_note' ? r.kind : 'dialogue') as
+            | 'dialogue'
+            | 'narration'
+            | 'inner'
+            | 'sfx_note',
+          text: r.text ?? '',
+        }))
+      },
+      listCharacters: async (bookId) => {
+        const rows = requireDbFor('audioImport')
+          .prepare(`SELECT id, name, aliases, note FROM characters WHERE book_id = ? ORDER BY sort_order ASC`)
+          .all(bookId) as Array<{ id: string; name: string; aliases: string | null; note: string | null }>
+        return rows.map((r) => ({
+          id: r.id,
+          name: r.name,
+          aliases: safeJsonStringArray(r.aliases),
+          note: r.note ?? null,
+        }))
+      },
+      listVoiceActors: async (projectId) => {
+        const rows = requireDbFor('audioImport')
+          .prepare(`SELECT id, name FROM voice_actors WHERE project_id = ? ORDER BY name ASC`)
+          .all(projectId) as Array<{ id: string; name: string }>
+        return rows.map((r) => ({ id: r.id, name: r.name }))
+      },
+    },
+    takeRepo: () => createSqliteTakeRepo(requireDbFor('audioImport')),
+    segmentRepo: () => createSqliteVoiceSegmentRepo(requireDbFor('audioImport')),
+    lineChapterId,
+    markLineRecorded,
+    /** 读画本：`.docx` 走 mammoth，纯文本直接读 */
+    readDocument: async (filePath: string) => {
+      const { readFile } = await import('node:fs/promises')
+      if (filePath.toLowerCase().endsWith('.docx')) {
+        const mammoth = (await import(/* @vite-ignore */ 'mammoth')) as unknown as {
+          extractRawText: (input: { buffer: Buffer }) => Promise<{ value: string }>
+        }
+        const r = await mammoth.extractRawText({ buffer: await readFile(filePath) })
+        return r.value
+      }
+      return readFile(filePath, 'utf8')
+    },
+    /**
+     * 把外部音频复制进项目目录。
+     *
+     * 项目内相对路径由服务层生成（`imports/{时间戳}-{清洗过的文件名}`），
+     * 这里只建目录 + 复制。**复制而不是移动**：用户的样本文件夹要保持原样
+     * （他可能还要用别的工具处理，而且一期导入失败时不能把源文件搞丢）。
+     */
+    /**
+     * 把外部音频复制进项目目录。
+     *
+     * 返回**实际落盘的绝对路径**（不只是相对路径）—— 服务层要校验
+     * 「复制出来的那一份」是否是可读的容器格式（见 `copyAndVerifyAudio`）。
+     * 让复制方回报实际路径，避免调用方按约定去拼、拼错时读到残留文件。
+     */
+    copyIntoProject: async ({ projectId, sourcePath, relativeTarget }) => {
+      const { mkdir, copyFile } = await import('node:fs/promises')
+      const { dirname, join } = await import('node:path')
+      const dest = join(paths.projectRoot, projectId, relativeTarget)
+      await mkdir(dirname(dest), { recursive: true })
+      await copyFile(sourcePath, dest)
+      return { relativePath: relativeTarget, absolutePath: dest }
+    },
+    probeDurationMs: createDurationProbe(ffmpegRunner),
+    /**
+     * 导入时的转码能力（mp3/m4a → WAV）。
+     *
+     * `ffmpegAvailable` 读的是**启动期能力探测**的结果，而不是「执行器对象在不在」——
+     * 执行器总是会被构造出来（它只是 spawn 的封装），没装 ffmpeg 时同样存在。
+     * 用探测结果做门禁，才能在用户没装 ffmpeg 时立刻给出「去设置里配」的指引，
+     * 而不是等 spawn 抛 ENOENT 再报一个看不懂的错。
+     */
+    ffmpeg: ffmpegRunner,
+    ffmpegAvailable: () => state.capabilities?.ffmpeg.available === true,
+    /**
+     * 导入时按 VAD 切句要先把音频解成单声道 PCM。
+     *
+     * `readAudioFile` 会读文件、解析 WAV 头、下混单声道；它**只认 WAV** ——
+     * 这正是导入链路保证「项目内那一份一定是 WAV」的原因（见 `copyAndVerifyAudio`）。
+     * 传入的是绝对路径（`readAudioFile` 的 `resolveAudioPath` 对绝对路径原样返回）。
+     */
+    decodeAudio: async (absolutePath) => {
+      try {
+        const r = await readAudioFile(paths.projectRoot, absolutePath)
+        return { samples: r.mono, sampleRate: r.format.sampleRate }
+      } catch (e) {
+        /**
+         * 解不了就返回 null（服务层退回整段 take），**不抛错** —— 导入本身仍要成功。
+         * 但必须记日志：否则「为什么这次导入的每行都没有精确区间」永远查不出来。
+         */
+        log.warn('audioImport.decodeAudioFailed', {
+          event: 'audioImport.decodeAudioFailed',
+          path: absolutePath,
+          reason: e instanceof Error ? e.message : String(e),
+        })
+        return null
+      }
+    },
+    /**
+     * 画本解析缓存的失效判定。
+     *
+     * 拿不到 mtime 时返回 null —— 服务层会据此**禁用**缓存（保守策略：
+     * 不知道文件有没有变就不敢用缓存）。这里不兜成 0，否则缓存会永远命中。
+     */
+    mtimeOf: async (filePath: string) => {
+      const { stat } = await import('node:fs/promises')
+      try {
+        return (await stat(filePath)).mtimeMs
+      } catch {
+        return null
+      }
+    },
+    log,
+  })
+
+  /**
+   * 导入的**后台任务**（真机需求：「导入变为后台的一个任务」）。
+   *
+   * 服务实例复用同一个 `audioImportService`（现取 db / 项目根），
+   * 任务规格注册进队列后即可被 `record:importStart` 触发。
+   */
+  const audioImportTasks = createAudioImportTasks({
+    service: audioImportService,
+    queue,
+    log: { info: log.info.bind(log), warn: log.warn.bind(log), error: log.error.bind(log) },
+  })
+  for (const spec of audioImportTasks.taskSpecs()) queue.registerSpec(spec)
+
   const presetService = createPresetService({
     repo: () => createSqlitePresetRepo(requireDbFor('preset')),
     log,
@@ -542,7 +891,32 @@ export function buildHandlerDeps(opts: BuildHandlerDepsOptions): BuiltPorts {
   })
 
   const domainHandlers: RegisteredHandler[] = [
-    ...createBookHandlers(bookService),
+    ...createBookHandlers(bookService, {
+      /**
+       * 画本导入把 CV 写进了角色备注（`CV：xxx`），这里立刻把它补成配音员 + 绑定 ——
+       * 否则「CV 表」在主界面里永远是空表（数据在角色备注里，配音员表里没有）。
+       * 失败**不能**影响导入结果：书已经落库了，补配音员只是后置增强。
+       */
+      onCommitted: async ({ bookId }) => {
+        try {
+          const res = await characterService.syncActorsFromNotes(bookId, { force: true })
+          if (res.createdActors > 0 || res.boundCharacters > 0) {
+            log.info('voiceActor.syncedAfterImport', {
+              event: 'voiceActor.syncedAfterImport',
+              bookId,
+              createdActors: res.createdActors,
+              boundCharacters: res.boundCharacters,
+            })
+          }
+        } catch (error) {
+          log.warn('voiceActor.syncAfterImportFailed', {
+            event: 'voiceActor.syncAfterImportFailed',
+            bookId,
+            message: error instanceof Error ? error.message : String(error),
+          })
+        }
+      },
+    }),
     ...createChapterHandlers(chapterService),
     ...createCanvasHandlers({
       // 画本域的上下文**每次调用现取**（理由同 withCanvasRepo：库可能被换掉）
@@ -559,21 +933,9 @@ export function buildHandlerDeps(opts: BuildHandlerDepsOptions): BuiltPorts {
             // 这正是 docs/06 §8 的要求：「绝不因为模型缺失就阻断用户」。
             // 传一个假 provider 才是错的：那会让 `report.embeddingUsed` 说谎。
             embedProvider: null,
-            // LLM 复核（画本编辑器的「AI 复核存疑行」）：
-            // 每次生成现取设置 —— 用户可能在设置页刚改完服务商/地址/隐私开关。
-            // 没有可用配置时返回 null，由 createProviderLlmReviewer 返回空数组，
-            // 上层记 CANVAS_LLM_UNAVAILABLE 并让低置信行进待确认列表（绝不谎报 llmUsed）。
-            llmReviewer: createProviderLlmReviewer({
-              getContext: () => {
-                const ai = state.requireSettings().current().ai
-                if (!ai) return null
-                return {
-                  provider: resolveProvider(ai, { apiKey: readSecret('ai.apiKey') }),
-                  allowCloud: ai.allowSendTextToCloud,
-                  timeoutMs: ai.timeoutMs,
-                }
-              },
-            }),
+            // LLM 复核：与生成任务共用同一个适配器（设置每次现取）。
+            // 没有可用配置时返回空数组，上层记 CANVAS_LLM_UNAVAILABLE 并让低置信行进待确认列表。
+            llmReviewer: canvasLlmReviewer,
             log: { info: log.info.bind(log), warn: log.warn.bind(log), error: log.error.bind(log) },
           }),
           canvasRepo,
@@ -592,8 +954,11 @@ export function buildHandlerDeps(opts: BuildHandlerDepsOptions): BuiltPorts {
     }),
     ...createAudioHandlers({
       analysis: analysisService,
-      device: deviceService,      take: takeService,
+      device: deviceService,
+      take: takeService,
       record: recordService,
+      importService: audioImportService,
+      importTasks: audioImportTasks,
       log: { info: log.info.bind(log), warn: log.warn.bind(log) },
     }),
     ...createProcessingHandlers({
@@ -745,15 +1110,52 @@ export function buildHandlerDeps(opts: BuildHandlerDepsOptions): BuiltPorts {
       quit: (force: boolean) => opts.quit(force),
     },
 
-    // ── 能力探测（部分实现，见文件头说明）──────────────────────────────────
+    // ── 能力探测（完整实现，入口在 capabilities.ts）──────────────────────────
     capabilities: {
+      /**
+       * 读**当前快照**（廉价、不 spawn 进程）。
+       *
+       * 启动期第 9、10 步已经探测过一次，这里只做读取 ——
+       * 否则每次打开设置页、每次 `app:getCapabilities` 都要跑一遍
+       * `ffmpeg -version / -filters / -encoders`（三次进程 + 最长 40 秒超时）。
+       */
       getCapabilities: async (): Promise<AppCapabilities> => currentCapabilities(state),
+      /**
+       * **真的重新探测**，然后广播 `app:capabilitiesChanged`。
+       *
+       * 修掉的缺陷（docs/91 §5.2.51 ④ 第三条）：这里原来只是 `currentCapabilities(state)`
+       * —— 重新读一遍快照，什么也没探测。用户换了 ffmpeg 路径后点「重新探测」，
+       * 看到的还是旧结果，而界面上没有任何东西会说明这一点；
+       * 契约里的 `app:capabilitiesChanged` 也从来没有触发方（死事件）。
+       *
+       * 现在启动步骤与这里共用 `refreshCapabilities()`，所以
+       * 「点重新探测」与「重启应用」得到的结果必然一致。
+       */
       refresh: async (): Promise<AppCapabilities> => {
-        // 重新探测 = 重跑启动期的两步探测（模型 + ffmpeg）。
-        // 目前只更新 ffmpeg 可用性；模型校验需要读 manifest，成本低但还没接线。
-        const caps = currentCapabilities(state)
-        log.info('capabilities.refreshed', { event: 'capabilities.refreshed', ffmpeg: caps.ffmpeg.available })
-        return caps
+        const paths = state.requirePaths()
+        const settings = state.settings?.current()
+        const result = await refreshCapabilities({
+          resourceDir: paths.resourceDir,
+          modelDir: paths.modelDir,
+          // 与启动期同一处取值、同一套取值级兜底（设置树可能缺整支，docs/91 §5.2.3）
+          settingsFfmpegPath: settings?.paths?.ffmpegPath ?? null,
+          log,
+          secureStorage: currentCapabilities(state).secureStorage,
+        })
+        state.capabilities = result.capabilities
+        log.info('capabilities.refreshed', {
+          event: 'capabilities.refreshed',
+          ffmpeg: result.capabilities.ffmpeg.available,
+          ffmpegPath: result.capabilities.ffmpeg.path,
+          filters: result.capabilities.ffmpeg.filters.length,
+          missingFilters: result.capabilities.ffmpeg.missing.length,
+          requiredFiltersSource: result.detail.ffmpeg.requiredFiltersSource,
+          models: result.detail.models.total,
+          modelsMissing: result.detail.models.missing.length,
+        })
+        // 广播：其它窗口/面板不必自己去轮询（此前这个事件有订阅方、没有触发方）
+        eventsPort?.emit('app:capabilitiesChanged', result.capabilities)
+        return result.capabilities
       },
     },
 
@@ -866,7 +1268,7 @@ export function buildHandlerDeps(opts: BuildHandlerDepsOptions): BuiltPorts {
   }
 
   // 录音服务的事件端口在这里接上（它构造时 `deps` 还没成型，见上面的说明）
-  eventsPort = deps.events
+  eventsPort = opts.events
 
   return {
     deps,
@@ -883,7 +1285,7 @@ function currentCapabilities(state: AppState): AppCapabilities {
   const caps = state.capabilities
   if (caps) return caps
   return {
-    ffmpeg: { version: '', available: false, path: null, filters: [], missing: [], encoders: [] },
+    ffmpeg: unavailableFfmpegCapabilities(),
     models: [],
     secureStorage: false,
     embedding: { modelId: 'bge-small-zh-v1.5', dim: 512, available: false },

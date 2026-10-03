@@ -454,3 +454,80 @@ describe('内存仓储语义（生产 SQLite 实现的契约）', () => {
     assert.ok(issues.some((i) => i.kind === 'no_character_ref'))
   })
 })
+// ---------------------------------------------------------------------------
+// Step 3：生成前自动抽取角色（本仓库新增）
+// ---------------------------------------------------------------------------
+
+/** 抽取用正文：每个角色至少出现 2 次且带引导语（抽取器的 minOccurrences 默认 2） */
+const EXTRACT_TEXT = [
+  '萧炎沉声道：“我的斗气与异火才是根本。”',
+  '药老低声道：“丹药的药材还差三味。”',
+  '萧炎皱眉道：“我一定会变强。”',
+  '药老叹道：“小子，别冲动。”',
+].join('\n')
+
+describe('生成前自动抽取角色（Step 3）', () => {
+  it('角色表为空 → 先从正文抽角色并落库，再判定归属', async () => {
+    const characterRepo = createMemoryCharacterRepo({ now: () => 1_700_000_000_000 })
+    const feature = createMemoryCanvasFeature({
+      characterRepo,
+      now: () => 1_700_000_000_000,
+      generateId: (p) => `${p}-1`,
+    })
+    const result = await feature.generateChapter({
+      bookId: 'b1',
+      chapterId: 'ch1',
+      chapterTitle: '第一章 陨落的天才',
+      chapterText: EXTRACT_TEXT,
+      options: OPTIONS,
+      limits: { attributionThreshold: 0.5, attributionMargin: 0.02 },
+    })
+    const all = await characterRepo.listByBook('b1', { includeArchived: true })
+    assert.ok(all.length > 0, '应从正文抽出角色并落库')
+    assert.ok(
+      result.warnings.some((w) => w.includes('CANVAS_CHARACTERS_EXTRACTED')),
+      `报告里要说明自动抽取：${result.warnings.join(' | ')}`,
+    )
+  })
+
+  it('注入 AI 抽取端口时，AI 给出的名字也会落库并写明引擎', async () => {
+    const characterRepo = createMemoryCharacterRepo({ now: () => 1_700_000_000_000 })
+    const feature = createMemoryCanvasFeature({
+      characterRepo,
+      characterExtractor: { extract: async () => [{ name: '萧炎' }, { name: 'AI 专属角色' }] },
+      now: () => 1_700_000_000_000,
+      generateId: (p) => `${p}-1`,
+    })
+    const result = await feature.generateChapter({
+      bookId: 'b1',
+      chapterId: 'ch1',
+      chapterTitle: '第一章 陨落的天才',
+      chapterText: CHAPTER_TEXT,
+      options: { ...OPTIONS, useLlm: true },
+      limits: { attributionThreshold: 0.5, attributionMargin: 0.02 },
+    })
+    const names = (await characterRepo.listByBook('b1', { includeArchived: true })).map((c) => c.name)
+    assert.ok(names.includes('AI 专属角色'), `AI 抽取的名字应入库：${names.join('、')}`)
+    assert.ok(
+      result.warnings.some((w) => w.includes('规则 + AI 抽取')),
+      `报告应写明引擎：${result.warnings.join(' | ')}`,
+    )
+  })
+
+  it('已有角色时仍会合并抽取：同名不重复建、新角色补进来', async () => {
+    const characterRepo = createMemoryCharacterRepo({ characters: [character('已有角色', 0)] })
+    const feature = createMemoryCanvasFeature({ characterRepo, now: () => 1, generateId: (p) => `${p}-1` })
+    await feature.generateChapter({
+      bookId: 'b1',
+      chapterId: 'ch1',
+      chapterTitle: '第一章 陨落的天才',
+      chapterText: EXTRACT_TEXT,
+      options: OPTIONS,
+      limits: { attributionThreshold: 0.5, attributionMargin: 0.02 },
+    })
+    const names = (await characterRepo.listByBook('b1', { includeArchived: true })).map((c) => c.name)
+    assert.ok(names.includes('已有角色'), '已有角色不能被删/覆盖')
+    assert.ok(names.includes('萧炎'), `应把本章抽到的角色补进来：${names.join('、')}`)
+    assert.equal(names.filter((n) => n === '萧炎').length, 1, '同名角色不重复建')
+  })
+})

@@ -23,9 +23,10 @@
 
 import { AppError } from '../../../../shared/errors.ts'
 import { buildAttributionReviewMessages, getStructuredSchema } from '../../../../shared/ai/prompts/templates.ts'
-import { callStructured, type StructuredSchema } from '../../../../shared/ai/structured.ts'
-import type { AIProvider } from '../../../../shared/ai/types.ts'
+import { callStructured, schemaFromShape, type StructuredSchema } from '../../../../shared/ai/structured.ts'
+import type { AIProvider, ChatMessage } from '../../../../shared/ai/types.ts'
 import type { LlmReviewItem, LlmReviewRequest, LlmReviewer } from '../../../../shared/canvas/index.ts'
+import type { CharacterExtractor } from './canvas.service.ts'
 
 export interface LlmReviewContext {
   provider: AIProvider
@@ -45,6 +46,88 @@ export interface CreateProviderLlmReviewerOptions {
 /** schema 只构造一次（`schemaFromShape` 是纯计算，但没必要每条都重建） */
 const REVIEW_SCHEMA = getStructuredSchema('attribution_review') as StructuredSchema<LlmReviewItem>
 
+
+// ============================================================================
+// AIProvider → CharacterExtractor（生成画本前的角色抽取）
+// ============================================================================
+
+/**
+ * 角色抽取的输出 schema：只要一个名字数组。
+ * 保持最小面是为了让弱模型也能稳定输出（复杂 schema 会显著提高解析失败率）。
+ */
+const EXTRACT_SCHEMA = schemaFromShape(
+  {
+    names: {
+      type: 'array',
+      items: { type: 'string', minLength: 1, maxLength: 24 },
+      description: '正文中真正出场的人物名（不含地名 / 组织 / 泛称 / 代词）',
+    },
+  },
+  { name: 'character_extract', description: '从中文小说正文中抽取角色名' },
+) as StructuredSchema<{ names: string[] }>
+
+export interface CreateProviderCharacterExtractorOptions {
+  /** 每次调用现取 Provider；返回 null 表示当前没有可用配置（返回空数组，不报错） */
+  getContext: () => LlmReviewContext | null
+  /** 送入模型的正文上限（默认 8000 字，避免超长上下文与费用失控） */
+  maxChars?: number
+}
+
+/**
+ * 用已配置的 AI 服务抽取角色（docs/11 §4.6 的「AI 抽取」路径）。
+ *
+ * 失败由调用方（`canvas.service`）catch 并降级到规则抽取：这里**不吞错**，
+ * 只保证「没有配置时返回空数组」这一种静默降级。
+ */
+export function createProviderCharacterExtractor(
+  options: CreateProviderCharacterExtractorOptions,
+): CharacterExtractor {
+  const maxChars = Math.max(500, options.maxChars ?? 8000)
+  return {
+    async extract(req) {
+      const ctx = options.getContext()
+      if (!ctx) return []
+
+      const text = req.chapterText.slice(0, maxChars)
+      const known = req.knownNames.slice(0, 200).join('、')
+      const messages: ChatMessage[] = [
+        {
+          role: 'system',
+          content: '你是中文小说的角色抽取器。只输出 JSON，不要解释；只抽真正出场的人物名，排除地名/组织/泛称/代词。',
+        },
+        {
+          role: 'user',
+          content: [
+            known ? `已知角色（不必重复）：${known}` : '已知角色：无',
+            '',
+            '请从下面的正文中抽取所有出场人物名：',
+            text,
+          ].join('\n'),
+        },
+      ]
+
+      const result = await callStructured<{ names: string[] }>(ctx.provider, messages, EXTRACT_SCHEMA, {
+        allowCloud: ctx.allowCloud,
+        purpose: 'character_extract',
+        temperature: 0.1,
+        maxTokens: 1024,
+        ...(ctx.timeoutMs !== undefined ? { timeoutMs: ctx.timeoutMs } : {}),
+        ...(req.signal ? { signal: req.signal } : {}),
+      })
+
+      const raw = Array.isArray(result.value?.names) ? result.value.names : []
+      const out: Array<{ name: string }> = []
+      const seen = new Set<string>()
+      for (const item of raw) {
+        const name = typeof item === 'string' ? item.trim() : ''
+        if (name.length === 0 || name.length > 24 || seen.has(name)) continue
+        seen.add(name)
+        out.push({ name })
+      }
+      return out
+    },
+  }
+}
 export function createProviderLlmReviewer(options: CreateProviderLlmReviewerOptions): LlmReviewer {
   return {
     async reviewBatch(req: LlmReviewRequest): Promise<LlmReviewItem[]> {

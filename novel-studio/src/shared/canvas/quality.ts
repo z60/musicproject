@@ -28,6 +28,7 @@ import type {
   SpeakerType,
 } from '../types.ts'
 import { findTopLevelQuoteSpans } from './attribution.ts'
+import { isNarrationRoleName } from './narration-role.ts'
 
 // ============================================================================
 // 输入类型
@@ -362,6 +363,9 @@ export function qualityCheck(
   // ---- 角色表：从未被引用 ----
   for (const c of characters) {
     if (c.isArchived) continue
+    // 旁白角色天然没有 `character_id` 指向它的行（旁白行的 character_id 恒为 null），
+    // 不跳过的话每一章都会给它报一条「从未出场」的假问题（见 shared/canvas/narration-role.ts）
+    if (isNarrationRoleName(c.name)) continue
     if (!referencedCharacters.has(c.id)) {
       push('no_character_ref', null, `角色「${c.name}」在本章从未出场（如已无用可归档）`)
     }

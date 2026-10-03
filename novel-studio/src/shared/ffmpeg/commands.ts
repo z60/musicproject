@@ -271,6 +271,57 @@ export function buildLoudnessVerifyCommand(input: LoudnessMeasureCommandInput): 
 }
 
 // ============================================================================
+// 解码为 WAV（导入外来音频，docs/91 §5.2.49）
+// ============================================================================
+
+export interface DecodeToWavCommandInput {
+  input: string
+  output: string
+  /** 输出采样率，默认 48 kHz（与项目内录音链路一致，见 docs/05 §2） */
+  sampleRate?: number
+  channels?: 1 | 2
+  /**
+   * 位深，默认 16。
+   *
+   * 这里解出来的是**中间产物**（后面还要走 VAD、切句、处理链），不是交付成品，
+   * 所以 16 位足够；用 24 位只会让导入 90 行的一次性解码多做一倍 I/O。
+   */
+  bitDepth?: 16 | 24
+  overwrite?: boolean
+  ffmpegPath?: string
+}
+
+/**
+ * 把 ffmpeg 能读的任何音频解成 WAV。
+ *
+ * 用于「按说话人导入音频」：真机样本 5 个**全是 mp3**，而项目内的音频链路
+ * （`audio-file.ts` 的 `isWav`、剪裁、拼接、处理链）一律按内容校验 WAV，
+ * 所以必须在入口处解一次，而不是让 mp3 一路带着扩展名 `.wav` 混进去。
+ *
+ * 三个必须写死的参数（漏一个都会在真机上出问题）：
+ *   · `-vn`              丢掉视频/封面流。mp3 常带 `attached_pic`，
+ *                        不丢会让 `-c:a` 选择失败（ffmpeg 报的是「输出不含流」这种难懂的错）
+ *   · `-map 0:a:0`       只取第一条音频流。真机样本里有多流文件，
+ *                        不显式 map 会按默认规则挑流，结果可能是错的音轨
+ *   · `-map_metadata -1` 不带源文件的元数据。ID3 里的曲名/流派会污染项目内文件，
+ *                        而且 `-map_chapters` 之类元数据在导入场景毫无意义
+ *
+ * @throws 不抛异常（非 0 退出码由调用方按 `AUDIO_IMPORT_TRANSCODE_FAILED` 处理）
+ */
+export function buildDecodeToWavCommand(input: DecodeToWavCommandInput): string[] {
+  const cmd = base(input.ffmpegPath)
+  cmd.push('-loglevel', 'error', '-nostats')
+  if (input.overwrite !== false) cmd.push('-y')
+  cmd.push('-i', input.input)
+  cmd.push('-vn', '-map', '0:a:0', '-map_metadata', '-1')
+  cmd.push('-c:a', (input.bitDepth ?? 16) === 24 ? 'pcm_s24le' : 'pcm_s16le')
+  cmd.push('-ar', String(input.sampleRate ?? 48000))
+  cmd.push('-ac', String(input.channels ?? 1))
+  cmd.push(input.output)
+  return cmd
+}
+
+// ============================================================================
 // M4B（docs/05 §9.2 / docs/15 §5.2）
 // ============================================================================
 
@@ -325,6 +376,28 @@ export function buildM4bProbeCommand(input: { file: string; ffprobePath?: string
     'json',
     '-show_format',
     '-show_chapters',
+    input.file,
+  ]
+}
+
+/**
+ * 用 ffprobe 读容器时长（导入期展示信息用，docs/10 §5）。
+ *
+ * ★ **`argv[0]` 必须是 `'ffprobe'`**：`FfmpegRunner.execute` 是按第一项分派二进制的
+ *   （`'ffmpeg'` → ffmpeg 路径，`'ffprobe'` → ffprobe 路径）。漏掉程序名，数组第一项
+ *   就成了 `-v`，`spawn('-v')` 直接 ENOENT；而调用方把这个错 `catch` 成 `null`，
+ *   表现为「非 WAV 导入的时长永远是空的」，一条日志都没有 —— 正是这种静默失败
+ *   让「时长探测没接线」和「时长探测写错了」看起来一模一样。
+ */
+export function buildDurationProbeCommand(input: { file: string; ffprobePath?: string }): string[] {
+  return [
+    input.ffprobePath ?? 'ffprobe',
+    '-v',
+    'error',
+    '-show_entries',
+    'format=duration',
+    '-of',
+    'default=noprint_wrappers=1:nokey=1',
     input.file,
   ]
 }

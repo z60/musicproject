@@ -136,6 +136,30 @@ const SliceMatchShape = v.object({
   confidence: v.number({ min: 0, max: 1 }),
 })
 
+/**
+ * 按说话人导入：一个待导入文件的人工修正。
+ *
+ * 字段**都可选**（不传 = 用自动判定结果）。`character` / `cv` 允许显式
+ * `null`（表示「清除人工指定、回到自动判定」），所以用 `nullable` 而不是仅 optional ——
+ * 少了 `nullable` 就没法表达「撤销修正」这个动作。
+ */
+const AudioImportOverrideShape = v.object({
+  character: OptNullableString,
+  cv: OptNullableString,
+  narration: OptBool,
+  /**
+   * 章节区间：文件名解析不出区间时，用户手工填（1 ~ 999999，与章节号口径一致）。
+   * 没有它就没法为「命名不合规」的文件选行，指定角色也白搭。
+   */
+  fromChapter: v.optional(v.nullable(v.number({ int: true, min: 1, max: 999_999 }))),
+  toChapter: v.optional(v.nullable(v.number({ int: true, min: 1, max: 999_999 }))),
+})
+
+const AudioImportFileRequestShape = v.object({
+  filePath: v.string().max(4000),
+  overrides: v.optional(AudioImportOverrideShape),
+})
+
 const VadSliceShape = v.object({
   id: Id,
   sessionId: Id,
@@ -484,6 +508,7 @@ export const IPC_REQ_SCHEMAS = {
   'app:getInfo': v.void(),
   'app:getPaths': v.void(),
   'app:getCapabilities': v.void(),
+  'app:refreshCapabilities': v.void(),
   // 只允许 http/https（docs/20 §4.1）；其余协议在 handler 里也会再挡一次
   'app:openExternal': v.object({ url: v.string().max(2000) }),
   'app:showItemInFolder': v.object({ path: v.string().max(2000) }),
@@ -573,6 +598,10 @@ export const IPC_REQ_SCHEMAS = {
 
   // ── 画本 ───────────────────────────────────────────────────────────────
   'canvas:generate': v.object({ chapterId: Id, options: CanvasGenerateOptionsShape }),
+  'canvas:generateBatch': v.object({
+    chapterIds: v.array(Id, { max: 20_000 }),
+    options: CanvasGenerateOptionsShape,
+  }),
   'canvas:getGenerateReport': v.object({ chapterId: Id }),
   'canvas:getChapter': v.object({
     chapterId: Id,
@@ -668,6 +697,7 @@ export const IPC_REQ_SCHEMAS = {
   'voiceActor:unbind': v.object({ characterId: Id, actorId: Id }),
   'voiceActor:workload': v.object({ bookId: Id }),
   'voiceActor:bindings': v.object({ bookId: Id }),
+  'voiceActor:syncFromCanvas': v.object({ bookId: Id, force: OptBool }),
 
   // ── 录音 ───────────────────────────────────────────────────────────────
   'record:prepare': v.object({
@@ -700,6 +730,45 @@ export const IPC_REQ_SCHEMAS = {
   }),
   'record:acceptSlices': v.object({ sessionId: Id, accepted: v.array(SliceMatchShape, { max: 20_000 }) }),
   'record:optimizeTrim': v.object({ takeId: Id, options: TrimOptionsShape }),
+
+  // ── 按说话人导入音频（docs/91 §5.2.49）──────────────────────────────────────
+  // 路径一律限制长度：IPC 载荷是不可信输入，超长字符串会浪费校验与日志开销。
+  // `confirm` 用 `v.literal(true)` 而不是 `v.boolean()` —— 只有**显式 true**
+  // 才允许写库；漏传、传 false、传其他真值都会在校验层被挡下（contract 层也有类型约束）。
+  'record:importScanCanvas': v.object({
+    projectId: Id,
+    bookId: Id,
+    canvasPath: v.optional(v.string().max(4000)),
+  }),
+  'record:importScanFiles': v.object({
+    dir: v.string().max(4000),
+    recursive: OptBool,
+  }),
+  'record:importPlan': v.object({
+    projectId: Id,
+    bookId: Id,
+    canvasPath: v.optional(v.string().max(4000)),
+    files: v.array(AudioImportFileRequestShape, { max: 5000 }),
+  }),
+  'record:importStart': v.object({
+    projectId: Id,
+    bookId: Id,
+    canvasPath: v.optional(v.string().max(4000)),
+    files: v.array(AudioImportFileRequestShape, { max: 5000 }),
+    onlyFiles: v.optional(v.array(v.string().max(1000), { max: 5000 })),
+    skipNeedsReview: OptBool,
+    // 与 `record:importApply` 同一道闸：写库必须显式确认
+    confirm: v.literal(true),
+  }),
+  'record:importApply': v.object({
+    projectId: Id,
+    bookId: Id,
+    canvasPath: v.optional(v.string().max(4000)),
+    files: v.array(AudioImportFileRequestShape, { max: 5000 }),
+    onlyFiles: v.optional(v.array(v.string().max(1000), { max: 5000 })),
+    skipNeedsReview: OptBool,
+    confirm: v.literal(true),
+  }),
 
   'device:list': v.void(),
   'device:savePreference': v.object({ deviceId: v.string().max(200), label: v.string().max(300) }),

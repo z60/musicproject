@@ -105,6 +105,8 @@ async function harness(over?: { canvas?: Partial<CanvasSettingsShape> }): Promis
         enqueued.generate.push({ chapterId, options })
         return { taskId: 'task-gen-1' }
       },
+      // 批量生成（章节管理用）：本测试只关心通道覆盖，不需要真正入队
+      enqueueGenerateBatch: async () => ({ taskId: 'task-gen-batch-1' }),
       enqueueRecompute: async (payload) => {
         enqueued.recompute.push(payload)
         return { taskId: 'task-rc-1' }
@@ -213,10 +215,10 @@ describe('画本域 handler · 契约面', () => {
     }
   })
 
-  it('canvas:getGenerateReport 已实现（12 个通道，报告有落库位置）', async () => {
+  it('canvas:getGenerateReport 已实现（13 个通道，报告有落库位置）', async () => {
     const h = await harness()
     try {
-      assert.equal(CANVAS_CHANNELS.length, 12)
+      assert.equal(CANVAS_CHANNELS.length, 13)
       assert.ok(CANVAS_CHANNELS.includes('canvas:getGenerateReport'))
       assert.ok(h.handlers.some((x) => x.channel === 'canvas:getGenerateReport'))
     } finally {

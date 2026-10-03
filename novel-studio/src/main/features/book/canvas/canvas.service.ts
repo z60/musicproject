@@ -25,6 +25,7 @@ import type {
   CanvasLine,
   CanvasLinePatch,
   ChapterCanvasState,
+  Character,
   Id,
   QualityIssue,
   Timestamp,
@@ -52,6 +53,7 @@ import {
   type QualitySegmentRef,
 } from '../../../../shared/canvas/index.ts'
 import { computeCentroid } from '../../../../shared/canvas/vector.ts'
+import { createCharacter, extractCharacterCandidates } from '../../../../shared/canvas/character.ts'
 import type { CanvasRepo } from './repositories/canvas.repo.ts'
 import type { CharacterCentroidRecord, CharacterRepo } from './repositories/character.repo.ts'
 
@@ -59,6 +61,24 @@ import type { CharacterCentroidRecord, CharacterRepo } from './repositories/char
 // 依赖与请求类型
 // ============================================================================
 
+/** 生成前角色抽取的请求（AI / 本地 NER 实现用） */
+export interface CharacterExtractRequest {
+  bookId: Id
+  chapterId: Id
+  chapterTitle?: string
+  chapterText: string
+  /** 已存在的角色名与别名（避免重复建） */
+  knownNames: string[]
+  signal?: AbortSignal
+}
+
+/**
+ * 角色抽取端口。
+ * 实现可以走 AI（结构化输出）或本地模型；**失败由调用方降级到规则抽取**，绝不阻断生成。
+ */
+export interface CharacterExtractor {
+  extract(req: CharacterExtractRequest): Promise<Array<{ name: string }>>
+}
 export interface CanvasServiceDeps {
   canvasRepo: CanvasRepo
   characterRepo: CharacterRepo
@@ -66,6 +86,11 @@ export interface CanvasServiceDeps {
   embedProvider?: EmbeddingProvider | null
   /** 注入式 LLM 复核；不注入 → 低置信行全部进待确认队列 */
   llmReviewer?: LlmReviewer | null
+  /**
+   * 注入式**角色抽取**（AI/NER）。不注入时只用规则抽取。
+   * 生成画本前先抽角色，再判定台词归属 —— 没有角色表时判定无从谈起（docs/11 §8）。
+   */
+  characterExtractor?: CharacterExtractor | null
   /**
    * 让出事件循环。ONNX 推理是同步阻塞的（docs/06 §4.3），
    * 默认实现用 `setImmediate`，生产可换成窗口级调度器（例如忙时降频）。
@@ -101,6 +126,11 @@ export interface GenerateChapterRequest {
   includeTitleLine?: boolean
   /** 覆盖 CANVAS_DEFAULTS 的限制 */
   limits?: CanvasLimits
+  /**
+   * 生成前是否先抽取角色（默认：角色表为空时自动跑；传 true 则强制跑一次）。
+   * docs/11 §8「角色表为空 → 先抽取生成候选，再判定」。
+   */
+  extractCharacters?: boolean
   /** 生成前自动打快照（默认 true，docs/11 §2 FR-2.4.7） */
   snapshot?: boolean
   signal?: AbortSignal
@@ -316,6 +346,91 @@ export function createCanvasService(deps: CanvasServiceDeps): CanvasService {
     }
   }
 
+  /**
+   * Step 3：生成前先把角色抽出来，再判定台词归属（docs/11 §8）。
+   *
+   * 触发条件：角色表为空（首次生成）或显式要求；已有角色时**不打扰**（避免每次生成都塞候选）。
+   * 抽取分两级：规则（永远可用）+ 注入的 AI/NER 端口（可选，失败只记日志）。
+   * 新角色按名字去重后落库；返回本次新增数量与所用引擎，供报告/告警展示。
+   */
+  async function ensureCharactersExtracted(
+    req: GenerateChapterRequest,
+  ): Promise<{ added: number; engine: string } | null> {
+    // **每次都抽取并合并**：批量生成是逐章跑任务，若按「角色表为空才抽」判定，
+    // 第一章抽出几个角色后，后续章节会全部跳过 —— 真机上就出现了整本书只有 1 个角色、
+    // 1879 条台词全判给它的局面。`extractCharacters:false` 是唯一的关闭方式。
+    if (req.extractCharacters === false) return null
+    const before = await deps.characterRepo.listByBook(req.bookId, { includeArchived: true })
+
+    const known = new Set<string>()
+    for (const c of before) {
+      known.add(c.name)
+      for (const a of c.aliases) known.add(a)
+    }
+
+    /** name → 是否来自 AI（仅用于报告引擎） */
+    const names = new Map<string, boolean>()
+    for (const candidate of extractCharacterCandidates(req.chapterText, {
+      chapterTitle: req.chapterTitle ?? null,
+    })) {
+      if (!known.has(candidate.name)) names.set(candidate.name, false)
+    }
+    let engine = '规则抽取'
+
+    // AI 抽取与其它 AI 能力同一开关（`options.useLlm`）：不勾就不花这笔钱。
+    // 规则抽取永远跑（便宜且离线可用）。
+    if (deps.characterExtractor && req.options.useLlm === true) {
+      try {
+        const ai = await deps.characterExtractor.extract({
+          bookId: req.bookId,
+          chapterId: req.chapterId,
+          ...(req.chapterTitle ? { chapterTitle: req.chapterTitle } : {}),
+          chapterText: req.chapterText,
+          knownNames: [...known],
+          ...(req.signal ? { signal: req.signal } : {}),
+        })
+        let aiAdded = 0
+        for (const item of ai) {
+          const name = typeof item?.name === 'string' ? item.name.trim() : ''
+          if (name.length === 0 || known.has(name) || names.has(name)) continue
+          names.set(name, true)
+          aiAdded++
+        }
+        if (aiAdded > 0) engine = '规则 + AI 抽取'
+      } catch (e) {
+        throwIfAborted(req.signal) // 取消必须继续往上冒泡
+        deps.log?.warn?.('canvas.characterExtract.aiFailed', {
+          event: 'canvas.characterExtract.aiFailed',
+          chapterId: req.chapterId,
+          reason: e instanceof Error ? e.message : String(e),
+        })
+      }
+    }
+
+    if (names.size === 0) return { added: 0, engine }
+
+    const ts = now()
+    let order = 0
+    const toCreate: Character[] = []
+    for (const name of names.keys()) {
+      toCreate.push(createCharacter({
+        id: generateId('char'),
+        bookId: req.bookId,
+        name,
+        sortOrder: order++,
+        now: ts,
+      }))
+    }
+    const added = await deps.characterRepo.upsertMany(toCreate)
+    deps.log?.info?.('canvas.characterExtract.done', {
+      event: 'canvas.characterExtract.done',
+      bookId: req.bookId,
+      chapterId: req.chapterId,
+      added,
+      engine,
+    })
+    return { added, engine }
+  }
   return {
     async generateChapter(req) {
       const startedAt = now()
@@ -325,10 +440,12 @@ export function createCanvasService(deps: CanvasServiceDeps): CanvasService {
       }
 
       const modelId = req.options.useEmbedding === true ? deps.embedProvider?.modelId ?? null : null
-      const [existing, characters] = await Promise.all([
-        deps.canvasRepo.listLines(req.chapterId),
-        loadCharacterRefs(req.bookId, modelId ?? '__none__'),
-      ])
+      const existing = await deps.canvasRepo.listLines(req.chapterId)
+
+      // Step 3：先抽角色，再判定（docs/11 §8）。抽完**重新读**角色表，判定才能用上这些角色。
+      req.onProgress?.({ stage: '抽取角色', ratio: 0.02, done: 0, total: 0 })
+      const extraction = await ensureCharactersExtracted(req)
+      const characters = await loadCharacterRefs(req.bookId, modelId ?? '__none__')
 
       // 生成前自动打快照（docs/11 §2 / FR-2.4.7）
       let snapshotId: Id | null = null
@@ -377,6 +494,13 @@ export function createCanvasService(deps: CanvasServiceDeps): CanvasService {
         elapsedMs,
       }
       const warnings = [...finalReport.warnings]
+      if (extraction) {
+        warnings.push(
+          extraction.added > 0
+            ? `CANVAS_CHARACTERS_EXTRACTED: 已自动抽取 ${extraction.added} 个角色（${extraction.engine}），随后进行说话人判定`
+            : 'CANVAS_CHARACTERS_EXTRACTION_EMPTY: 未能自动抽取到角色，未指定说话人的行会进待确认队列',
+        )
+      }
       if (finalReport.lowConfidence > 0) {
         warnings.push(`CANVAS_ATTRIBUTION_LOW_CONFIDENCE: ${finalReport.lowConfidence} 行需要人工确认`)
       }

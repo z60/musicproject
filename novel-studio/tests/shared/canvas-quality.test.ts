@@ -246,6 +246,23 @@ describe('画本质检：12 种 issue 每种都能被检出', () => {
   })
 })
 
+
+describe('质检：旁白角色不算「从未出场」', () => {
+  const NARRATION = makeCharacter({ id: 'c-旁白', name: '旁白' })
+  const ORPHAN = makeCharacter({ id: 'c-路人', name: '路人甲' })
+  const narrationLines: QualityCheckLine[] = [
+    makeLine({ id: 'N1', seq: 0, kind: 'narration', text: '夜色沉沉。' }),
+    makeLine({ id: 'N2', seq: 1, kind: 'narration', text: '他推门而入。' }),
+  ]
+
+  it('旁白行没有 character_id：不能给旁白角色报 no_character_ref', () => {
+    const issues = qualityCheck(narrationLines, [NARRATION, ORPHAN], [])
+    const refs = issues.filter((i) => i.kind === 'no_character_ref')
+    assert.deepEqual(refs.map((i) => i.message), ['角色「路人甲」在本章从未出场（如已无用可归档）'])
+    assert.ok(!refs.some((i) => i.message.includes('旁白')), '每章都报一句「旁白从未出场」纯属噪声')
+  })
+})
+
 // ---------------------------------------------------------------------------
 // 边界：空画本 / 只有一行 / 无 segments
 // ---------------------------------------------------------------------------

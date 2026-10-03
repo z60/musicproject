@@ -379,6 +379,16 @@ export function createSqliteCanvasRepo(db: DbLike): CanvasRepo {
       return rows.map(lineFromRow)
     },
 
+    async listNarrationByBook(bookId: Id): Promise<CanvasLine[]> {
+      const rows = db
+        .prepare(
+          `${SELECT_LINE} WHERE deleted_at IS NULL AND book_id = ? AND speaker_type = 'narration'
+            ORDER BY chapter_id ASC, seq ASC`,
+        )
+        .all(bookId) as CanvasLineRow[]
+      return rows.map(lineFromRow)
+    },
+
     async countByChapter(chapterId: Id): Promise<number> {
       const row = db
         .prepare(`SELECT COUNT(*) AS n FROM canvas_lines WHERE deleted_at IS NULL AND chapter_id = ?`)

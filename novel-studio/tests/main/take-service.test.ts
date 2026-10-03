@@ -13,6 +13,8 @@
  */
 
 import { strict as assert } from 'node:assert'
+
+import { createStubAudioImportService } from './helpers/stub-import-service.ts'
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -162,6 +164,7 @@ async function harness(): Promise<Harness> {
         lineChapterId: async () => 'c1',
         lineCharCounts: async () => [],
       }),
+      importService: createStubAudioImportService(),
       log: { info: () => {}, warn: () => {} },
     }),
     cleanup: () => {

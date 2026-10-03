@@ -1,5 +1,5 @@
 <!--
-  画本编辑 · 说话人单元格（docs/11 §4.2「说话人：角色名 + 置信度色带 + 候选提示，可编辑（下拉 + 快捷键）」）
+  画本编辑 · 说话人单元格（docs/11 §4.2）：**这里选的是 CV（谁来念）**，角色名在角色名列选。
   ============================================================================
   设计要点：
     · 置信度色带必须复用 @/shared/ui/ConfidenceBadge.vue（内部用 CONFIDENCE_BANDS），
@@ -14,6 +14,7 @@
 import { computed, ref } from 'vue'
 import type { CanvasLine, Id } from '@shared/types.ts'
 import ConfidenceBadge from '@/shared/ui/ConfidenceBadge.vue'
+import { filterSpeakerOptions } from '@shared/canvas/speaker-options.ts'
 import { useSpeakerAssign } from '../composables/useSpeakerAssign.ts'
 import { useCharactersStore } from '../stores/characters.store.ts'
 
@@ -63,14 +64,14 @@ const pending = computed(() => speaker.pendingIds.value.has(props.line.id))
 /** 是否「需要看一眼」：待确认 / 未分配 / 置信度低 */
 const suspicious = computed(() => props.line.needsReview || unassigned.value)
 
-const filteredCharacters = computed(() => {
-  const kw = keyword.value.trim().toLowerCase()
-  const list = characters.activeCharacters
-  if (!kw) return list
-  return list.filter(c =>
-    c.name.toLowerCase().includes(kw)
-    || c.aliases.some(alias => alias.toLowerCase().includes(kw)))
-})
+/**
+ * 面板里的候选：**按 CV 组织**（`cvPickerOptions`）。
+ *
+ * 真机反馈：「说话人需要选择 CV」—— 以前这里列的是角色表，用户想按配音员找人就得先在
+ * 脑子里做一次「CV → 角色」的翻译。现在一个 CV 只负责一个角色时标签直接是 CV 名，
+ * 负责多个角色时写成「语心草（方艺华）」（数据模型里一行只存角色，见 speaker-options.ts）。
+ */
+const filteredOptions = computed(() => filterSpeakerOptions(characters.cvPickerOptions, keyword.value))
 
 async function assign(characterId: Id | null): Promise<void> {
   if (props.readonly) return
@@ -146,26 +147,29 @@ function onSpeakerSelectInput(value: string): void {
           <el-input
             v-model="keyword"
             size="small"
-            placeholder="搜索角色名或别名"
+            placeholder="搜索 CV 或角色名"
             clearable
           />
 
           <div class="ns-speaker__list">
             <button
-              v-for="character in filteredCharacters"
-              :key="character.id"
+              v-for="item in filteredOptions"
+              :key="`${item.characterId ?? 'narration'}::${item.label}`"
               type="button"
               class="ns-speaker__option"
-              :class="{ 'is-active': character.id === line.characterId }"
-              @click="assign(character.id)"
+              :class="{ 'is-active': item.characterId === line.characterId }"
+              @click="assign(item.characterId)"
             >
-              <i class="ns-speaker__dot" :style="{ background: characters.colorOf(character.id) }" />
-              <span class="ns-speaker__option-name">{{ character.name }}</span>
-              <span v-if="character.aliases.length" class="ns-speaker__aliases">
-                {{ character.aliases.slice(0, 2).join('/') }}
-              </span>
+              <i
+                class="ns-speaker__dot"
+                :style="{ background: item.characterId ? characters.colorOf(item.characterId) : 'transparent' }"
+              />
+              <span class="ns-speaker__option-name">{{ item.label }}</span>
+              <span v-if="item.hint" class="ns-speaker__aliases">{{ item.hint }}</span>
             </button>
-            <p v-if="!filteredCharacters.length" class="ns-speaker__empty">没有匹配的角色（可在右栏角色表里新增）</p>
+            <p v-if="!filteredOptions.length" class="ns-speaker__empty">
+              没有匹配的 CV 或角色。先在右栏「CV 表」里把角色分配给配音员，这里就会出现该 CV。
+            </p>
           </div>
 
           <div class="ns-speaker__panel-actions">
@@ -179,22 +183,25 @@ function onSpeakerSelectInput(value: string): void {
 
     <template v-else>
       <div class="ns-speaker__full">
+        <!-- 选 CV：一个 CV 名下有多个角色时写成「CV（角色名）」（见 speaker-options.ts） -->
         <el-select
           :model-value="line.characterId ?? '__narration__'"
           :disabled="readonly"
           filterable
           size="small"
-          placeholder="选择角色"
+          placeholder="选择 CV"
           class="ns-speaker__select"
           @update:model-value="onSpeakerSelectInput"
         >
-          <el-option label="旁白（无角色）" value="__narration__" />
           <el-option
-            v-for="character in characters.activeCharacters"
-            :key="character.id"
-            :label="character.aliases.length ? `${character.name}（${character.aliases.join('/')}）` : character.name"
-            :value="character.id"
-          />
+            v-for="item in characters.cvPickerOptions"
+            :key="`${item.characterId ?? 'narration'}::${item.label}`"
+            :label="item.hint ? `${item.label}（${item.hint}）` : item.label"
+            :value="item.characterId ?? '__narration__'"
+          >
+            <span class="ns-speaker__option-name">{{ item.label }}</span>
+            <span v-if="item.hint" class="ns-speaker__aliases">{{ item.hint }}</span>
+          </el-option>
         </el-select>
 
         <ConfidenceBadge

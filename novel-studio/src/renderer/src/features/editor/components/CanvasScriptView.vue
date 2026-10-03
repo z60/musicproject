@@ -165,8 +165,9 @@ function speakerColor(line: CanvasLine): string {
 
 function speakerName(line: CanvasLine): string {
   if (line.kind === 'sfx_note') return '音效'
-  if (line.speakerType === 'narration' || !line.characterId) return '旁白'
-  return characters.nameOf(line.characterId)
+  if (line.speakerType === 'narration' || !line.characterId) return characters.narrationDisplayName
+  // 剧本视图的说话人同样「有 CV 显示 CV，否则角色名」
+  return characters.displayNameOf(line.characterId)
 }
 
 /** 台词文本在剧本视图里加「」括号，音效行用【】——一眼区分「要念」与「只是提示」 */

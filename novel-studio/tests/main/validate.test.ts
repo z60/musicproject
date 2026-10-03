@@ -260,7 +260,7 @@ describe('契约覆盖：每个 IPC 通道都有可用的 req schema', () => {
   it('IPC_CHANNELS 与 IPC_REQ_SCHEMAS 的键集合完全一致', () => {
     const fromSchemas = schemaChannels()
     assert.deepEqual(fromSchemas, [...IPC_CHANNELS].sort())
-    assert.equal(fromSchemas.length, 158, '契约通道数变化时必须同步更新本断言')
+    assert.equal(fromSchemas.length, 166, '契约通道数变化时必须同步更新本断言')
   })
 
   it('每个通道都能取到 schema 且不是 undefined', () => {

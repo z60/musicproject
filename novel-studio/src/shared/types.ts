@@ -564,6 +564,18 @@ export interface VadOptions {
   headRollbackMs: number
   tailKeepMs: number
   autoNoiseFloor: boolean
+  /**
+   * 间隔小于此值的两段语音**合并**成一片（默认 250 ms，见 `VAD_BRIDGE_GAP_MS`）。
+   *
+   * 为什么导入场景需要调小它：录制场景合并短间隙是对的（句内停顿不该切片），
+   * 但**导入既成音频**时相反 —— 「按说话人导入」的文件是一个说话人连续念整章，
+   * 句与句之间往往只有 100~250 ms 的短停顿。若把它们桥接掉，VAD 就只能切出
+   * 「几行一片」的大片，接着只能**按字符比例硬切**，音与文本就会错位
+   * （真机反馈：导入后第 N 行的音和文本对不上）。
+   *
+   * 不传 = 用 `VAD_BRIDGE_GAP_MS`（录制路径行为不变）。
+   */
+  bridgeGapMs?: number
   /** 中文语速估算用（字/秒），用于估算画本行期望时长 */
   charsPerSecond: number
 }
@@ -920,6 +932,14 @@ export type TaskKind =
   | 'book.import'
   | 'canvas.generate'
   /**
+   * 批量生成画本（章节管理的「批量生成画本」）：**一条任务**处理 N 章。
+   *
+   * 为什么单独一个 kind：批量若逐章入队，用户会在章节管理看到 N 张进度卡
+   * （真机上表现为「一直弹出进度为 0 的标签」），任务中心也会被 N 条记录淹没。
+   * 合成一条任务后，进度只有一份，失败也只重试这一条。
+   */
+  | 'canvas.generate.batch'
+  /**
    * 重算说话人判定（`canvas:recomputeAttribution`）。
    *
    * 为什么单独一个 kind 而不是复用 `canvas.generate`：两者在任务中心里是**不同的事**
@@ -944,6 +964,15 @@ export type TaskKind =
   | 'package.export'
   | 'package.import'
   | 'package.merge'
+  /**
+   * 按说话人导入音频（`record:importStart`）。
+   *
+   * 为什么必须是任务而不是一次同步调用：一个文件要「解码 → 逐帧能量 → VAD → 铺满每行」
+   * （真机样本最大 30 MB / 74 章），几十个文件就是几分钟。放在 IPC 里同步做，
+   * 渲染进程会一直转圈、用户不能离开向导；做成任务后可以关掉向导、在任务中心看进度，
+   * 而且失败能重试、重启能续（队列的既有能力）。
+   */
+  | 'audioImport.apply'
   | 'db.backup'
   | 'cache.clean'
 
@@ -1204,8 +1233,175 @@ export interface AppSettings {
 }
 
 // ============================================================================
-// 能力探测（docs/02 §5.1、docs/14 §3.1）
+// 按说话人导入音频（docs/12 §录音域、docs/91 §5.2.49）
 // ============================================================================
+//
+// 这一组类型是**跨进程契约**：主进程的服务层直接构造它们，渲染进程只读。
+// 所以刻意**不引用** `src/shared/audio-import/**` 里的内部类型
+// （那些是纯逻辑层的实现细节，改它们不该影响 IPC 契约）。
+
+/** 画本扫描摘要（`record:importScanCanvas` 的响应） */
+export interface AudioImportCanvasScan {
+  filePath: string
+  /** 文档章节号 ↔ 数据库章节 id 的对齐结果（只含数据库里真实存在的章节） */
+  chapters: Array<{ no: number; chapterId: Id; title: string; lineCount: number }>
+  characters: Array<{ id: Id; name: string; aliases: string[] }>
+  voiceActors: Array<{ id: Id; name: string }>
+  /** 画本里出现过的 CV 名（来自角色表与正文标记） */
+  canvasCvs: string[]
+  /** 文档里的章节号范围（可能超出数据库已有章节，UI 要据此提示） */
+  documentChapterRange: { from: number; to: number } | null
+  /** 文档解析警告（结构不规范之处），UI 应展示而不是静默忽略 */
+  warnings: Array<{ sourceLine: number; reason: string; detail: string; sample?: string }>
+}
+
+/** 扫描到的音频候选文件（**含命名不合规的**，见 `parseError`） */
+export interface AudioImportCandidate {
+  filePath: string
+  fileName: string
+  sizeBytes: number
+  /** 时长；ffmpeg 不可用或探测失败时为 null（不是 0 —— 0 表示「真的是 0 秒」） */
+  durationMs: number | null
+  /**
+   * 文件名解析失败的原因（`null` = 解析成功）。
+   *
+   * 为什么扫描结果要**带着**不合规的文件：真机反馈「目录里 24 个文件，扫描只扫出 6 个」——
+   * 以前这里把解析失败的文件直接丢掉，用户只看到一个变小的数字，
+   * 既不知道少了几个、也不知道少了哪些、更不知道该怎么改名。
+   * 界面必须把「跳过了哪些文件、为什么」如实列出来。
+   */
+  parseError?: { reason: string; detail: string } | null
+}
+
+/** 人工修正（覆盖自动判定） */
+export interface AudioImportFileOverride {
+  character?: string | null
+  cv?: string | null
+  narration?: boolean
+  /**
+   * 章节区间（文件名解析不出区间时必填）。
+   *
+   * 「解析不出的文件」既要能指定说话人、也要能指定它覆盖哪些章 ——
+   * 否则没有区间就选不出行，指定了角色也没用。
+   */
+  fromChapter?: number | null
+  toChapter?: number | null
+}
+
+/** 请求里描述一个待导入文件 */
+export interface AudioImportFileRequest {
+  filePath: string
+  overrides?: AudioImportFileOverride
+}
+
+export type AudioImportFileStatus =
+  | 'ready'
+  | 'needs-review'
+  | 'unresolved-speaker'
+  | 'no-lines'
+  | 'invalid-name'
+  | 'duplicate-lines'
+
+/** 单个文件的导入计划 */
+export interface AudioImportFilePlan {
+  filePath: string
+  fileName: string
+  sizeBytes: number
+  durationMs: number | null
+  status: AudioImportFileStatus
+  /** 章节区间（文件名解析成功时有值） */
+  range: { from: number; to: number } | null
+  /** 区间里画本实际存在的章节号 */
+  chaptersInCanvas: number[]
+  /** 区间里画本没有的章节号（用于提示「有 N 章不在画本里」） */
+  chaptersMissingInCanvas: number[]
+  /** 命中画本行数 */
+  lineCount: number
+  /** 命中行的章节分布 */
+  linesByChapter: Record<number, number>
+  /**
+   * 命中行样例（供 UI 预览）。
+   *
+   * ⚠️ 这里刻意**不提供**「命中行的 id 列表」。
+   *   原因：预览走**文档行**（编号是文档行号）、导入走**数据库行**（编号是 `seq`），
+   *   两个编号空间不同。把其中任一当成「要导入的行」暴露出去，
+   *   都会诱使调用方拿它去查库 —— 而那样查到的行**未必是同一批**。
+   *   要展示就先展示 `samples`，要落库就交给服务层按同一个目标重算。
+   */
+  samples: Array<{ chapterNo: number; character: string; text: string }>
+  /** 与别的文件重叠的行数 */
+  overlappingLineCount: number
+  /** 说话人目标说明（UI 直接显示） */
+  targetExplanation: string | null
+  /** 目标类型（UI 据此决定给用户哪些修正选项） */
+  targetKind: string | null
+  /** CV 匹配方式与置信度 */
+  cvMatchedName: string | null
+  cvMatchMethod: string
+  cvConfidence: number
+  /** 需要用户注意的说明 */
+  notes: string[]
+}
+
+export interface AudioImportPlanSummary {
+  totalFiles: number
+  readyFiles: number
+  needsReviewFiles: number
+  unresolvedFiles: number
+  noLinesFiles: number
+  invalidFiles: number
+  overlappingFiles: number
+  duplicatedLineCount: number
+  totalLines: number
+  totalDurationMs: number
+  totalBytes: number
+  canvasChapterRange: { from: number; to: number } | null
+  availableCvs: string[]
+  availableCharacters: string[]
+}
+
+/** 导入预览（`record:importPlan` 的响应） */
+export interface AudioImportPlan {
+  files: AudioImportFilePlan[]
+  summary: AudioImportPlanSummary
+  warnings: string[]
+}
+
+/** 单个文件的导入结果 */
+export interface AudioImportFileResult {
+  fileName: string
+  lineCount: number
+  createdTakes: number
+  error: string | null
+  /**
+   * 这个文件的音频是怎么切到行上的（docs/91 §5.2.49 ⑮）。
+   *
+   * - `vad`            按 VAD 语音片切分，边界落在句间静音上（最可信）
+   * - `whole-timeline` VAD 没找到静音间隙，按每行文本长度**按比例**硬切
+   * - `empty`          解出来是空音频，没有产生任何区间（此时 `createdTakes` 为 0）
+   * - `none`           没有解码能力（缺依赖 / 解码失败），退回**整段 take**
+   *
+   * 为什么必须回报给渲染进程：`createdTakes` 相同的两次导入，听感可能完全不同 ——
+   * 「整段 take」意味着每一行听到的都是同一整段音频。UI 必须能区分并提示用户。
+   */
+  splitMethod: 'asr' | 'vad' | 'whole-timeline' | 'empty' | 'none'
+  /** 切出的段数（VAD 的语音片数 / ASR 的识别段数；0 = 没切） */
+  sliceCount: number
+  /** 区间不可信、建议试听复核的行数（`splitMethod !== 'vad'` 时通常 > 0） */
+  needsReview: number
+}
+
+/** 导入执行结果（`record:importApply` 的响应） */
+export interface AudioImportApplyResult {
+  files: number
+  createdTakes: number
+  createdSegments: number
+  markedRecorded: number
+  skipped: Array<{ fileName: string; reason: string }>
+  perFile: AudioImportFileResult[]
+}
+
+
 
 export interface FfmpegCapabilities {
   version: string

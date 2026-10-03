@@ -17,6 +17,8 @@ import { describe, it } from 'node:test'
 
 import {
   buildChapterExportCommand,
+  buildDecodeToWavCommand,
+  buildDurationProbeCommand,
   buildLoudnessApplyCommand,
   buildLoudnessMeasureCommand,
   buildLoudnessVerifyCommand,
@@ -150,6 +152,53 @@ describe('命令构建：分章导出（docs/05 §9.1）', () => {
 })
 
 // ---------------------------------------------------------------------------
+// 解码为 WAV（导入外来音频）
+// ---------------------------------------------------------------------------
+
+describe('命令构建：解码为 WAV（导入 mp3 等外来音频）', () => {
+  const base = { input: 'C:/samples/2221-2230-石玉凤-德钦.mp3', output: 'C:/proj/imports/x.wav' }
+
+  it('默认输出 48 kHz / 单声道 / 16 位 PCM', () => {
+    const cmd = buildDecodeToWavCommand(base)
+    assert.equal(valueOf(cmd, '-ar'), '48000')
+    assert.equal(valueOf(cmd, '-ac'), '1')
+    assert.equal(valueOf(cmd, '-c:a'), 'pcm_s16le')
+    assert.equal(cmd[cmd.length - 1], base.output)
+    assert.equal(cmd[0], 'ffmpeg')
+  })
+
+  /**
+   * 这三条是「漏了就会在真机上出问题」的参数，单独立用例钉住。
+   * 详见 `buildDecodeToWavCommand` 的注释。
+   */
+  it('-vn 丢掉封面流（mp3 常带 attached_pic，不丢会让 -c:a 选择失败）', () => {
+    assert.ok(buildDecodeToWavCommand(base).includes('-vn'))
+  })
+
+  it('-map 0:a:0 只取第一条音频流（真机样本里有多流文件）', () => {
+    const cmd = buildDecodeToWavCommand(base)
+    assert.equal(valueOf(cmd, '-map'), '0:a:0')
+  })
+
+  it('-map_metadata -1 不带源文件元数据（ID3 会污染项目内文件）', () => {
+    const cmd = buildDecodeToWavCommand(base)
+    assert.equal(valueOf(cmd, '-map_metadata'), '-1')
+  })
+
+  it('24 位与 2 声道可显式指定', () => {
+    const cmd = buildDecodeToWavCommand({ ...base, bitDepth: 24, channels: 2, sampleRate: 44100 })
+    assert.equal(valueOf(cmd, '-c:a'), 'pcm_s24le')
+    assert.equal(valueOf(cmd, '-ac'), '2')
+    assert.equal(valueOf(cmd, '-ar'), '44100')
+  })
+
+  it('默认覆盖已有文件（-y），显式传 overwrite:false 时不加', () => {
+    assert.ok(buildDecodeToWavCommand(base).includes('-y'))
+    assert.ok(!buildDecodeToWavCommand({ ...base, overwrite: false }).includes('-y'))
+  })
+})
+
+// ---------------------------------------------------------------------------
 // 响度
 // ---------------------------------------------------------------------------
 
@@ -227,6 +276,21 @@ describe('命令构建：M4B 合并（docs/05 §9.2 / docs/15 §5.2）', () => {
     assert.equal(cmd[0], 'ffprobe')
     assert.ok(cmd.includes('-show_chapters'))
     assert.ok(cmd.includes('-show_format'))
+  })
+
+  it('时长探测：第一项必须是程序名 ffprobe，不能直接从 -v 起头', () => {
+    const cmd = buildDurationProbeCommand({ file: 'take.mp3' })
+    // 第一项是程序名：`FfmpegRunner.execute` 按它分派二进制（ffprobe）。
+    // 曾经这里手写成「从 -v 开始」，spawn('-v') ENOENT 后被 catch 吞成 null ——
+    // 断言这一条，静默失败就再也回不来了。
+    assert.equal(cmd[0], 'ffprobe')
+    assert.equal(cmd[cmd.length - 1], 'take.mp3')
+    assert.equal(valueOf(cmd, '-show_entries'), 'format=duration')
+  })
+
+  it('时长探测：显式给的 ffprobePath 优先于裸名字', () => {
+    const cmd = buildDurationProbeCommand({ file: 'take.mp3', ffprobePath: 'C:\\bin\\ffprobe.exe' })
+    assert.equal(cmd[0], 'C:\\bin\\ffprobe.exe')
   })
 })
 
@@ -397,7 +461,7 @@ describe('解析：版本 / 滤镜 / 能力探测（docs/02 §5.1）', () => {
     assert.equal(parseVersion(''), null)
   })
 
-  it('parseFilters 只取「三字符标记 + 滤镜名」的行', () => {
+  it('parseFilters 旧格式：三字符标记（6.x 及更早）', () => {
     const stdout = [
       'Filters:',
       '  T.. = Timeline support',
@@ -412,6 +476,50 @@ describe('解析：版本 / 滤镜 / 能力探测（docs/02 §5.1）', () => {
     ].join('\n')
     const filters = parseFilters(stdout)
     assert.deepEqual(filters, ['acompressor', 'afftdn', 'alimiter', 'amix', 'loudnorm'])
+  })
+
+  it('parseFilters 新格式：**两字符**标记（实测 ffmpeg 9.0.2）', () => {
+    // ★ 这十条是真实输出（`ffmpeg -hide_banner -filters` 的前几行 + 几个音频滤镜），
+    //   不是照着正则手写的。旧正则写死「三字符标记」，在这种输出上匹配 **0 行** ——
+    //   后果是滤镜列表为空 ⇒ 必需滤镜「全部缺失」⇒ UI 把降噪/EQ/压缩控件全隐藏，
+    //   而 ffmpeg 明明是好的。单测当时没抓住，因为 fixture 是照旧格式手写的。
+    const stdout = [
+      'Filters:',
+      '  T.. = Timeline support',
+      '  .S. = Slice threading',
+      '  A = Audio input/output',
+      '  V = Video input/output',
+      '  N = Dynamic number and/or type of input/output',
+      '  | = Source or sink filter',
+      '  ------',
+      ' TS aap               AA->A      Apply Affine Projection algorithm to first audio stream.',
+      ' .. abench            A->A       Benchmark part of a filtergraph.',
+      ' .. acompressor       A->A       Audio compressor.',
+      ' TS afftdn            A->A       Denoise audio samples using FFT.',
+      ' .. amix              N->A       Audio mixing.',
+      ' .. anullsink         A->|       Do absolutely nothing with the input audio.',
+      ' .. abuffer           |->A       Buffer audio frames, and make them accessible to the filterchain.',
+      ' .. loudnorm          A->A       EBU R128 loudness normalization',
+    ].join('\n')
+    const filters = parseFilters(stdout)
+    assert.deepEqual(filters, [
+      'aap',
+      'abench',
+      'abuffer',
+      'acompressor',
+      'afftdn',
+      'amix',
+      'anullsink',
+      'loudnorm',
+    ])
+    // 表头与图例必须一条都不进来（它们里面没有 `->`；表头里那个 `->` 在说明文字里）
+    assert.ok(!filters.includes('='), '图例行不能被当成滤镜')
+  })
+
+  it('parseFilters 的判据是签名列：必需滤镜能被真的认出来', () => {
+    // 这是「能力探测」的最后一公里：解析不出名字，能力探测就等于没做
+    const stdout = REQUIRED_FILTERS.map((f, i) => ` .. ${f}${' '.repeat(Math.max(1, 18 - f.length))}A->A       ${i}`).join('\n')
+    assert.deepEqual(parseFilters(stdout), [...REQUIRED_FILTERS].sort())
   })
 
   it('parseEncoders 取音频/视频编码器名', () => {

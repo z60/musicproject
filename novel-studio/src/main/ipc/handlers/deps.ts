@@ -173,7 +173,8 @@ export interface ProviderPort {
 
 /** 主 → 渲染 的事件推送 */
 export interface EventPort {
-  emit<E extends IpcEventName>(event: E, payload: IpcEventPayload<E>): void
+  /** `opts.durable`：窗口不在时也**不许丢**（落待补发队列），见 `ipc/events.ts` */
+  emit<E extends IpcEventName>(event: E, payload: IpcEventPayload<E>, opts?: { durable?: boolean }): void
 }
 
 /** 渲染 → 主 的单向通道订阅（handler 层只用它做登记，实际转接在 bootstrap） */

@@ -451,3 +451,42 @@ describe('画本任务 · character.centroid', () => {
     }
   })
 })
+// ---------------------------------------------------------------------------
+// 批量生成（章节管理「批量生成画本」）：一条任务跑 N 章
+// ---------------------------------------------------------------------------
+
+describe('画本任务 · canvas.generate.batch', () => {
+  it('一条任务跑完（用现有章节）：章节状态更新、报告落库', async () => {
+    const h = await harness()
+    try {
+      const { taskId } = await h.tasks.enqueueGenerateBatch(['c1'], OPTIONS)
+      const record = await h.queue.waitFor(taskId)
+      assert.equal(record.status, 'succeeded', JSON.stringify(record.error ?? null))
+
+      const repo = createSqliteCanvasRepo(h.db as unknown as DbLike)
+      const lines = await repo.listLines('c1')
+      assert.ok(lines.length >= 4, `批量任务也要真的产出画本行，实际 ${lines.length}`)
+      const chapter = await createSqliteChapterRepo(h.db as unknown as DbLike).findById('c1')
+      assert.equal(chapter?.canvasState, 'generated')
+      assert.ok(await repo.getGenerateReport('c1'), '每章的报告也要落库')
+    } finally {
+      await h.cleanup()
+    }
+  })
+
+  it('跨书批量被拒：INVALID_PAYLOAD（进度与去重都无法表达跨书批量）', async () => {
+    const h = await harness()
+    try {
+      h.db.exec(`INSERT INTO books (id, project_id, title, narrator, language, source_type, content_hash, char_count, chapter_count, created_at, updated_at)
+                 VALUES ('b2', 'p1', '书2', '旁白', 'zh-CN', 'txt', 'h2', 0, 1, 1, 1)`)
+      h.db.exec(`INSERT INTO chapters (id, book_id, seq, title, kind, raw_text, source_text, char_count, start_offset, end_offset, canvas_state, line_count, created_at, updated_at)
+                 VALUES ('c9', 'b2', 1, '第一章', 'chapter', 'x', 'x', 1, 0, 1, 'none', 0, 1, 1)`)
+      await assert.rejects(
+        h.tasks.enqueueGenerateBatch(['c1', 'c9'], OPTIONS),
+        (e: unknown) => (e as { key?: string }).key === 'INVALID_PAYLOAD',
+      )
+    } finally {
+      await h.cleanup()
+    }
+  })
+})

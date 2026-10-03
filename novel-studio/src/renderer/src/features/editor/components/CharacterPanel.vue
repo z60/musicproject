@@ -110,7 +110,15 @@ const mergeResult = ref<string | null>(null)
 const bindActorId = ref<Record<Id, Id | null>>({})
 const bindPrimary = ref<Record<Id, boolean>>({})
 
-const showWorkload = ref(false)
+/**
+ * CV 表默认展开。
+ * 之前默认收起，而它挂在角色列表**下面** —— 103 个角色的书里，这块永远在屏幕外，
+ * 用户的实际反馈是「右侧边栏没有 CV 表」（真机反馈 docs/91 §5.2.x）。
+ */
+const showWorkload = ref(true)
+/** 「从画本同步 CV」的进行中标记与回执（同步会建配音员/建绑定，必须给交代） */
+const syncing = ref(false)
+const syncNote = ref<string | null>(null)
 /** 归档确认 */
 const confirmArchive = ref<{ open: boolean; character: Character | null; archived: boolean }>({
   open: false,
@@ -360,9 +368,122 @@ async function toggleWorkload(): Promise<void> {
   if (showWorkload.value) await characters.loadWorkload()
 }
 
+/**
+ * 按角色备注里的 `CV：xxx` 补齐配音员与绑定（`voiceActor:syncFromCanvas`，force）。
+ *
+ * `force` 是刻意的：面板加载时走的是**自动模式**（只在项目首次同步时动手），
+ * 用户点这个按钮则明确表示「我要按画本重新对一遍」，此时该重新建绑定。
+ */
+async function syncFromCanvas(): Promise<void> {
+  if (syncing.value) return
+  syncing.value = true
+  syncNote.value = null
+  try {
+    const res = await characters.syncActorsFromCanvas(true)
+    if (!res) {
+      syncNote.value = '同步失败：拿不到当前书籍。'
+      return
+    }
+    await characters.loadWorkload()
+    syncNote.value = res.matchedCharacters === 0
+      ? '画本里没有 CV 备注（形如「CV：名字」），没有可同步的内容。'
+      : `已同步：新建配音员 ${res.createdActors} 个 · 新建绑定 ${res.boundCharacters} 条 · 备注里有 CV 的角色 ${res.matchedCharacters} 个。`
+  } finally {
+    syncing.value = false
+  }
+}
+
 function actorName(actorId: Id): string {
   return characters.actorById.get(actorId)?.name ?? '未知配音员'
 }
+
+/**
+ * CV 表：每个配音员一行 —— 名字、**名下的角色**、行/字/预估时长/已录。
+ *
+ * 与「角色表」互补：角色表答「这个角色由谁配」，CV 表答「这个 CV 配了哪些角色」。
+ * 配音员分工要按人看才知道谁空谁满（docs/11 §6.1），所以角色名必须出现在这张表里。
+ */
+const cvRows = computed(() => {
+  const rolesByActor = new Map<string, string[]>()
+  for (const b of characters.bindings) {
+    const name = characters.characterById.get(b.characterId)?.name
+    if (!name) continue
+    const list = rolesByActor.get(b.actorId) ?? []
+    list.push(b.isPrimary ? name : `${name}（备）`)
+    rolesByActor.set(b.actorId, list)
+  }
+  const rows = characters.workload.map((w) => ({
+    key: w.actorId,
+    name: w.name,
+    roles: (rolesByActor.get(w.actorId) ?? []).join('、'),
+    lines: w.lines,
+    chars: w.chars,
+    estimatedDurationMs: w.estimatedDurationMs,
+    recordedCount: w.recordedCount,
+  }))
+  // 没有任何 CV 绑定的角色也要看得见（否则「这些角色还没分 CV」会从表里消失）
+  const bound = new Set(characters.bindings.map((b) => b.characterId))
+  const unbound = characters.activeCharacters.filter((c) => !bound.has(c.id))
+  if (unbound.length > 0) {
+    let lines = 0
+    let chars = 0
+    let estimatedDurationMs = 0
+    for (const c of unbound) {
+      const s = characters.statsOf(c.id)
+      if (!s) continue
+      lines += s.lines
+      chars += s.chars
+      estimatedDurationMs += s.estimatedDurationMs
+    }
+    rows.push({
+      key: '__unbound__',
+      name: '（未绑定 CV）',
+      roles: unbound.map((c) => c.name).join('、'),
+      lines,
+      chars,
+      estimatedDurationMs,
+      recordedCount: 0,
+    })
+  }
+  return rows
+})
+
+// ── CV 表：给某个 CV 勾选角色（多选）────────────────────────────────────────
+const assignActor = ref<{ actorId: Id; name: string } | null>(null)
+const assignRoleIds = ref<Id[]>([])
+const assignBusy = ref(false)
+
+/** 该 CV 当前绑定的角色 id */
+function actorCharacterIds(actorId: Id): Id[] {
+  return characters.bindings.filter((b) => b.actorId === actorId).map((b) => b.characterId)
+}
+
+function openAssign(actorId: Id, name: string): void {
+  assignActor.value = { actorId, name }
+  assignRoleIds.value = actorCharacterIds(actorId)
+}
+
+/** 保存：勾选的绑定、取消勾选的解绑（主/备由角色面板那一侧单独设） */
+async function submitAssign(): Promise<void> {
+  const target = assignActor.value
+  if (!target || assignBusy.value) return
+  assignBusy.value = true
+  try {
+    const before = new Set(actorCharacterIds(target.actorId))
+    const after = new Set(assignRoleIds.value)
+    for (const characterId of before) {
+      if (!after.has(characterId)) await characters.unbindActor(characterId, target.actorId)
+    }
+    for (const characterId of after) {
+      if (!before.has(characterId)) await characters.bindActor(characterId, target.actorId, false)
+    }
+    await characters.loadWorkload()
+    assignActor.value = null
+  } finally {
+    assignBusy.value = false
+  }
+}
+
 
 // ---------------------------------------------------------------------------
 // 列表长度控制（真机反馈：角色一多，整个角色栏被撑得很长）
@@ -410,6 +531,8 @@ function summaryOf(character: Character): string {
 
 onMounted(async () => {
   await characters.loadAllStats()
+  // CV 表默认展开：它的负载数字不能等用户点开才算（那会先看到一排 0）
+  await characters.loadWorkload()
 })
 </script>
 
@@ -458,6 +581,40 @@ onMounted(async () => {
 
     <!-- 主体：面板内部滚动（角色再多也不会把侧栏撑长） -->
     <div class="ns-chars__body">
+    <!-- CV 表（配音员分工）：数据来源是角色备注里的 `CV：xxx`，由 voiceActor:syncFromCanvas 补齐 -->
+    <section class="ns-chars__workload">
+      <div class="ns-chars__workload-head">
+        <el-button size="small" text @click="toggleWorkload">
+          {{ showWorkload ? '收起' : '展开' }}CV 表（配音员分工）
+        </el-button>
+        <el-button size="small" text :loading="syncing" :disabled="readonly" @click="syncFromCanvas">
+          从画本同步 CV
+        </el-button>
+      </div>
+      <p v-if="syncNote" class="ns-chars__muted">{{ syncNote }}</p>
+      <ul v-if="showWorkload && cvRows.length" class="ns-chars__workload-list">
+        <li v-for="item in cvRows" :key="item.key">
+          <span class="ns-chars__name">{{ item.name }}</span>
+          <span class="ns-chars__muted">
+            {{ formatInt(item.lines) }} 行 · {{ formatCount(item.chars) }} 字 ·
+            预估 {{ formatDuration(item.estimatedDurationMs) }} · 已录 {{ formatInt(item.recordedCount) }} 行
+          </span>
+          <div class="ns-chars__muted">角色：{{ item.roles || '—' }}</div>
+          <el-button
+            v-if="item.key !== '__unbound__'"
+            size="small"
+            text
+            type="primary"
+            @click="openAssign(item.key, item.name)"
+          >
+            选择角色…
+          </el-button>
+        </li>
+      </ul>
+      <p v-else-if="showWorkload" class="ns-chars__muted">
+        还没有配音员。画本里的 CV 记在角色备注里（<code>CV：名字</code>），点上面的「从画本同步 CV」按备注补齐。
+      </p>
+    </section>
     <!-- 原型向量重建任务进度 -->
     <TaskProgressCard
       v-if="characters.centroidTaskId"
@@ -603,22 +760,33 @@ onMounted(async () => {
       :bordered="false"
     />
 
-    <!-- 分工负载 -->
-    <section class="ns-chars__workload">
-      <el-button size="small" text @click="toggleWorkload">
-        {{ showWorkload ? '收起' : '展开' }}配音员分工负载
-      </el-button>
-      <ul v-if="showWorkload && characters.workload.length" class="ns-chars__workload-list">
-        <li v-for="item in characters.workload" :key="item.actorId">
-          <span class="ns-chars__name">{{ item.name }}</span>
-          <span class="ns-chars__muted">
-            {{ formatInt(item.lines) }} 行 · {{ formatCount(item.chars) }} 字 ·
-            预估 {{ formatDuration(item.estimatedDurationMs) }} · 已录 {{ formatInt(item.recordedCount) }} 行
-          </span>
-        </li>
-      </ul>
-      <p v-else-if="showWorkload" class="ns-chars__muted">还没有配音员，或尚未绑定任何角色。</p>
-    </section>
+
+    <!-- CV 表：给这个 CV 勾选角色（可多选） -->
+    <el-dialog
+      :model-value="assignActor !== null"
+      :title="`给「${assignActor?.name ?? ''}」选择角色`"
+      width="520px"
+      @update:model-value="(v) => { if (!v) assignActor = null }"
+    >
+      <el-select
+        v-model="assignRoleIds"
+        multiple
+        filterable
+        placeholder="选择角色（可多选）"
+        style="width: 100%"
+      >
+        <el-option v-for="c in characters.activeCharacters" :key="c.id" :label="c.name" :value="c.id" />
+      </el-select>
+      <p class="ns-chars__muted">
+        勾选 = 这个 CV 负责这些角色；取消勾选 = 解绑。主/备配音员在角色表那一侧设置。
+        <br>
+        「旁白」也在列表里：勾上它 = 这个 CV 读整本书的旁白（旁白行的说话人列会显示成他）。
+      </p>
+      <template #footer>
+        <el-button @click="assignActor = null">取消</el-button>
+        <el-button type="primary" :loading="assignBusy" @click="submitAssign">保存</el-button>
+      </template>
+    </el-dialog>
     </div>
 
     <!-- 编辑对话框 -->
@@ -919,8 +1087,15 @@ onMounted(async () => {
   font-size: 11px;
 }
 .ns-chars__workload {
-  padding-top: 6px;
-  border-top: 1px dashed var(--ns-border-light, #e4e7ed);
+  /* 已经在列表**上方**（曾经在下面：103 个角色的书里永远在屏幕外） */
+  padding-bottom: 6px;
+  border-bottom: 1px dashed var(--ns-border-light, #e4e7ed);
+}
+.ns-chars__workload-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
 }
 .ns-chars__workload-list {
   margin: 6px 0 0;
@@ -932,6 +1107,7 @@ onMounted(async () => {
 }
 .ns-chars__workload-list li {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   align-items: baseline;
   font-size: 12px;

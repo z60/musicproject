@@ -3,11 +3,14 @@
  * ============================================================================
  * 设计依据：docs/06 §4 「本地 Embedding（L2）」全节
  *
- * ⚠⚠ 本文件**不实现推理**，也**不假装实现推理**。
+ * 本文件**不伪造向量**：没有真实运行时（session / 分词器 / 张量工厂）时明确拒绝加载，
+ * 绝不返回随机/常量向量去骗上层（docs/06 §8：模型缺失就退化为规则判定，并且 UI 要提示）。
  *
- * `onnxruntime-node` 是原生模块，在「无网络、无 node_modules」的受限环境里不可用；
- * 任何在这里返回伪造向量的写法都属于自欺，会让上层误以为向量判定可用
- * （docs/06 §8 明确要求「embedding 模型缺失时退化为规则判定，并且 UI 要提示」）。
+ * 有了注入的运行时之后，`createOnnxEmbeddingProvider` 会**真的跑推理**：
+ *   tokenize（batch×seq）→ int64 张量 → session.run → CLS/mean 池化 → L2 归一化，
+ * 并按 16→8→4→1 做 OOM 降级、每批 `yieldToLoop()`（docs/06 §4.2 的踩坑清单）。
+ * 原生模块（onnxruntime-node / @xenova/transformers）只在主进程的加载器里动态 import，
+ * 因此本文件仍是纯逻辑、可在无 node_modules 的测试环境里跑。
  *
  * 因此本文件交付的是：
  *   1. 真实实现所需的最小注入接口（`OnnxSessionLike` / `OnnxTensorFactoryLike` / `TokenizerLike`）
@@ -311,7 +314,7 @@ export async function runBatchesWithOomDowngrade<_T>(
 }
 
 // ============================================================================
-// Provider 工厂（**明确不实现**）
+// Provider 工厂（注入运行时后真实推理）
 // ============================================================================
 
 /** 说明为什么这里没有实现推理（会出现在 NOT_IMPLEMENTED 错误的 details 里） */
@@ -330,12 +333,12 @@ export const ONNX_IMPLEMENTATION_NOTES = [
 /**
  * 创建真实的 ONNX embedding Provider。
  *
- * **当前环境不提供推理**：调用会抛 `NOT_IMPLEMENTED`，并在 details 里给出完整实现要点。
- * 需要端到端跑测试时请用 `createDeterministicEmbeddingProvider()`
- * （并牢记它没有语义能力）。
+ * 缺 `session` / `tokenizer` / `tensors` 任一 → 抛 `NOT_IMPLEMENTED`（`onnx-runtime-unavailable`）：
+ * 装配层据此降级为规则判定。三者齐全时**真的推理**，输出保证 L2 归一化。
+ * 单测用假的 session/tokenizer 即可验证池化与归一化，不需要原生模块。
  */
 export function createOnnxEmbeddingProvider(config: OnnxEmbeddingConfig): EmbeddingProvider {
-  // 先做「能做的校验」，这样在真的接上依赖时前端错误会来得更早更清楚
+  // 缺注入 → 明确说「运行时不完整」，让装配层去装 onnxruntime-node / 分词器
   if (!config.session || !config.tokenizer || !config.tensors) {
     throw new AppError('NOT_IMPLEMENTED', {
       params: { feature: '本地 ONNX 向量模型（需要 onnxruntime-node 与分词器）' },
@@ -348,11 +351,103 @@ export function createOnnxEmbeddingProvider(config: OnnxEmbeddingConfig): Embedd
     })
   }
 
-  // 有 session 也没有用：这里没有真正的推理，绝不用假数据顶替
-  throw new AppError('NOT_IMPLEMENTED', {
-    params: { feature: 'ONNX 推理（本环境未实现，禁止伪造向量）' },
-    details: { reason: 'inference-not-implemented', modelId: config.modelId, notes: ONNX_IMPLEMENTATION_NOTES },
-  })
+  const session = config.session
+  const tokenizer = config.tokenizer
+  const tensors = config.tensors
+  const inputNames = resolveInputNames(session)
+  const maxLength = config.maxLength ?? 512
+  const dim = config.dim
+  const pooling = config.pooling
+  const startBatchSize = Math.max(1, config.batchSize ?? 16)
+
+  /** 输出张量名：`last_hidden_state` 优先；没有就读第一个输出（不同导出命名不一） */
+  function pickOutputName(): string {
+    if (session.outputNames.includes('last_hidden_state')) return 'last_hidden_state'
+    if (session.outputNames.includes('sentence_embedding')) return 'sentence_embedding'
+    return session.outputNames[0] ?? ''
+  }
+
+  function throwIfAborted(signal?: AbortSignal): void {
+    if (!signal?.aborted) return
+    const err = new Error('向量化已取消')
+    err.name = 'AbortError'
+    throw err
+  }
+
+  /** 一批文本 → 一批已 L2 归一化的向量（真实推理；第 4.2 节的坑都在这里落实） */
+  async function embedBatch(texts: string[]): Promise<Float32Array[]> {
+    const encoded = await tokenizer.encode(texts, { padding: true, truncation: true, maxLength })
+    const feeds = buildFeeds(encoded, inputNames, tensors)
+    const outputs = await session.run(feeds)
+    const name = pickOutputName()
+    const tensor = name ? outputs[name] : undefined
+    if (!tensor || !(tensor.data instanceof Float32Array)) {
+      throw new AppError('MODEL_LOAD_FAILED', {
+        params: { model: config.modelId },
+        details: { reason: 'output-missing', outputName: name, available: [...session.outputNames] },
+      })
+    }
+    const [batch, seq] = encoded.dims
+    const data = tensor.data
+    const vectors: Float32Array[] = []
+    for (let b = 0; b < batch; b++) {
+      const vector = pooling === 'cls'
+        // last_hidden_state 是 [batch, seq, dim]，CLS 在每条的 seq=0 → 展平偏移 b*seq*dim
+        ? poolCls(data, dim, b * seq)
+        // mean 池化要先切出本条，否则 poolMean 的 tokenCount 会把整批算成一条
+        : poolMean(
+            data.subarray(b * seq * dim, (b + 1) * seq * dim),
+            dim,
+            Array.from(encoded.attentionMask).slice(b * seq, (b + 1) * seq),
+            0,
+          )
+      vectors.push(l2NormalizeInPlace(vector))
+    }
+    return vectors
+  }
+
+  let warmed = false
+  async function warmup(): Promise<void> {
+    if (warmed) return
+    warmed = true
+    if (config.warmup === false) return
+    // 首次加载 1~3 s；预热失败不致命（真正调用时再报真实错误）
+    try { await embedBatch(['预热']) } catch { /* 见上 */ }
+  }
+
+  return {
+    modelId: config.modelId,
+    dim,
+    async embed(texts: string[], signal?: AbortSignal): Promise<Float32Array[]> {
+      if (texts.length === 0) return []
+      await warmup()
+      return runBatchesWithOomDowngrade(
+        texts,
+        async (batch) => { throwIfAborted(signal); return await embedBatch(batch) },
+        {
+          batchSize: startBatchSize,
+          ...(signal ? { signal } : {}),
+          ...(config.yieldToLoop ? { yieldToLoop: config.yieldToLoop } : {}),
+          ...(config.onProgress ? { onProgress: config.onProgress } : {}),
+        },
+      )
+    },
+    async healthCheck(): Promise<{ ok: boolean; message: string }> {
+      try {
+        const vectors = await embedBatch(['健康检查'])
+        const first = vectors[0]
+        const ok = vectors.length === 1 && first !== undefined && first.length === dim && isL2Normalized(first)
+        return {
+          ok,
+          message: ok
+            ? `ONNX 会话正常（${config.modelId}, dim=${dim}, pooling=${pooling}）`
+            : `输出不合法：条数=${vectors.length}, 维度=${first?.length ?? 0}（期望 ${dim}）或未 L2 归一化`,
+        }
+      } catch (e) {
+        return { ok: false, message: e instanceof Error ? e.message : String(e) }
+      }
+    },
+  }
 }
 
 /**

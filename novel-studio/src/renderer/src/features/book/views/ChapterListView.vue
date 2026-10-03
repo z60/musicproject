@@ -314,6 +314,15 @@ async function retryCanvas(chapterId: string): Promise<void> {
   await chapters.generateCanvas([chapterId], chapters.defaultGenerateOptions())
 }
 
+/**
+ * 批量生成的重试：直接重试**同一条队列任务**（载荷里已经带了完整的 chapterIds）。
+ * 不要重新提交一条新的 —— 那会在任务中心留下两条记录。
+ */
+function retryBatchCanvas(): void {
+  const taskId = chapters.batchCanvasTaskId
+  if (taskId) void tasks.retry(taskId)
+}
+
 // ── 配音员分工（voiceActor:workload）──────────────────────────────────────
 
 const workloadOpen = ref(false)
@@ -450,7 +459,24 @@ const bookTitle = computed(() => session.book?.title ?? '未选择书籍')
         {{ formatInt(chapters.rows.length) }} 章。过滤状态下不提供拖拽排序（顺序含义不明确），请先清空搜索。
       </p>
 
-      <!-- 画本任务进度（每个任务一张统一进度卡，docs/04 §2.4） -->
+      <!-- 批量生成画本：**一条任务**一张卡（不再逐章堆 N 张卡、也不再一直显示 0%） -->
+      <div v-if="chapters.batchCanvasTaskId" class="cl__tasks">
+        <TaskProgressCard
+          :task-id="chapters.batchCanvasTaskId"
+          title="批量生成画本"
+          kind="canvas.generate.batch"
+          cancelable
+          retryable
+          closable
+          openable
+          @cancel="tasks.cancel"
+          @retry="retryBatchCanvas()"
+          @close="chapters.clearBatchCanvasTask()"
+          @open="router.push({ path: '/tasks' })"
+        />
+      </div>
+
+      <!-- 单章生成画本：每个任务一张统一进度卡（docs/04 §2.4） -->
       <div v-if="canvasTaskEntries.length" class="cl__tasks">
         <TaskProgressCard
           v-for="task in canvasTaskEntries"

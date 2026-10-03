@@ -63,7 +63,38 @@ export const useTasksStore = defineStore('app/tasks', () => {
     progress.value = { ...progress.value, [state.taskId]: state }
 
     const index = records.value.findIndex(r => r.id === state.taskId)
-    if (index < 0) return
+    if (index < 0) {
+      /**
+       * **列表刷新之后才入队的任务，必须在这里补进列表**。
+       *
+       * 真机现象（docs/91 §5.2.62）：`records` 只在挂载/手动刷新时从 `task:list` 拉一次，
+       * 于是「点导入 → 右下角任务栏里根本没有这个任务」——
+       * 用户以为没提交，实际上任务在跑。事件里带着 kind，够拼一条最小记录了；
+       * 下一次 `refresh()` 会用主进程的权威记录覆盖它。
+       */
+      records.value = [
+        ...records.value,
+        {
+          id: state.taskId,
+          kind: (state.kind || 'cache.clean') as TaskRecord['kind'],
+          status: state.status,
+          priority: 0,
+          projectId: null,
+          progress: state.progress,
+          stage: state.stage || null,
+          result: (state.result ?? null) as TaskRecord['result'],
+          error: null,
+          attempts: 1,
+          maxAttempts: 1,
+          concurrencyKey: null,
+          dedupeKey: null,
+          createdAt: state.startedAt,
+          startedAt: state.startedAt,
+          finishedAt: state.finished ? Date.now() : null,
+        },
+      ]
+      return
+    }
     const record = records.value[index]!
     records.value[index] = {
       ...record,

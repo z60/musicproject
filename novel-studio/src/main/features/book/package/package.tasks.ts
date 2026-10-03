@@ -45,6 +45,7 @@ import { copyFile, mkdir, open, readFile, readdir, rename, rm, writeFile } from 
 import { dirname, isAbsolute, join, resolve, sep } from 'node:path'
 
 import { AppError } from '../../../../shared/errors.ts'
+import { isNarrationRoleName } from '../../../../shared/canvas/narration-role.ts'
 import type {
   CanvasLine,
   Character,
@@ -1119,11 +1120,26 @@ export function createPackageTasks(deps: PackageTaskDeps): PackageTasks {
     return ids.map((id) => byId.get(id)!)
   }
 
-  function loadLines(db: DbLike, bookId: Id, characterIds: readonly Id[], chapterIds: readonly Id[]): LineSqlRow[] {
+  /**
+   * 该配音员作用域内的画本行。
+   *
+   * `includeNarration`：作用域里含「旁白」角色时为 true —— 旁白行的 `character_id` 恒为 null，
+   * 只按 `character_id IN (…)` 取的话，「负责旁白的 CV」导出的包会是**空的**
+   * （他会看到「导出成功」却没有一行要录）。
+   */
+  function loadLines(
+    db: DbLike,
+    bookId: Id,
+    characterIds: readonly Id[],
+    chapterIds: readonly Id[],
+    includeNarration = false,
+  ): LineSqlRow[] {
     const params: unknown[] = [bookId]
     let sql = `${SELECT_LINE_SQL} WHERE l.book_id = ? AND l.deleted_at IS NULL AND c.deleted_at IS NULL`
     if (characterIds.length > 0) {
-      sql += ` AND l.character_id IN (${placeholders(characterIds.length)})`
+      const scope = [`l.character_id IN (${placeholders(characterIds.length)})`]
+      if (includeNarration) scope.push(`l.speaker_type = 'narration'`)
+      sql += ` AND (${scope.join(' OR ')})`
       params.push(...characterIds)
     } else {
       sql += ` AND 1 = 0`
@@ -1278,7 +1294,14 @@ export function createPackageTasks(deps: PackageTaskDeps): PackageTasks {
     // 「允许看到其它角色的词」= 该书的全部行（含旁白）；默认只给自己的角色
     const scopeLines = allowOtherCharacterLines
       ? loadAllBookLines(db, book.id, chapterIds)
-      : loadLines(db, book.id, scopeCharacterIds, chapterIds)
+      : loadLines(
+          db,
+          book.id,
+          scopeCharacterIds,
+          chapterIds,
+          // 作用域里有「旁白」角色 → 把旁白行一并下发（旁白行没有 character_id）
+          scopeCharacters.some((c) => isNarrationRoleName(c.name)),
+        )
     if (scopeLines.length === 0) {
       throw new AppError('NOT_FOUND', {
         details: {

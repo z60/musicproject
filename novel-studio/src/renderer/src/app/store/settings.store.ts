@@ -87,8 +87,17 @@ export const useSettingsStore = defineStore('app/settings', () => {
     await load(true)
   }
 
+  /**
+   * 重新探测能力（设置页的「重新探测」按钮）。
+   *
+   * ★ 必须走 `app:refreshCapabilities`，**不是** `app:getCapabilities`：
+   *   后者只是读主进程里的启动期快照，点了等于什么都没发生
+   *   （docs/91 §5.2.51 ④ 第三条记的就是这个）。前者会真的重新跑
+   *   `ffmpeg -version / -filters / -encoders` 并重读模型目录，
+   *   完成后主进程广播 `app:capabilitiesChanged`（下面 init() 里已订阅）。
+   */
   async function refreshCapabilities(): Promise<void> {
-    const caps = await callSafe('app:getCapabilities', undefined)
+    const caps = await callSafe('app:refreshCapabilities', undefined)
     if (caps) capabilities.value = caps
   }
 

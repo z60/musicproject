@@ -277,12 +277,17 @@ export function findSlices(frames: VadFrame[], speech: boolean[], opts: VadOptio
 
   // 1) 原始段 + 2) 桥接
   const raw = groupRuns(speech)
+  /**
+   * 桥接阈值可调（`VadOptions.bridgeGapMs`）：导入既成音频时调小它，
+   * 句间的短停顿才会成为切片边界（否则只能按字符比例硬切，音与文本错位）。
+   */
+  const bridgeGapMs = opts.bridgeGapMs ?? VAD_BRIDGE_GAP_MS
   const bridged: FrameRun[] = []
   for (const run of raw) {
     const prev = bridged[bridged.length - 1]
     if (prev) {
       const gapMs = (run.startFrame - (prev.endFrame + 1)) * frameMs
-      if (gapMs < VAD_BRIDGE_GAP_MS) {
+      if (gapMs < bridgeGapMs) {
         prev.endFrame = run.endFrame
         continue
       }

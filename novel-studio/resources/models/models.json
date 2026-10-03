@@ -50,10 +50,11 @@
     {
       "id": "ffmpeg",
       "label": "ffmpeg",
-      "file": "bin/{platform}/{arch}/ffmpeg{ext}",
+      "file": "bin/ffmpeg{ext}",
       "sha256": null,
       "license": "TODO：优先选择 LGPL 构建，避免 GPL 传染（docs/21 §16）",
       "source": "TODO",
+      "note": "扁平路径，没有 {platform}/{arch} 分层 —— 运行时只按 resources/bin/ffmpeg(.exe) 探测（src/main/paths.ts 的 ffmpegCandidates）。ffprobe 不在这里登记：它由 ffmpeg 路径同目录派生（同文件 ffprobePathFor）。注意本文件目前只有 models 段被启动期读取（bootstrap-steps.ts 的 verifyModels），binaries 段尚无任何消费者，登记值仅供人与发布前核对。",
       "requiredFilters": [
         "loudnorm",
         "afftdn",

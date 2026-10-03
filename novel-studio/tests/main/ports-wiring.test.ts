@@ -48,8 +48,10 @@ import { loadMigrations } from '../../src/main/infra/db/migrations/index.ts'
 import { migrate } from '../../src/main/infra/db/migrate.ts'
 import type { DbLike } from '../../src/main/infra/db/types.ts'
 import type { IpcMainLike, IpcMainInvokeEventLike, SafeStorageLike } from '../../src/main/infra/electron/types.ts'
+import type { TaskQueue } from '../../src/main/infra/queue/queue.ts'
+import type { TaskContext, TaskKind } from '../../src/main/infra/queue/types.ts'
 import type { Logger } from '../../src/main/infra/log/index.ts'
-import type { HandlerDeps } from '../../src/main/ipc/handlers/deps.ts'
+import type { EventPort, HandlerDeps } from '../../src/main/ipc/handlers/deps.ts'
 import type { HttpClient, HttpRequest } from '../../src/shared/ai/types.ts'
 
 // ---------------------------------------------------------------------------
@@ -66,6 +68,10 @@ interface Wired {
   invoke: (channel: string, payload?: unknown) => Promise<IpcResult<unknown>>
   registered: string[]
   impl: ReturnType<typeof registerAllHandlers>
+  /** 真实任务队列（验收「任务事件是否真的推到渲染进程」要用它） */
+  queue: TaskQueue
+  /** 事件出口收到的全部事件（假发射器收集，见下面 `events`） */
+  emitted: Array<{ event: string; payload: unknown }>
   cleanup: () => void
 }
 
@@ -142,7 +148,19 @@ async function wire(options: WireOptions = {}): Promise<Wired> {
     },
   })
 
+  /**
+   * 事件出口：装配层**必须**注入（真机事故 docs/91 §5.2.62：不注入时任务进度永远 0%）。
+   * 这里收进数组，顺便让「任务进度有没有真的推出来」可断言。
+   */
+  const emitted: Array<{ event: string; payload: unknown }> = []
+  const events: EventPort = {
+    emit: (event, payload) => {
+      emitted.push({ event: String(event), payload })
+    },
+  }
+
   const built = buildHandlerDeps({
+    events,
     state,
     version: '0.0.0-test',
     portable: false,
@@ -187,6 +205,8 @@ async function wire(options: WireOptions = {}): Promise<Wired> {
   return {
     state,
     deps: built.deps,
+    queue: built.queue,
+    emitted,
     registered: [...listeners.keys()],
     impl,
     invoke: async (channel, payload) => {
@@ -245,6 +265,22 @@ describe('装配层接线 · 自检与通道集合', () => {
       const uncovered = IPC_CHANNELS.filter((c) => !union.has(c))
       assert.deepEqual(uncovered, [])
       assert.equal(union.size, IPC_CHANNELS.length)
+
+      /**
+       * **占位总数必须是 0**。
+       *
+       * 为什么单独钉一条：这一条是「163 个通道都有真实业务实现」这个说法的
+       * 唯一客观依据。少了它，文档里那句「契约里已无占位通道」就只能靠
+       * 启动日志里的一行 `placeholders: 0` 来支撑 —— 而那行日志只在真机出现，
+       * 跑测试时看不到。
+       * 真退化了（某域被整块换成占位）这条立刻红，而且**互相不相交 + 并集完整**
+       * 那两条断言照样是绿的（占位同样会被注册），所以它不能被那两条替代。
+       */
+      assert.equal(
+        placeholders.size,
+        0,
+        `有 ${placeholders.size} 个通道退化成占位（抛 NOT_IMPLEMENTED）：${[...placeholders].join(', ')}`,
+      )
     } finally {
       w.cleanup()
     }
@@ -292,6 +328,41 @@ describe('装配层接线 · 自检与通道集合', () => {
       // 项目包导出（.nsp）也是任务：规格没注册的话「导出项目包」只会返回 NOT_IMPLEMENTED
       const pkg = await queue.enqueue('package.export', { op: 'project', projectId: 'p1', options: {} }, {})
       assert.ok(pkg.taskId, 'package.export 的规格没注册 → 导出项目包点了没反应')
+    } finally {
+      w.cleanup()
+    }
+  })
+
+  /**
+   * 真机事故 docs/91 §5.2.62：事件发射器写好了却**从没被构造**，
+   * `TaskQueue` 也拿不到事件出口 ⇒ `ctx.report()` / `task:finished` 全丢，
+   * 于是「任务栏的进度条无法实时变化」（永远 0%、永远不结束）。
+   *
+   * 这条用**真队列 + 一个最小任务**验收：进度与终态必须真的推出来。
+   */
+  it('任务进度与终态真的推给了渲染进程（事件出口已接上）', async () => {
+    const w = await wire()
+    try {
+      const queue = w.queue
+      // 用一个契约里存在、ports 没注册过的 kind，避免与真实规格撞车
+      queue.registerSpec({
+        kind: 'cache.clean' as TaskKind,
+        run: (ctx: TaskContext) => {
+          ctx.report(0.5, '一半')
+          return { ok: true }
+        },
+      })
+      const res = await queue.enqueue('cache.clean', {}, {})
+      await queue.whenIdle()
+
+      const progress = w.emitted.filter((e) => e.event === 'task:progress')
+      const finished = w.emitted.filter((e) => e.event === 'task:finished')
+      assert.ok(progress.length > 0, '没有 task:progress → 进度条永远不会动')
+      assert.ok(
+        progress.some((e) => (e.payload as { taskId?: string }).taskId === res.taskId),
+        '进度事件必须带上任务 id（否则界面认不出是哪个任务）',
+      )
+      assert.ok(finished.length > 0, '没有 task:finished → 任务卡永远显示「进行中」')
     } finally {
       w.cleanup()
     }

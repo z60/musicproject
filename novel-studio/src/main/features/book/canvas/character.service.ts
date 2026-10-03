@@ -1,11 +1,11 @@
 /**
- * Novel Studio · 角色与配音员服务（`character:*` / `voiceActor:*`，共 14 个通道）
+ * Novel Studio · 角色与配音员服务（`character:*` / `voiceActor:*`，共 15 个通道）
  * ============================================================================
  * 设计依据：
  *   · docs/11 §4.6  角色表：禁止物理删除（只归档）、合并（含别名冲突）、出场统计、原型重建
  *   · docs/11 §6.1  配音员：主 / 备绑定、分工视图（行数/字数/预估时长）
  *   · docs/06 §8    「角色表为空时先跑抽取生成候选，提示用户确认后再判定」
- *   · docs/20 §4.4  14 个通道的请求/响应契约
+ *   · docs/20 §4.4  15 个通道的请求/响应契约
  *
  * ### 这一层做什么、不做什么
  *   **纯逻辑全在 `src/shared/canvas/character.ts` 里**（抽取、别名冲突、合并、统计），
@@ -48,6 +48,13 @@ import {
   UPSTREAM_MIN_OCCURRENCES,
   type CharacterObservation,
 } from '../../../../shared/canvas/character-profile.ts'
+import { isPlaceholderCvName, normalizeCvName, parseCvFromNote } from '../../../../shared/canvas/character-display.ts'
+import {
+  isNarrationRoleName,
+  NARRATION_ROLE_NAME,
+  NARRATION_ROLE_NOTE,
+  NARRATION_ROLE_SORT_ORDER,
+} from '../../../../shared/canvas/narration-role.ts'
 import { dropUndefined } from '../../../../shared/util/drop-undefined.ts'
 import type { TaskQueue } from '../../../infra/queue/queue.ts'
 import type { Logger } from '../../../infra/log/index.ts'
@@ -84,6 +91,12 @@ export interface CharacterServiceDeps {
    * 恰恰是最该被分配的人 —— 只显示有绑定的人会把这张表变成残表。
    */
   listProjectActors: (bookId: Id) => Promise<VoiceActor[]>
+  /**
+   * 某本书所属的项目 id（`voiceActor:syncFromCanvas` 建配音员要用它 ——
+   * `voice_actors.project_id` 非空，而画本备注只告诉我们书名/书 id）。
+   * 取不到（书被删）时同步会安全地返回 0 而不是抛错。
+   */
+  projectIdOfBook?: (bookId: Id) => Promise<Id | null>
   /** 任务队列（`character:rebuildCentroid` 要入队；不传则抛 TASK_QUEUE_UNAVAILABLE） */
   queue?: TaskQueue
   newId?: (prefix: string) => Id
@@ -140,7 +153,33 @@ export interface CharacterService {
   unbind(characterId: Id, actorId: Id): Promise<{ ok: boolean }>
   listBindings(bookId: Id): Promise<CharacterBinding[]>
   workload(bookId: Id): Promise<ActorWorkload[]>
+  /**
+   * 从角色备注的 `CV：xxx` 反向补齐配音员与绑定（`voiceActor:syncFromCanvas`）。
+   *
+   * `force` 省略 = **自动模式**：只在这个项目从未自动同步过时执行。
+   * 为什么要有自动模式：面板每次加载都强行重绑的话，用户刚在 CV 表里
+   * 取消勾选（解绑）的绑定会在下一次刷新时自己长回来。
+   */
+  syncActorsFromNotes(bookId: Id, opts?: { force?: boolean }): Promise<SyncActorsResult>
 }
+
+export interface SyncActorsResult {
+  /** 新建的配音员数 */
+  createdActors: number
+  /** 新建的（角色, 配音员）绑定数 */
+  boundCharacters: number
+  /** 备注里带 CV 的角色数（= 期望被绑定的角色数） */
+  matchedCharacters: number
+  /** 自动模式下判定「本项目已同步过」而整体跳过的标记 */
+  skipped: boolean
+}
+
+/**
+ * 自动建出来的配音员会带上这条备注 —— 它同时充当「本项目已自动同步过」的标记。
+ * 用备注当标记而不是新加一张表：配音员本来就是用户可见的实体，
+ * 写上来源比留空更有用（用户会问「这个名字哪来的」）。
+ */
+export const CANVAS_SYNC_ACTOR_NOTE = '由画本 CV 备注自动建立'
 
 /**
  * `character:extract` 一次最多读入的正文字数。
@@ -169,6 +208,39 @@ export function createCharacterService(deps: CharacterServiceDeps): CharacterSer
     const c = await deps.repo().characters.get(characterId)
     if (!c) throw new AppError('NOT_FOUND', { details: { entity: 'character', characterId } })
     return c
+  }
+
+  /**
+   * 确保这本书有「旁白」角色（幂等）。
+   *
+   * 为什么要它在角色表里：把旁白指派给某个 CV（「旁白由语心草读」）需要一条绑定，
+   * 而 `character_voice_bindings.character_id` 是指向 `characters(id)` 的外键 ——
+   * 没有这个角色行，用户就永远无法给 CV 分配旁白（真机反馈）。
+   *
+   * 名字已经存在（用户自己建的、或画本表里本来就有）就复用它，绝不新建第二个。
+   */
+  async function ensureNarrationCharacter(bookId: Id): Promise<Character> {
+    const repo = deps.repo().characters
+    const list = await repo.listByBook(bookId, { includeArchived: true })
+    const existing = list.find((c) => isNarrationRoleName(c.name))
+    if (existing) return existing
+    const saved = await repo.upsert({
+      ...createCharacter({
+        id: newId('ch'),
+        bookId,
+        name: NARRATION_ROLE_NAME,
+        sortOrder: NARRATION_ROLE_SORT_ORDER,
+        now: now(),
+      }),
+      note: NARRATION_ROLE_NOTE,
+    })
+    log?.info?.('character.narrationRole.created', {
+      event: 'character.narrationRole.created',
+      bookId,
+      characterId: saved.id,
+      note: '旁白在角色表里有一行，才能把旁白指派给某个 CV（绑定表有外键到 characters）',
+    })
+    return saved
   }
 
   return {
@@ -441,8 +513,16 @@ export function createCharacterService(deps: CharacterServiceDeps): CharacterSer
     },
 
     async stats(characterId) {
-      await requireCharacter(characterId)
-      const lines = await deps.repo().canvas.listByCharacter(characterId)
+      const character = await requireCharacter(characterId)
+      // 旁白角色的行不在 `character_id` 上（旁白行的 character_id 恒为 null，见 narration-role.ts），
+      // 所以要按 `speaker_type='narration'` 取；统计时**临时**把它们算到这个角色名下，
+      // 台词行本身不改归属。
+      const lines = isNarrationRoleName(character.name)
+        ? (await deps.repo().canvas.listNarrationByBook(character.bookId)).map((l) => ({
+            ...l,
+            characterId,
+          }))
+        : await deps.repo().canvas.listByCharacter(characterId)
       // `recordedMs` 传 null：录音域还没落地（takes/voice_segments 没有写入路径），
       // 所以「已录时长」如实为 0，而不是拿估算时长冒充（docs/12 实现后再接上）
       return buildCharacterStats(
@@ -543,6 +623,86 @@ export function createCharacterService(deps: CharacterServiceDeps): CharacterSer
       return actors.listBindings(list.map((c) => c.id))
     },
 
+    async syncActorsFromNotes(bookId, opts) {
+      // 先把「旁白」角色补齐：它必须在场，用户才能在 CV 表/角色表里把旁白指派给某个 CV。
+      // 这一步与「按备注补 CV」无关，也不受下面的自动模式跳过影响。
+      await ensureNarrationCharacter(bookId)
+      const { characters, actors } = deps.repo()
+      // 只处理未归档角色：归档角色是「这本书里已经没有他的名字」的标记，
+      // 给他补配音员只会在 CV 表里凭空多出一个 0 行的分工行
+      const list = await characters.listByBook(bookId)
+      const wanted: Array<{ character: Character; cv: string }> = []
+      for (const c of list) {
+        const cv = parseCvFromNote(c.note)
+        if (!cv || isPlaceholderCvName(cv)) continue
+        wanted.push({ character: c, cv })
+      }
+      const empty: SyncActorsResult = {
+        createdActors: 0,
+        boundCharacters: 0,
+        matchedCharacters: wanted.length,
+        skipped: false,
+      }
+      if (wanted.length === 0) return empty
+
+      const projectId = deps.projectIdOfBook ? await deps.projectIdOfBook(bookId) : null
+      if (!projectId) return { ...empty, skipped: true }
+
+      const actorList = await deps.listProjectActors(bookId)
+      // 自动模式：本项目已经同步过一次就不再动绑定（否则用户的解绑会被撤销）
+      if (opts?.force !== true && actorList.some((a) => a.note === CANVAS_SYNC_ACTOR_NOTE)) {
+        return { ...empty, skipped: true }
+      }
+
+      const actorByName = new Map<string, VoiceActor>()
+      for (const a of actorList) {
+        const key = normalizeCvName(a.name)
+        if (!actorByName.has(key)) actorByName.set(key, a)
+      }
+      const existing = await actors.listBindings(list.map((c) => c.id))
+      const bound = new Set(existing.map((b) => `${b.characterId}::${b.actorId}`))
+      // 已经有主配音员的角色不抢主位：人工指派优先于画本备注
+      const hasPrimary = new Set(existing.filter((b) => b.isPrimary).map((b) => b.characterId))
+
+      let createdActors = 0
+      let boundCharacters = 0
+      for (const { character, cv } of wanted) {
+        const key = normalizeCvName(cv)
+        let actor = actorByName.get(key)
+        if (!actor) {
+          actor = await actors.upsert({
+            id: newId('va'),
+            projectId,
+            name: cv,
+            contact: null,
+            note: CANVAS_SYNC_ACTOR_NOTE,
+            profile: null,
+            createdAt: now(),
+            updatedAt: now(),
+          })
+          actorByName.set(key, actor)
+          createdActors++
+        }
+        if (bound.has(`${character.id}::${actor.id}`)) continue
+        const isPrimary = !hasPrimary.has(character.id)
+        await actors.bind(character.id, actor.id, isPrimary)
+        bound.add(`${character.id}::${actor.id}`)
+        if (isPrimary) hasPrimary.add(character.id)
+        boundCharacters++
+      }
+
+      log?.info?.('voiceActor.syncedFromCanvas', {
+        event: 'voiceActor.syncedFromCanvas',
+        bookId,
+        cvs: actorByName.size,
+        createdActors,
+        boundCharacters,
+        matchedCharacters: wanted.length,
+        forced: opts?.force === true,
+      })
+      return { createdActors, boundCharacters, matchedCharacters: wanted.length, skipped: false }
+    },
+
     async workload(bookId) {
       const { characters, actors, canvas } = deps.repo()
       const list = await characters.listByBook(bookId, { includeArchived: true })
@@ -551,7 +711,11 @@ export function createCharacterService(deps: CharacterServiceDeps): CharacterSer
 
       const lines: Array<{ characterId: Id | null; chars: number; recordedMs: number | null }> = []
       for (const c of list) {
-        for (const line of await canvas.listByCharacter(c.id)) {
+        // 旁白角色按 `speaker_type='narration'` 取行（口径与 character:stats 一致）
+        const rows = isNarrationRoleName(c.name)
+          ? await canvas.listNarrationByBook(bookId)
+          : await canvas.listByCharacter(c.id)
+        for (const line of rows) {
           lines.push({ characterId: c.id, chars: countReadableChars(line.text), recordedMs: null })
         }
       }

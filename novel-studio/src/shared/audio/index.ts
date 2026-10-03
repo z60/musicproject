@@ -10,15 +10,41 @@
 
 export * from './pcm.ts'
 export * from './wav.ts'
+export * from './container.ts'
 export * from './vad.ts'
+export * from './match.ts'
+export * from './allocate.ts'
+export * from './split.ts'
+export * from './text-match.ts'
 export * from './trim.ts'
 export * from './loudness.ts'
 export * from './peaks.ts'
 export * from './process.ts'
 
 // 类型需要显式 type 导出（Node 的 --experimental-strip-types 会擦除类型）
+export type { AudioContainer, AudioProbeResult } from './container.ts'
 export type { VadFrame, VadSliceRange, VadOptionsExt } from './vad.ts'
 export type { TrimRange, TrimOptionsExt } from './trim.ts'
 export type { ParsedLoudness } from './loudness.ts'
 export type { PeaksMeta, SerializedPeaks } from './peaks.ts'
 export type { WavHeaderParseResult, RepairWavHeaderInput, RepairWavHeaderResult } from './wav.ts'
+export type {
+  AsrSegment,
+  MatchableLine,
+  TextMatchCandidate,
+  TextMatchOptions,
+  TextMatchResult,
+} from './text-match.ts'
+export type {
+  AllocatableLine,
+  AllocateOptions,
+  AllocateResult,
+  LineAudioRange,
+  SpeechSlice,
+} from './allocate.ts'
+export type {
+  NoSpeechFallback,
+  SplitPlanInput,
+  SplitPlanResult,
+  SplitPlanStats,
+} from './split.ts'

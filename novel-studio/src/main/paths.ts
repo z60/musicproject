@@ -124,3 +124,28 @@ export function ffmpegCandidates(opts: {
   out.push(exeName) // 交给 PATH 解析
   return out
 }
+
+/**
+ * ffprobe 可执行文件路径 —— 由 **ffmpeg 路径派生**，不单独探测。
+ *
+ * ### 为什么不给 ffprobe 也来一份候选列表
+ *   任何官方/第三方分发里 ffmpeg 与 ffprobe 都是**同目录、同前缀**的一对
+ *   （`bin/ffmpeg.exe` + `bin/ffprobe.exe`）。让用户只填一次路径、两个二进制跟着走，
+ *   既少一个要填的框，也不会出现「ffmpeg 指到 A 目录、ffprobe 指到 B 目录」这种
+ *   只有真跑起来才会发现的错配。
+ *
+ * ### 裸名字 = 交给 PATH
+ *   `'ffmpeg'` / `'ffmpeg.exe'` 这种不带目录分隔符的输入，语义是「PATH 上找」。
+ *   对它做 `dirname` 会得到 `'.'`，拼出 `.\ffprobe.exe` —— 那是「当前工作目录」，
+ *   与 PATH 语义完全不同，所以这里显式退回裸名字。
+ */
+export function ffprobePathFor(
+  ffmpegPath: string | null | undefined,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const exeName = platform === 'win32' ? 'ffprobe.exe' : 'ffprobe'
+  const p = ffmpegPath?.trim()
+  if (!p) return exeName
+  if (!p.includes('/') && !p.includes('\\')) return exeName
+  return join(dirname(p), exeName)
+}

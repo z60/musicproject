@@ -13,7 +13,7 @@
 import { strict as assert } from 'node:assert'
 import { describe, it } from 'node:test'
 
-import { VAD_DEFAULTS, VAD_SPEECH_MARGIN_DB } from '../../src/shared/constants.ts'
+import { VAD_DEFAULTS, VAD_IMPORT_OVERRIDES, VAD_SPEECH_MARGIN_DB } from '../../src/shared/constants.ts'
 import { AppError } from '../../src/shared/errors.ts'
 import {
   estimateNoiseFloorDb,
@@ -247,6 +247,40 @@ describe('VAD 边界精修（findSlices）', () => {
     assert.equal(slices.length, 1, '20 ms 的间隔（< 250 ms）必须合并')
     assert.equal(slices[0]!.startMs, 20)
     assert.equal(slices[0]!.endMs, 720)
+  })
+
+
+
+  /**
+   * 桥接阈值可调（`VadOptions.bridgeGapMs`）——「按说话人导入」的连续朗读必须调小它。
+   *
+   * 真机故障（docs/91 §5.2.59）：句与句之间只有 100~200 ms 的停顿，被默认的 250 ms
+   * 桥接吃掉 ⇒ 只能切出「几行一片」的大片 ⇒ 剩下按字符比例硬切 ⇒ 导进来的音和文本错位。
+   */
+  it('bridgeGapMs 调小后，240 ms 的句间停顿会成为切片边界', () => {
+    const frames = mkFrames(60, -60)
+    for (const [from, to] of [[5, 14] as [number, number], [27, 36] as [number, number]]) {
+      for (let i = from; i <= to; i++) frames[i] = { rmsDb: -10, peakDb: -5, zcr: 0.05 }
+    }
+    const speech = mkSpeech(60, [[5, 14], [27, 36]])
+    const opts = { ...OPTS, frameMs: FRAME_MS, noiseFloorDb: -55, totalMs: 1200 }
+
+    const bridged = findSlices(frames, speech, opts)
+    assert.equal(bridged.length, 1, '默认 250 ms 桥接会把 240 ms 的停顿合并掉（导入场景的问题根源）')
+
+    const kept = findSlices(frames, speech, { ...opts, bridgeGapMs: 80 })
+    assert.equal(kept.length, 2, '调小到 80 ms 后它就是一个真实边界')
+  })
+
+  it('导入覆盖参数（VAD_IMPORT_OVERRIDES）确实比默认更敏感', () => {
+    const frames = mkFrames(60, -60)
+    for (let i = 5; i <= 14; i++) frames[i] = { rmsDb: -10, peakDb: -5, zcr: 0.05 }
+    for (let i = 27; i <= 36; i++) frames[i] = { rmsDb: -10, peakDb: -5, zcr: 0.05 }
+    const speech = mkSpeech(60, [[5, 14], [27, 36]])
+    const opts = { ...OPTS, frameMs: FRAME_MS, noiseFloorDb: -55, totalMs: 1200 }
+    assert.equal(findSlices(frames, speech, { ...opts, ...VAD_IMPORT_OVERRIDES }).length, 2)
+    assert.equal(VAD_IMPORT_OVERRIDES.minSilenceMs, 200)
+    assert.equal(VAD_IMPORT_OVERRIDES.bridgeGapMs, 80)
   })
 
   it('间隔 300 ms（>= 250 ms）保持两段', () => {

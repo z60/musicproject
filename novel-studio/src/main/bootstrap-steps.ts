@@ -18,18 +18,24 @@
  *   这两条不是风格问题：调换后的后果不是报错，而是静默丢数据。
  */
 
-import { promises as fsp, readdirSync } from 'node:fs'
+import { readdirSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { AppError, summarizeCauseChain } from '../shared/errors.ts'
-import type { FfmpegCapabilities, ModelStatus } from '../shared/types.ts'
 import { formatBootReport, type BootContext, type BootStepHandlers } from './bootstrap/index.ts'
+import {
+  loadEmbeddingCapability,
+  probeFfmpeg,
+  probeModels,
+  unavailableFfmpegCapabilities,
+} from './capabilities.ts'
 import { cleanupCaches, cleanupStaleTemps, defaultCleanupTargets, DEFAULT_CACHE_TTL_MS, DEFAULT_TEMP_MAX_AGE_MS } from './bootstrap/cleanup.ts'
 import { recoverRecordings } from './bootstrap/recovery.ts'
-import { createWindowManager, MEDIA_SCHEME } from './bootstrap/window-manager.ts'
+import { createWindowManager, MEDIA_SCHEME, registerMediaProtocol } from './bootstrap/window-manager.ts'
 import { checkIntegrity, openDatabase, runMigrations } from './db.ts'
 import { currentSchemaVersion } from './infra/db/index.ts'
-import { resolveAppPaths, ffmpegCandidates } from './paths.ts'
+import { resolveAppPaths } from './paths.ts'
+import { resolveProjectPath } from './infra/fs/paths.ts'
 import { createSettingsStore } from './settings.ts'
 import { createStoreLogger } from './store-logger.ts'
 import type { AppState } from './app-state.ts'
@@ -333,14 +339,41 @@ export function createBootStepHandlers(deps: BootDeps): BootStepHandlers {
     // ── 9. 校验模型（不阻塞开窗）──────────────────────────────────────────
     'verify-models': async () => {
       const paths = state.requirePaths()
-      const models = await verifyModels(paths.modelDir, paths.resourceDir)
+      // 探测实现在 `capabilities.ts`：与设置页的「重新探测」**共用同一个函数**。
+      // 此前这里是本地 `verifyModels()`，它要求 `models.json` 的 `models` 是数组，
+      // 而文件里是按类型分组的对象 ⇒ 模型清单恒为空（docs/91 §5.2.51 ④）。
+      const probed = await probeModels({
+        resourceDir: paths.resourceDir,
+        modelDir: paths.modelDir,
+        log: state.log(),
+      })
+      const models = probed.models
       const ok = models.filter((m) => m.ok).length
       state.log().info('models.verified', {
         event: 'models.verified',
         total: models.length,
         ok,
         missing: models.filter((m) => !m.exists).map((m) => m.id),
+        manifestOk: probed.manifestOk,
       })
+      // 文件存在 ≠ 能推理：这里真的加载一次（结果有进程内缓存，ports 复用同一份），
+      // 把**真实**可用性写进能力快照。否则会自相矛盾：画本报告说 embeddingUsed=true，
+      // 而设置页的能力标志仍写着「向量不可用」。
+      const embedding = await loadEmbeddingCapability(paths.modelDir)
+      const prev = state.capabilities
+      state.capabilities = {
+        ffmpeg: prev?.ffmpeg ?? unavailableFfmpegCapabilities(),
+        models,
+        secureStorage: canUseSecureStorage(state),
+        embedding: { modelId: embedding.modelId, dim: embedding.dim, available: embedding.available },
+      }
+      if (!embedding.available) {
+        state.log().info('ai.embedding.unavailable', {
+          event: 'ai.embedding.unavailable',
+          modelId: embedding.modelId,
+          reason: embedding.reason,
+        })
+      }
       return { models, modelsOk: ok }
     },
 
@@ -348,26 +381,35 @@ export function createBootStepHandlers(deps: BootDeps): BootStepHandlers {
     'detect-ffmpeg': async () => {
       const paths = state.requirePaths()
       const settings = state.settings?.current()
-      const candidates = ffmpegCandidates({
-        paths,
+      // 候选路径与必需滤镜都由 `capabilities.ts` 决定：清单（`models.json` 的
+      // `binaries[]`）优先、代码兜底，且与设置页「重新探测」走同一条路径。
+      const probed = await probeFfmpeg({
+        resourceDir: paths.resourceDir,
         // `settings?.paths?.ffmpegPath` 里的第二个 `?.` 不是多余的：
         // 启动路径上的设置树可能因库里存过坏值而缺一整支（docs/91 §5.2.3 的
         // `import = null` 就是这么让第 11 步崩掉的）。启动期读取一律取值级兜底，
         // 宁可退回「按候选路径探测」也不能让启动中止。
         settingsFfmpegPath: settings?.paths?.ffmpegPath ?? null,
+        log: state.log(),
       })
-      const ffmpeg = await probeFfmpeg(candidates, state)
+      const ffmpeg = probed.capabilities
       state.log().info('ffmpeg.probed', {
         event: 'ffmpeg.probed',
         available: ffmpeg.available,
         version: ffmpeg.version,
         path: ffmpeg.path,
+        filters: ffmpeg.filters.length,
         missingFilters: ffmpeg.missing.length,
+        // 这三条让「为什么某个控件被隐藏了」可以直接从日志回答
+        candidates: probed.detail.candidates.length,
+        requiredFiltersSource: probed.detail.requiredFiltersSource,
+        requiredFilters: probed.detail.requiredFilters.length,
+        manifestOk: probed.detail.manifestOk,
       })
       // 能力快照在这里成型，随后由 register-ipc-handlers 交给 capabilities 端口
       const prev = state.capabilities
       state.capabilities = {
-        ffmpeg: ffmpeg.available ? ffmpeg : defaultFfmpegCapabilities(),
+        ffmpeg: ffmpeg.available ? ffmpeg : unavailableFfmpegCapabilities(),
         models: prev?.models ?? [],
         secureStorage: canUseSecureStorage(state),
         embedding: prev?.embedding ?? { modelId: 'bge-small-zh-v1.5', dim: 512, available: false },
@@ -387,8 +429,25 @@ export function createBootStepHandlers(deps: BootDeps): BootStepHandlers {
         state.log().warn('protocol.skipped', { event: 'protocol.skipped', reason: 'protocol-unavailable' })
         return { registered: false }
       }
-      // 真正的 handler 注册在 ipc 层（需要 fs 校验），这里只做「协议可用」这一步
-      state.log().info('protocol.registered', { event: 'protocol.registered', scheme: MEDIA_SCHEME })
+      /**
+       * **这里必须真的注册 handler**。
+       *
+       * 真机事故（docs/91 §5.2.56）：这一步以前只写了一条 `protocol.registered` 日志，
+       * 注释说「真正的 handler 注册在 ipc 层」—— 而 ipc 层根本没有这段代码。
+       * 结果 `ns-media://` 没有任何 handler，**所有音频都放不出来**
+       * （`<audio src="ns-media://…">` 直接 ERR_UNKNOWN_URL_SCHEME），
+       * 界面上的表现就是「录音试听没反应 / 导入的音频无法播放」。
+       *
+       * 时机：`protocol.handle` 只能在 ready 之后调用（本步骤就是 ready 之后），
+       * 而 `protocol.registerSchemesAsPrivileged` 在 `src/main/index.ts` 里（ready 之前）。
+       */
+      registerMediaProtocol({
+        electron,
+        projectRoot: paths.projectRoot,
+        // 逃逸校验在 resolveProjectPath 内完成（非项目的绝对路径会抛 PATH_ESCAPE_BLOCKED）
+        resolve: (projectId, relPath) => resolveProjectPath(projectId, relPath, paths.projectRoot),
+        log: { warn: (event, fields) => state.log().warn(event, fields), info: (event, fields) => state.log().info(event, fields) },
+      })
       return { registered: true, scheme: MEDIA_SCHEME, projectRoot: paths.projectRoot }
     },
 
@@ -497,10 +556,6 @@ function listProjectIds(projectRoot: string): string[] {
   }
 }
 
-function defaultFfmpegCapabilities(): FfmpegCapabilities {
-  return { version: '', available: false, path: null, filters: [], missing: [], encoders: [] }
-}
-
 function canUseSecureStorage(state: AppState): boolean {
   try {
     return state.electron?.safeStorage.isEncryptionAvailable() ?? false
@@ -565,120 +620,15 @@ function createDbWindowStateStore(state: AppState): import('./bootstrap/window-m
 }
 
 // ---------------------------------------------------------------------------
-// 模型校验
+// 模型校验 / ffmpeg 探测
 // ---------------------------------------------------------------------------
-
-interface ModelsManifestEntry {
-  id: string
-  kind: 'whisper' | 'embedding'
-  file: string
-  sha256?: string | null
-  sizeBytes?: number | null
-}
-
-/**
- * 校验 `resources/models/models.json` 里登记的模型是否就位。
- *
- * **只报不拦**：模型缺失时应用照常启动（不用模型的功能可用），
- * 只是 embedding/ASR 相关能力探测为 false —— UI 据此隐藏入口，
- * 而不是等用户点了才报错（docs/02 §5.1）。
- */
-async function verifyModels(modelDir: string, resourceDir: string): Promise<ModelStatus[]> {
-  const manifestPath = join(resourceDir, 'models', 'models.json')
-  let entries: ModelsManifestEntry[] = []
-  try {
-    const raw = await fsp.readFile(manifestPath, 'utf8')
-    const parsed: unknown = JSON.parse(raw)
-    if (Array.isArray(parsed)) entries = parsed as ModelsManifestEntry[]
-    else if (parsed && typeof parsed === 'object' && Array.isArray((parsed as { models?: unknown }).models)) {
-      entries = (parsed as { models: ModelsManifestEntry[] }).models
-    }
-  } catch {
-    return []
-  }
-
-  const out: ModelStatus[] = []
-  for (const e of entries) {
-    const filePath = join(modelDir, e.file)
-    let sizeBytes: number | null = null
-    try {
-      const st = await fsp.stat(filePath)
-      sizeBytes = st.size
-    } catch {
-      sizeBytes = null
-    }
-    const exists = sizeBytes !== null
-    const sizeOk = !e.sizeBytes || (sizeBytes !== null && sizeBytes === e.sizeBytes)
-    out.push({
-      id: e.id,
-      kind: e.kind,
-      filePath,
-      exists,
-      expectedSha256: e.sha256 ?? null,
-      actualSha256: null, // 校验和留到用户显式点「校验」时算，启动期不读几十 MB 文件
-      sizeBytes,
-      ok: exists && sizeOk,
-      message: exists
-        ? sizeOk
-          ? null
-          : `文件大小与登记不符（期望 ${e.sizeBytes} 字节，实际 ${sizeBytes}）`
-        : '模型文件不存在，请放入 resources/models 或改用 Mock provider',
-    })
-  }
-  return out
-}
-
-// ---------------------------------------------------------------------------
-// ffmpeg 探测
-// ---------------------------------------------------------------------------
-
-/** 关键滤镜白名单：缺任何一个，对应的处理链就没法跑（docs/14 §3.1） */
-const REQUIRED_FILTERS = ['loudnorm', 'alimiter', 'highpass', 'acompressor', 'afftdn', 'deesser', 'equalizer'] as const
-
-/**
- * 探测 ffmpeg（docs/02 §5.1）。
- *
- * 用 `-version` 与 `-filters` 两个命令：前者确认可执行，后者确认**关键滤镜**在位。
- * 只报可用性，不抛错 —— 没有 ffmpeg 时录音/对齐仍可用，只是没法处理与导出。
- */
-async function probeFfmpeg(candidates: readonly string[], state: AppState): Promise<FfmpegCapabilities> {
-  const { execFile } = await import('node:child_process')
-  const { promisify } = await import('node:util')
-  const run = promisify(execFile)
-  const log = state.requireLogger()
-
-  for (const candidate of candidates) {
-    try {
-      const versionOut = await run(candidate, ['-version'], { timeout: 10_000, windowsHide: true })
-      const version = /ffmpeg version (\S+)/.exec(String(versionOut.stdout))?.[1] ?? ''
-      let filters: string[] = []
-      let encoders: string[] = []
-      try {
-        const filtersOut = await run(candidate, ['-hide_banner', '-filters'], { timeout: 15_000, windowsHide: true })
-        filters = parseNameColumn(String(filtersOut.stdout))
-        const encodersOut = await run(candidate, ['-hide_banner', '-encoders'], { timeout: 15_000, windowsHide: true })
-        encoders = parseNameColumn(String(encodersOut.stdout))
-      } catch (e) {
-        log.warn('ffmpeg.probe.filtersFailed', { event: 'ffmpeg.probe.filtersFailed', reason: String(e) })
-      }
-      const missing = REQUIRED_FILTERS.filter((f) => !filters.includes(f))
-      return { version, available: true, path: candidate, filters, missing, encoders }
-    } catch {
-      // 换下一个候选
-    }
-  }
-  return defaultFfmpegCapabilities()
-}
-
-/** 从 `ffmpeg -filters` / `-encoders` 的输出里取「名字」列（第二列是名称） */
-function parseNameColumn(text: string): string[] {
-  const out: string[] = []
-  for (const line of text.split(/\r?\n/)) {
-    // 形如： ` T.. acompressor   A->A  ...` / ` V....D libx264  ...`
-    const m = /^\s*[A-Z.]{5,}\s+(\S+)\s/.exec(line)
-    if (m) out.push(m[1]!)
-  }
-  return out
-}
+//
+// ★ 两者的实现都搬到了 `src/main/capabilities.ts`（`probeModels` / `probeFfmpeg`）。
+//   原因有二：
+//     1. 设置页的「重新探测」需要一个**可调用**的探测入口 —— 留在这里就只能重读快照
+//        （docs/91 §5.2.51 ④ 第三条）。搬出去之后启动步骤与重新探测跑的是同一份代码；
+//     2. 这里原来各有一份「第二实现」：`verifyModels()` 只认数组形态的 `models`
+//        （文件里是分组对象 ⇒ 永远返回空清单），本地 `parseNameColumn()` 与
+//        `shared/ffmpeg/parse.ts` 的解析器并存（两份都得修，必然漏一个）。
 
 export { formatBootReport }

@@ -55,7 +55,11 @@ import {
   type ImportPreview,
   type ImportTxContext,
 } from './import.service.ts'
-import { parseCanvasScript } from '../../../../shared/text/canvas-script.ts'
+import {
+  blankCanvasCharacterTables,
+  parseCanvasScript,
+  speakerContextOf,
+} from '../../../../shared/text/canvas-script.ts'
 
 // ---------------------------------------------------------------------------
 // 依赖
@@ -621,7 +625,23 @@ export function createBookService(deps: BookServiceDeps): BookService {
     // 放在这里（而不是预览阶段）是为了不让预览载荷翻倍；预览只看章节切分。
     const scriptByChapterId = new Map<Id, ReturnType<typeof parseCanvasScript>>()
     if (req.importMode === 'canvas') {
-      for (const draft of included) draft.canvasScript = parseCanvasScript(draft.rawText, { chapterTitle: draft.title })
+      /**
+       * ⚠️ **两遍解析**：角色表常只在全书最前面的「前言」章（或章末），
+       * 而这里逐章解析时每章文本里没有表 —— 没有表就无法判断 `【A-B】` 里
+       * 哪边是 CV / 角色名，会退回「角色名-CV名」，把整本书的角色建成 CV。
+       * 所以先解析一遍汇总全书角色表，再带着上下文重新解析每一章。
+       */
+      const firstPass = included.map((d) => parseCanvasScript(d.rawText, { chapterTitle: d.title }))
+      const speakerContext = speakerContextOf(firstPass.flatMap((s) => s.characters))
+      for (const draft of included) {
+        draft.canvasScript = parseCanvasScript(draft.rawText, {
+          chapterTitle: draft.title,
+          speakerContext,
+        })
+        // 解析完再把角色表从**入库的正文**里等长抹掉（预览文本必须保留原表，
+        // 否则这里就拿不到全书角色表了）
+        draft.rawText = blankCanvasCharacterTables(draft.rawText)
+      }
     }
 
     const now = Date.now()

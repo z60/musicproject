@@ -154,15 +154,28 @@ export function parseVersion(stdout: string): string | null {
 /**
  * 解析 `ffmpeg -filters` 输出的滤镜名列表。
  *
- * 输出形如：
- * ```
- * Filters:
- *   T.. = Timeline support
- *   .S. = Slice threading
- *   ... acompressor       A->A       Audio compressor.
- *   ..C afftdn            A->A       Affine denoise.
- * ```
- * 只取「三字符标记 + 名字」的行，过滤表头与说明行。
+ * ### 判据是「签名列」，不是「标记列」
+ *   老版本（6.x 及更早）每个滤镜行是三字符标记：
+ *   ```
+ *   Filters:
+ *     T.. = Timeline support
+ *     ... acompressor       A->A       Audio compressor.
+ *   ```
+ *   新版本（**实测 9.0.2-full_build**）把标记列压成了 **2 个字符**：
+ *   ```
+ *     TS aap               AA->A      Apply Affine Projection algorithm to first audio stream.
+ *     .. acompressor       A->A       Audio compressor.
+ *     .. anullsink         A->|       Do absolutely nothing with the input audio.
+ *     .. abuffer           |->A       Buffer audio frames, and make them accessible to the filterchain.
+ *   ```
+ *
+ *   这里原来写死「三字符标记」（`^\s{1,4}([TSC.]{3})\s+…`），于是**在 7.x/8.x/9.x 上匹配 0 行**：
+ *   滤镜列表为空 ⇒ 必需滤镜「全部缺失」⇒ UI 把降噪/EQ/压缩等控件全隐藏，而 ffmpeg 明明是好的。
+ *   单测没抓住它，因为 fixture 是照着旧格式**手写**的 —— 测的是自己想象的输出，不是真实输出。
+ *
+ *   现在的判据是每个滤镜行都必然有的 **输入→输出签名**（`A->A` / `AA->A` / `N->A` / `A->|` / `|->A`）：
+ *   它对版本稳定，并且天然排掉表头与图例（那些行里没有 `->`）。
+ *   实测：9.0.2 的 587 行输出里，含 `->` 的 579 行**全部**命中，未命中的 8 行正是表头与图例。
  *
  * @throws 不抛异常；无匹配返回空数组
  */
@@ -171,7 +184,8 @@ export function parseFilters(stdout: string): string[] {
   const names = new Set<string>()
   for (const rawLine of stdout.split(/\r?\n/)) {
     const line = rawLine.replace(/\s+$/, '')
-    const m = /^\s{1,4}([TSC.]{3})\s+([A-Za-z0-9_]+)\s+\S/.exec(line)
+    // 标记列 1~3 字符（新旧格式都覆盖）+ 滤镜名 + 含 `->` 的签名列
+    const m = /^\s{1,4}([A-Za-z.|]{1,3})\s+([A-Za-z0-9_]+)\s+\S*->\S*/.exec(line)
     if (!m) continue
     names.add(m[2] as string)
   }

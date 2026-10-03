@@ -16,6 +16,8 @@
  */
 
 import { strict as assert } from 'node:assert'
+
+import { createStubAudioImportService } from './helpers/stub-import-service.ts'
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -190,7 +192,14 @@ async function harness(opts?: {
     record,
     events,
     logs,
-    handlers: createAudioHandlers({ analysis, device, take, record, log: { info: () => {}, warn: () => {} } }),
+    handlers: createAudioHandlers({
+      analysis,
+      device,
+      take,
+      record,
+      importService: createStubAudioImportService(),
+      log: { info: () => {}, warn: () => {} },
+    }),
     cleanup: () => {
       record.closeAll('test-cleanup')
       db.close()

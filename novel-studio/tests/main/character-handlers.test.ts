@@ -91,6 +91,7 @@ async function harness(): Promise<Harness> {
     repo: () => ({ canvas, characters, actors }),
     chapters,
     listProjectActors: (bookId) => (bookId === 'b1' ? actors.listByProject('p1') : Promise.resolve([])),
+    projectIdOfBook: async (bookId) => (bookId === 'b1' || bookId === 'b2' ? 'p1' : null),
     queue: {
       enqueue: async (kind: string, payload: unknown, opts: unknown) => {
         enqueued.push({ kind, payload, opts })
@@ -163,7 +164,7 @@ async function seedLine(
 
 async function addCharacter(
   h: Harness,
-  input: { id?: string; bookId?: string; name: string; aliases?: string[]; color?: string | null },
+  input: { id?: string; bookId?: string; name: string; aliases?: string[]; color?: string | null; note?: string | null },
 ): Promise<Character> {
   return (await call(h, 'character:upsert', {
     character: { ...input, bookId: input.bookId ?? 'b1' },
@@ -516,4 +517,139 @@ describe('角色域 handler · 配音员与分工负载', () => {
       h.cleanup()
     }
   })
+
+  it('voiceActor:syncFromCanvas 按角色备注的 CV：补齐配音员与主绑定（幂等）', async () => {
+    const h = await harness()
+    try {
+      // 画本导入写进 note 的就是这个格式（`buildScriptCharacterNote`）
+      const c1 = await addCharacter(h, { name: '男龙套3', note: 'CV：阿翼爱热闹' })
+      const c2 = await addCharacter(h, { name: '洪进宝', note: 'CV：鱼头一颗糖｜音色：大叔音' })
+      const c3 = await addCharacter(h, { name: '霍青骏', note: 'CV：鱼头一颗糖' })
+      // 没有备注 / 占位备注的角色不该凭空造出配音员
+      await addCharacter(h, { name: '路人甲' })
+      await addCharacter(h, { name: '路人乙', note: 'CV：未知' })
+
+      const first = (await call(h, 'voiceActor:syncFromCanvas', { bookId: 'b1', force: true })) as {
+        createdActors: number
+        boundCharacters: number
+        matchedCharacters: number
+        skipped: boolean
+      }
+      assert.equal(first.createdActors, 2, '两个不同的 CV 名 → 两个配音员（同名去重）')
+      assert.equal(first.boundCharacters, 3)
+      assert.equal(first.matchedCharacters, 3)
+      assert.equal(first.skipped, false)
+
+      assert.deepEqual(
+        ((await call(h, 'voiceActor:list', { projectId: 'p1' })) as VoiceActor[]).map((a) => a.name).sort(),
+        ['阿翼爱热闹', '鱼头一颗糖'],
+      )
+      const bindings = (await call(h, 'voiceActor:bindings', { bookId: 'b1' })) as Array<{
+        characterId: string
+        actorId: string
+        isPrimary: boolean
+      }>
+      assert.equal(bindings.length, 3)
+      assert.ok(bindings.every((b) => b.isPrimary), '画本备注派生的绑定是主配音（没有人工指派时）')
+      const actors = (await call(h, 'voiceActor:list', { projectId: 'p1' })) as VoiceActor[]
+      const byName = new Map(actors.map((a) => [a.name, a.id]))
+      assert.ok(bindings.some((b) => b.characterId === c1.id && b.actorId === byName.get('阿翼爱热闹')))
+      assert.ok(bindings.some((b) => b.characterId === c2.id && b.actorId === byName.get('鱼头一颗糖')))
+      assert.ok(bindings.some((b) => b.characterId === c3.id && b.actorId === byName.get('鱼头一颗糖')))
+
+      // 再同步一次：什么都不新建（幂等）
+      const second = (await call(h, 'voiceActor:syncFromCanvas', { bookId: 'b1', force: true })) as {
+        createdActors: number
+        boundCharacters: number
+      }
+      assert.equal(second.createdActors, 0)
+      assert.equal(second.boundCharacters, 0)
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  it('自动模式只同步一次：用户解绑之后刷新不会自己长回来', async () => {
+    const h = await harness()
+    try {
+      const c1 = await addCharacter(h, { name: '男龙套3', note: 'CV：阿翼爱热闹' })
+      // 首次自动同步（面板加载走的就是 force 省略这条路径）
+      const first = (await call(h, 'voiceActor:syncFromCanvas', { bookId: 'b1' })) as { createdActors: number; skipped: boolean }
+      assert.equal(first.skipped, false)
+      assert.equal(first.createdActors, 1)
+
+      const actor = ((await call(h, 'voiceActor:list', { projectId: 'p1' })) as VoiceActor[])[0]!
+      await call(h, 'voiceActor:unbind', { characterId: c1.id, actorId: actor.id })
+
+      const second = (await call(h, 'voiceActor:syncFromCanvas', { bookId: 'b1' })) as { skipped: boolean; boundCharacters: number }
+      assert.equal(second.skipped, true, '项目已自动同步过：自动模式必须整体跳过')
+      assert.equal(second.boundCharacters, 0)
+      assert.deepEqual(await call(h, 'voiceActor:bindings', { bookId: 'b1' }), [], '解绑不能被自动同步撤销')
+
+      // 用户显式点「从画本同步 CV」时才重新绑
+      const forced = (await call(h, 'voiceActor:syncFromCanvas', { bookId: 'b1', force: true })) as { boundCharacters: number }
+      assert.equal(forced.boundCharacters, 1)
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  it('人工指派优先：备注里的 CV 只作为备选，不抢主位', async () => {
+    const h = await harness()
+    try {
+      const c1 = await addCharacter(h, { name: '洪进宝', note: 'CV：鱼头一颗糖' })
+      const manual = (await call(h, 'voiceActor:upsert', { actor: { projectId: 'p1', name: '我自己找的' } })) as VoiceActor
+      await call(h, 'voiceActor:bind', { characterId: c1.id, actorId: manual.id, isPrimary: true })
+
+      await call(h, 'voiceActor:syncFromCanvas', { bookId: 'b1', force: true })
+      const bindings = (await call(h, 'voiceActor:bindings', { bookId: 'b1' })) as Array<{
+        actorId: string
+        isPrimary: boolean
+      }>
+      assert.equal(bindings.length, 2, '备注里的 CV 仍然补进来（作为备选）')
+      assert.equal(bindings.filter((b) => b.isPrimary).length, 1)
+      assert.equal(bindings.find((b) => b.isPrimary)!.actorId, manual.id, '人工指派的主配音不能被备注顶掉')
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  it('同步会确保书里有「旁白」角色：CV 才能被指派去读旁白（幂等）', async () => {
+    const h = await harness()
+    try {
+      // 旁白行：speakerType='narration'，character_id 为 null
+      await seedLine(h, { id: 'n1', seq: 0, text: '夜色沉沉。' })
+      await seedLine(h, { id: 'n2', seq: 1, text: '他推门而入。' })
+      const c1 = await addCharacter(h, { name: '萧炎' })
+      await seedLine(h, { id: 'd1', seq: 2, text: '药老，我来了。', characterId: c1.id })
+
+      await call(h, 'voiceActor:syncFromCanvas', { bookId: 'b1' })
+      const list = (await call(h, 'character:list', { bookId: 'b1' })) as Character[]
+      const narration = list.find((c) => c.name === '旁白')
+      assert.ok(narration, '同步后角色表里必须有「旁白」——没有它就没有外键可挂 CV 绑定')
+      assert.equal(narration.note, '系统角色：整本书的旁白', '来源要写在备注里（用户会问这个名字哪来的）')
+      assert.equal(list[0]!.name, '旁白', '旁白排在最前（sortOrder=-1）')
+
+      // 再同步一次不能造出第二个旁白
+      await call(h, 'voiceActor:syncFromCanvas', { bookId: 'b1' })
+      const again = (await call(h, 'character:list', { bookId: 'b1' })) as Character[]
+      assert.equal(again.filter((c) => c.name === '旁白').length, 1)
+
+      // 分工负载：旁白角色的行数来自 speakerType='narration' 的行，而不是 character_id
+      const actor = (await call(h, 'voiceActor:upsert', { actor: { projectId: 'p1', name: '语心草' } })) as VoiceActor
+      await call(h, 'voiceActor:bind', { characterId: narration.id, actorId: actor.id, isPrimary: true })
+      const workload = (await call(h, 'voiceActor:workload', { bookId: 'b1' })) as ActorWorkload[]
+      const row = workload.find((w) => w.name === '语心草')
+      assert.equal(row?.lines, 2, '「负责旁白的 CV」要看得见旁白的 2 行')
+      assert.equal(row?.chars, 9) // 夜色沉沉。=4 字，他推门而入。=5 字（标点不计）
+
+      // 角色出场统计同理（旁白行的 character_id 是 null，不能按它算）
+      const stats = (await call(h, 'character:stats', { characterId: narration.id })) as { lines: number; chars: number }
+      assert.equal(stats.lines, 2)
+      assert.equal(stats.chars, 9)
+    } finally {
+      h.cleanup()
+    }
+  })
+
 })

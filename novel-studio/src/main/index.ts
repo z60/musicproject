@@ -34,6 +34,7 @@ import { BOOT_STEPS, formatBootReport, runBootSequence, validateBootPlan } from 
 import { registerMediaSchemePrivileges } from './bootstrap/window-manager.ts'
 import { loadElectron } from './infra/electron/index.ts'
 import { registerAllHandlers } from './ipc/index.ts'
+import { createEventEmitter, createMemoryEventBacklog } from './ipc/events.ts'
 import { buildHandlerDeps } from './ports.ts'
 
 // ---------------------------------------------------------------------------
@@ -163,7 +164,31 @@ async function main(): Promise<void> {
   //    而 BOOT_STEPS 的第 12 步正好在那个位置。因此这里用闭包延迟装配。
   let deps: ReturnType<typeof buildHandlerDeps> | null = null
   handlers['register-ipc-handlers'] = async () => {
+    /**
+     * 主 → 渲染的事件出口。
+     *
+     * 真机事故（docs/91 §5.2.62）：这个发射器写好了却**从来没人构造**，
+     * 于是 `ctx.report()` / `task:finished` 一路走到 `events: undefined` 就断了 ——
+     * 所有任务的进度条永远是 0%、永远不显示完成。事件出口必须在这里真的建起来。
+     *
+     * 目标用**取值函数**（窗口会重建）：主窗口的 webContents 每次现取。
+     * 待补发队列用内存实现：`task:finished` 在窗口不在时先存着，窗口就绪后补发。
+     */
+    const events = createEventEmitter(
+      () => {
+        const wc = state.mainWindow?.webContents
+        return wc ? [wc as never] : []
+      },
+      {
+        log: {
+          warn: (event, fields) => state.log().warn(event, fields),
+          info: (event, fields) => state.log().info(event, fields),
+        },
+        backlog: createMemoryEventBacklog(),
+      },
+    )
     const built = buildHandlerDeps({
+      events,
       state,
       version: electron.app.getVersion(),
       portable: state.portable,

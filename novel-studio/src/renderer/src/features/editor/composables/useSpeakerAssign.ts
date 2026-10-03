@@ -83,9 +83,11 @@ export function useSpeakerAssign(): UseSpeakerAssign {
   function speakerLabel(line: CanvasLine | null | undefined): string {
     if (!line) return '—'
     if (line.speakerType === 'narration' || !line.characterId) {
-      return line.kind === 'sfx_note' ? '音效' : '旁白'
+      // 旁白（含未指派）也走「有 CV 显示 CV」：旁白角色的 CV 就是「谁读旁白」
+      return line.kind === 'sfx_note' ? '音效' : characters.narrationDisplayName
     }
-    return characters.nameOf(line.characterId)
+    // 说话人列显示：有 CV 显示 CV，没有 CV 显示角色名（`displayNameOf`）
+    return characters.displayNameOf(line.characterId)
   }
 
   function isUnassigned(line: CanvasLine | null | undefined): boolean {

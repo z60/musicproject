@@ -33,6 +33,7 @@ import { useSettingsStore } from '@/app/store/settings.store.ts'
 import CanvasTable from '../components/CanvasTable.vue'
 import CanvasScriptView from '../components/CanvasScriptView.vue'
 import LineEditorDrawer from '../components/LineEditorDrawer.vue'
+import RoleCell from '../components/RoleCell.vue'
 import SpeakerCell from '../components/SpeakerCell.vue'
 import EmotionTagPicker from '../components/EmotionTagPicker.vue'
 import PauseControl from '../components/PauseControl.vue'
@@ -342,7 +343,8 @@ const mergePreview = computed(() => {
   if (!target || !mergeWithId.value) return null
   return characters.previewMerge(target.id, [target.id, mergeWithId.value])
 })
-const mergeCandidates = computed(() => characters.activeCharacters.filter(c => c.id !== mergeTarget.value?.id))
+// 合并候选也排除「旁白」：把旁白合并进某个角色没有意义，而它会被下一条 ensure 立刻重建
+const mergeCandidates = computed(() => characters.assignableCharacters.filter(c => c.id !== mergeTarget.value?.id))
 
 async function onMergeConfirm(payload: { targetId: Id; sourceIds: Id[]; keepAliases: boolean }): Promise<void> {
   mergeLoading.value = true
@@ -382,6 +384,12 @@ onBeforeUnmount(() => {
 // 章节上下文变化（含深链 props.chapterId）时重新加载画本
 watch(currentChapterId, async (id) => {
   if (id && id !== canvas.loadedChapterId) await canvas.load(id)
+})
+
+// 生成结束会**先抽角色再判定**：重载角色表，说话人列才能解析出新抽出的角色
+// （不重载时列里显示「未知角色」，看起来就像角色没被安置进去）
+watch(() => canvas.generationVersion, async () => {
+  await characters.load(bookId.value, projectId.value)
 })
 </script>
 
@@ -461,7 +469,8 @@ watch(currentChapterId, async (id) => {
             <el-option :value="SPEAKER_ANY" label="全部说话人" />
             <el-option :value="SPEAKER_UNKNOWN" label="未分配（台词无角色）" />
             <el-option :value="SPEAKER_NARRATION" label="旁白" />
-            <el-option v-for="character in characters.activeCharacters" :key="character.id" :value="character.id" :label="character.name" />
+            <!-- 旁白走上面的 SPEAKER_NARRATION（按 speakerType 筛），不列旁白角色：它的行 characterId 恒为 null -->
+            <el-option v-for="character in characters.assignableCharacters" :key="character.id" :value="character.id" :label="character.name" />
           </el-select>
           <el-select
             :model-value="filterState.kind" size="small" clearable class="ns-editor__filter is-narrow" placeholder="类型"
@@ -574,6 +583,7 @@ watch(currentChapterId, async (id) => {
         <div v-if="activeLine && canvas.selectedCount === 1" class="ns-editor__quick">
           <span class="ns-editor__muted">#{{ activeLine.seq }}</span>
           <SpeakerCell :line="activeLine" :readonly="readonly" :threshold="canvas.threshold" @change="onLineChanged" @open="canvas.openDrawer" @locate="focusLine" />
+          <RoleCell :line="activeLine" :readonly="readonly" @change="onLineChanged" @open="canvas.openDrawer" />
           <EmotionTagPicker
             :emotion="activeLine.emotion" :intensity="activeLine.emotionIntensity" :readonly="readonly"
             @change="(patch) => patchActiveLine(patch, '修改情绪')"

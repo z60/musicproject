@@ -17,7 +17,9 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import type { Take } from '@shared/types.ts'
+import { takeSourceRange } from '@shared/audio/take-range.ts'
 import { mediaUrlWithCacheBust, segmentUrl } from '@/shared/lib/media-url.ts'
+import { playRange } from '@/shared/lib/media-element.ts'
 import { UNKNOWN, formatDate, formatDb, formatDuration, formatRelativeTime } from '@/shared/lib/format.ts'
 import { TAKE_FLAG_PRESETS } from '../stores/takes.store.ts'
 
@@ -98,9 +100,11 @@ async function preview(take: Take): Promise<void> {
     playingId.value = null
     return
   }
-  player.src = urlOf(take)
+  // ★ 导入的 take 指向整段源文件：必须从 `srcInMs` 起播、到 `srcOutMs` 停。
+  // 旧实现直接 `player.src = 整段文件` 后 play()，于是「导入的音频放不出来 / 放的是别的」。
+  const range = takeSourceRange(take)
   try {
-    await player.play()
+    await playRange(player, urlOf(take), range.startMs, range.endMs)
     playingId.value = take.id
     emit('play', take.id)
   } catch {
@@ -131,8 +135,12 @@ function toggleExpand(take: Take): void {
     return
   }
   expandedId.value = take.id
-  punchIn.value = props.punchInMs || Math.max(0, take.trimmedInMs || 0)
-  punchOut.value = props.punchOutMs || Math.max(1, take.srcOutMs || take.durationMs)
+  // 补录区间用**源文件内**坐标（与 playTake 的 pre-roll 同一口径）：
+  // 导入的 take 起点是 `srcInMs` 而不是 0 —— 旧写法 `trimmedInMs` 在导入数据上恒为 0，
+  // 补录会把整段文件都当成「这一句」。
+  const range = takeSourceRange(take)
+  punchIn.value = props.punchInMs || range.startMs
+  punchOut.value = props.punchOutMs || range.endMs
 }
 
 function confirmPunch(take: Take): void {
@@ -299,7 +307,8 @@ defineExpose({
     </ol>
 
     <!-- 唯一试听元素：也用于监听「已有轨道」（docs/12 §7） -->
-    <audio ref="playerRef" class="ns-takes__player" preload="none" @ended="playingId = null" />
+    <!-- `@pause` 也要清 playingId：播到 take 区间终点是我们自己 pause 的（没有 ended 事件） -->
+    <audio ref="playerRef" class="ns-takes__player" preload="none" @ended="playingId = null" @pause="playingId = null" />
   </section>
 </template>
 

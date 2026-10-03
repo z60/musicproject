@@ -26,6 +26,7 @@ import { formatDuration, formatLufs, formatScore, formatDb } from '@/shared/lib/
 import { useEditableField, useImmediateField } from '@/shared/lib/use-editable-field.ts'
 import AutoSaveIndicator from '@/shared/ui/AutoSaveIndicator.vue'
 import ConfidenceBadge from '@/shared/ui/ConfidenceBadge.vue'
+import RoleCell from './RoleCell.vue'
 import SpeakerCell from './SpeakerCell.vue'
 import EmotionTagPicker from './EmotionTagPicker.vue'
 import PauseControl from './PauseControl.vue'
@@ -434,9 +435,13 @@ watch(() => props.line?.id, syncFields, { immediate: true })
           <span class="ns-drawer__autosave-hint">文本 500 ms 防抖写库；标记类改动立即写库</span>
         </div>
 
-        <!-- 归属：候选 Top-3 -->
+        <!-- 归属：说话人（CV）与角色名两列都能改（与主视图同一套选项，docs/11 §4.2） -->
         <section class="ns-drawer__section">
           <h4 class="ns-drawer__section-title">归属</h4>
+          <div class="ns-drawer__role-row">
+            <span class="ns-drawer__muted">角色名</span>
+            <RoleCell :line="line" :readonly="readonly" @change="(id) => emit('changed', id)" @open="() => undefined" />
+          </div>
           <SpeakerCell
             :line="line"
             :readonly="readonly"
@@ -777,6 +782,12 @@ watch(() => props.line?.id, syncFields, { immediate: true })
   color: var(--ns-text-secondary, #909399);
   font-size: 11px;
   font-weight: 400;
+}
+.ns-drawer__role-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
 }
 .ns-drawer__candidates {
   margin-top: 8px;

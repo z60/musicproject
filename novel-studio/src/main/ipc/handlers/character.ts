@@ -102,6 +102,10 @@ export function createCharacterHandlers(deps: CharacterHandlerDeps): RegisteredH
 
     h('voiceActor:workload', async (req) => deps.service.workload(req.bookId)),
 
+    h('voiceActor:syncFromCanvas', async (req) => {
+      return deps.service.syncActorsFromNotes(req.bookId, { force: req.force === true })
+    }),
+
     h('voiceActor:bindings', async (req) => {
       const list = await deps.service.listBindings(req.bookId)
       // 契约里 `isPrimary` 是必填的布尔值：仓储返回的就是布尔，这里显式转一次，
@@ -131,4 +135,5 @@ export const CHARACTER_CHANNELS: readonly string[] = [
   'voiceActor:unbind',
   'voiceActor:workload',
   'voiceActor:bindings',
+  'voiceActor:syncFromCanvas',
 ]

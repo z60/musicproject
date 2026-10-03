@@ -12,10 +12,13 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import type { AppSettings, CanvasLine, Character, RecordingMode, Take } from '@shared/types.ts'
+import type { AppSettings, CanvasLine, Character, RecordingMode, Take, VoiceActor } from '@shared/types.ts'
 import { RECORD_LIMITS, VAD_DEFAULTS } from '@shared/constants.ts'
 import { ROLE_FILTER_ALL, ROLE_FILTER_NARRATION, filterLinesByRole } from '@shared/canvas/role-filter.ts'
+import { parseCvFromNote } from '@shared/canvas/character-display.ts'
+import { isNarrationRoleName, NARRATION_ROLE_NAME } from '@shared/canvas/narration-role.ts'
 import { buildLineContext } from '@shared/canvas/context-window.ts'
+import { takeSourceRange } from '@shared/audio/take-range.ts'
 import { AppError } from '@shared/errors.ts'
 import { call, callSafe } from '@/shared/lib/ipc.ts'
 import { reportError } from '@/shared/lib/error-bus.ts'
@@ -23,10 +26,13 @@ import {
   UNKNOWN, formatBytes, formatDb, formatDuration, formatInt, formatProgressRatio,
 } from '@/shared/lib/format.ts'
 import { mediaUrlWithCacheBust, segmentUrl } from '@/shared/lib/media-url.ts'
+import { playRange } from '@/shared/lib/media-element.ts'
 import ConfirmDialog from '@/shared/ui/ConfirmDialog.vue'
 import LevelMeter from '@/shared/ui/LevelMeter.vue'
 import ContinuousControls from '../components/ContinuousControls.vue'
 import CountdownOverlay from '../components/CountdownOverlay.vue'
+import ImportBySpeakerWizard from '../components/ImportBySpeakerWizard.vue'
+import { useAudioImportStore } from '../stores/audio-import.store.ts'
 import LinePromptCard from '../components/LinePromptCard.vue'
 import LiveWaveform from '../components/LiveWaveform.vue'
 import MonitorPanel from '../components/MonitorPanel.vue'
@@ -71,6 +77,9 @@ interface TakeListExposed { player: HTMLAudioElement | null; stop: () => void }
 const mode = ref<RecordingMode>(route.query.mode === 'continuous' ? 'continuous' : 'line_by_line')
 const lines = ref<CanvasLine[]>([])
 const characters = ref<Character[]>([])
+/** 配音员与绑定：只用来把「旁白」显示成读它的那个人（旁白角色绑了 CV 时） */
+const actors = ref<VoiceActor[]>([])
+const bindings = ref<Array<{ characterId: string; actorId: string; isPrimary: boolean }>>([])
 /**
  * 「按角色录制」筛选：'all' = 全部行；'narration' = 只录旁白；其余是 characterId。
  * 只决定**本页要走/要录的行**，不改画本、不改行的说话人 —— 与任务包页（docs/12 §5）同一语义。
@@ -92,6 +101,13 @@ const showShortcuts = ref(false)
 const compareOpen = ref(false)
 const comparePicks = ref<string[]>([])
 const confirmDiscard = ref(false)
+/** 「按说话人导入音频」对话框（docs/91 §5.2.49） */
+const importOpen = ref(false)
+/**
+ * 向导状态在 Pinia store 里（不随对话框的 v-if 销毁），
+ * 所以关闭对话框时显式重置 —— 避免「重开时停在旧步骤、带着旧计划」。
+ */
+const audioImport = useAudioImportStore()
 const autoNext = ref(true)
 /** onPcmBlock 的解除函数（卸载必须调用，否则采集块会继续推给已销毁的波形组件） */
 let offPcm: (() => void) | null = null
@@ -116,8 +132,20 @@ const contextLines = computed(() => buildLineContext(lines.value, chapterIndexOf
 const charsPerSecond = computed(() => settings.recording?.vad?.charsPerSecond ?? VAD_DEFAULTS.charsPerSecond)
 const deviceOptions = computed(() => devices.inputs)
 const characterNames = computed(() => new Map(characters.value.map(character => [character.id, character])))
+/**
+ * 旁白行的说话人名：旁白角色绑了 CV 就显示 **CV**（「有 CV 显示 CV」，与角色行同一口径），
+ * 否则显示「旁白」。绑定的 CV 名取配音员表；画本备注里的 `CV：xxx` 作为兜底。
+ */
+const narrationDisplayName = computed(() => {
+  const narration = characters.value.find(character => isNarrationRoleName(character.name))
+  if (!narration) return NARRATION_ROLE_NAME
+  const binding = bindings.value.find(item => item.characterId === narration.id)
+  const actor = binding ? actors.value.find(item => item.id === binding.actorId) : undefined
+  const cv = actor?.name ?? parseCvFromNote(narration.note)
+  return cv && cv.length > 0 ? cv : NARRATION_ROLE_NAME
+})
 function speakerNameOf(line: CanvasLine | null): string {
-  if (!line || line.speakerType === 'narration') return '旁白'
+  if (!line || line.speakerType === 'narration') return narrationDisplayName.value
   if (line.characterId) return characterNames.value.get(line.characterId)?.name ?? '未知角色'
   return '未指定角色'
 }
@@ -138,7 +166,7 @@ const narrationLineCount = computed(() => lines.value.filter(line => line.speake
 /** 当前筛选的展示名（进度文案与空态提示用） */
 const roleFilterLabel = computed(() => {
   if (roleFilter.value === ROLE_FILTER_ALL) return '全部角色'
-  if (roleFilter.value === ROLE_FILTER_NARRATION) return '旁白'
+  if (roleFilter.value === ROLE_FILTER_NARRATION) return narrationDisplayName.value
   return characterNames.value.get(roleFilter.value)?.name ?? '未知角色'
 })
 /** 切换「按角色录制」：录音中禁止（会误导）；切换后定位到该范围内第一个未录行 */
@@ -183,12 +211,16 @@ async function loadAll(): Promise<void> {
   if (!chapterId) return
   loading.value = true
   try {
-    const [page, chars] = await Promise.all([
+    const [page, chars, binds, actorList] = await Promise.all([
       call('canvas:getChapter', { chapterId }),
       session.bookId ? callSafe('character:list', { bookId: session.bookId }) : Promise.resolve(null),
+      session.bookId ? callSafe('voiceActor:bindings', { bookId: session.bookId }) : Promise.resolve(null),
+      session.projectId ? callSafe('voiceActor:list', { projectId: session.projectId }) : Promise.resolve(null),
     ])
     lines.value = page.lines ?? []
     characters.value = chars ?? []
+    bindings.value = binds ?? []
+    actors.value = actorList ?? []
     // 拉整章 take：进度（含按角色筛选后的进度）才准，否则只有走过的行才有 byLine
     await takes.loadByChapter(chapterId)
   } finally { loading.value = false }
@@ -216,12 +248,18 @@ function releasePinnedTake(): void {
 const TAKE_PEAKS_PER_SEC = 100
 async function loadTakePeaks(take: Take): Promise<void> {
   try {
-    const result = await callSafe('analysis:peaks', { path: take.filePath, peaksPerSec: TAKE_PEAKS_PER_SEC })
+    // 只取**这条 take 的区间**：导入的 take 是整段源文件里的几十秒，画整段等于画错波形
+    const range = takeSourceRange(take)
+    const result = await callSafe('analysis:peaks', {
+      path: take.filePath,
+      peaksPerSec: TAKE_PEAKS_PER_SEC,
+      fromMs: range.startMs,
+      toMs: range.endMs,
+    })
     const peaks = result?.peaks
     if (!peaks?.length) { waveformRef.value?.clearTake(); return }
-    const totalPeaks = result?.totalPeaks ?? Math.floor(peaks.length / 2)
-    // 时间轴右端 = 桶数 / 每秒桶数（与传进来的 peaks 自洽）
-    waveformRef.value?.showPeaks(peaks, Math.max(1, Math.round((totalPeaks / TAKE_PEAKS_PER_SEC) * 1000)))
+    // 时间轴右端 = 区间时长（与传进来的 peaks 自洽）
+    waveformRef.value?.showPeaks(peaks, Math.max(1, range.endMs - range.startMs))
   } catch {
     // 文件缺失/读取失败：回到空态（试听那条路会由 TakeList 走 error-bus 提示）
     waveformRef.value?.clearTake()
@@ -386,14 +424,21 @@ function onPunchRange(payload: { takeId: string; srcInMs: number; srcOutMs: numb
  * 同时只该有一路试听，且该元素已挂在监听图上，另建一个会绕开监听音量。
  * 取舍：TakeList 的 playingId 不跟踪这里，列表上的「停止」只在用户从列表点试听时出现。
  */
-async function playTake(take: Take, fromMs: number): Promise<boolean> {
+async function playTake(take: Take, fromMs?: number): Promise<boolean> {
   const element = takeListRef.value?.player ?? null
   const base = session.projectId ? segmentUrl(session.projectId, take.filePath) : null
   if (!element || !base) return false
-  element.src = mediaUrlWithCacheBust(base, take.recordedAt)
-  element.currentTime = Math.max(0, fromMs / 1000)
+  /**
+   * 从 take 的**源文件区间**起播（导入的 take 音频在文件的第 `srcInMs` 毫秒，不是第 0 毫秒），
+   * 并且必须等 `loadedmetadata` 之后再 seek —— 设完 src 立刻赋 currentTime 会被浏览器忽略，
+   * 结果「点了播放却从文件开头放」（真机反馈：导入的 CV 音无法播放）。
+   */
+  const range = takeSourceRange(take)
+  const startMs = typeof fromMs === 'number'
+    ? Math.min(Math.max(fromMs, range.startMs), Math.max(range.startMs, range.endMs - 1))
+    : range.startMs
   try {
-    await element.play()
+    await playRange(element, mediaUrlWithCacheBust(base, take.recordedAt), startMs, range.endMs)
     return true
   } catch (error) {
     // 播放失败是真实故障（文件缺失/被移动），按消息表上报（docs/22 §6.2）
@@ -405,7 +450,8 @@ async function playTake(take: Take, fromMs: number): Promise<boolean> {
 /** 试听当前 take（P / docs/12 §9.1） */
 async function playCurrentTake(): Promise<void> {
   const take = selectedTake.value ?? currentTakes.value[0] ?? null
-  if (take) await playTake(take, take.trimmedInMs)
+  // 不给 fromMs：默认取 take 自己的源区间起点（导入数据是 srcInMs，本地录制是 trimmedInMs）
+  if (take) await playTake(take)
 }
 
 /**
@@ -578,6 +624,23 @@ onBeforeUnmount(() => {
           :disabled="recording.isRecording || recording.isPaused" @click="mode = 'continuous'">连续</button>
         <button type="button" class="ns-rec__mode" @click="router.push('/recording/task')">任务包</button>
         <button type="button" class="ns-rec__mode" @click="router.push('/recording/continuous')">切片确认</button>
+        <!--
+          按说话人导入音频（docs/91 §5.2.49）。
+          需要 projectId + bookId：导入要按画本行匹配，少了书就无从匹配。
+        -->
+        <button
+          type="button"
+          class="ns-rec__mode"
+          :disabled="!session.projectId || !session.bookId"
+          :title="
+            session.projectId && session.bookId
+              ? '把配音员交付的音频按说话人导入到画本行'
+              : '先在书架里打开一本书'
+          "
+          @click="importOpen = true"
+        >
+          按说话人导入
+        </button>
       </div>
       <!-- 按角色录制：只走/只录该角色的行（docs/12 §5 的轻量版，不改画本）；连续模式不适用 -->
       <div v-if="mode === 'line_by_line'" class="ns-rec__row">
@@ -585,7 +648,7 @@ onBeforeUnmount(() => {
           <select class="ns-rec__control" :value="roleFilter"
             :disabled="recording.isRecording || recording.isPaused" @change="onRoleFilterChange">
             <option value="all">全部角色（{{ formatInt(lines.length) }} 行）</option>
-            <option value="narration">旁白（{{ formatInt(narrationLineCount) }} 行）</option>
+            <option value="narration">{{ narrationDisplayName }}（{{ formatInt(narrationLineCount) }} 行）</option>
             <option v-for="item in chapterCharacterOptions" :key="item.id" :value="item.id">
               {{ item.name }}（{{ formatInt(item.count) }} 行）
             </option>
@@ -703,7 +766,30 @@ onBeforeUnmount(() => {
     <ConfirmDialog v-model="confirmDiscard" title="丢弃本次录音？" type="warning" confirm-text="丢弃"
       message="未定稿的会话文件会被删除；已生成的 take 不受影响。" @confirm="discardSession" />
     <CountdownOverlay :visible="countdownVisible" :seconds="countdownSeconds"
-      cancel-hint="按任意键立刻开始录音" @cancel="onCountdownCancel" />  </div>
+      cancel-hint="按任意键立刻开始录音" @cancel="onCountdownCancel" />
+
+    <!--
+      按说话人导入音频（docs/91 §5.2.49）。
+      `destroy-on-close` 销毁的是**组件**，但向导状态存在 Pinia store 里
+      （生命周期跟随应用），所以还要在关闭时显式 `reset()` ——
+      否则重新打开会停在旧的步骤、带着上一次的计划，用户很容易对着陈旧数据点导入。
+    -->
+    <el-dialog
+      v-model="importOpen"
+      title="按说话人导入音频"
+      width="1080px"
+      top="6vh"
+      destroy-on-close
+      @closed="audioImport.reset()"
+    >
+      <ImportBySpeakerWizard
+        v-if="session.projectId && session.bookId"
+        :project-id="session.projectId"
+        :book-id="session.bookId"
+      />
+      <div v-else class="ns-rec__import-blocked">先在书架里打开一本书，再回来导入音频。</div>
+    </el-dialog>
+  </div>
 </template>
 
 <style scoped>

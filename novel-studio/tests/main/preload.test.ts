@@ -330,6 +330,29 @@ describe('preload 白名单规模', () => {
     assert.deepEqual(keys, ['attachRecordPort', 'detachRecordPort', 'invoke', 'mediaUrl', 'on', 'send', 'sendRecordPcm'])
   })
 
+  /**
+   * 白名单是**运行期**的闸门：渲染进程调一个不在白名单里的通道会被直接拒绝。
+   *
+   * 为什么单独盯这几个通道：它们是「按说话人导入音频」新增的（docs/91 §5.2.49），
+   * 而 preload 的白名单来自契约（自动包含）—— 一旦将来有人把它改成**静态列表**，
+   * 就会表现为「界面点导入没反应」，而主进程日志里连一条记录都没有（请求根本没出去）。
+   * 那种缺陷用「规模 > 100」是发现不了的。
+   */
+  it('新增的 record:import* 通道能通过白名单（不是静态列表）', async () => {
+    const { api } = makeApi()
+    for (const ch of [
+      'record:importScanCanvas',
+      'record:importScanFiles',
+      'record:importPlan',
+      'record:importApply',
+    ]) {
+      await assert.doesNotReject(
+        async () => await api.invoke(ch, {}),
+        `通道 ${ch} 被 preload 白名单拒绝了 —— 渲染进程将无法调用它`,
+      )
+    }
+  })
+
   it('API 上不存在 ipcRenderer / require / process 之类的泄漏', () => {
     const { api } = makeApi()
     const json = Object.keys(api).join(',')

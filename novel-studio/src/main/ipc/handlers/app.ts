@@ -34,6 +34,11 @@ export const appHandlers = [
 
   h('app:getCapabilities', voidSchema, (_req, deps) => deps.capabilities.getCapabilities()),
 
+  // 真的重新探测（spawn ffmpeg / 读模型目录）；完成后主进程广播 app:capabilitiesChanged。
+  // 设置页的「重新探测」按钮走这一条 —— 不要把它并进 getCapabilities：
+  // 那个通道在窗口加载与设置页打开时都会被调，不能每次都跑三个进程。
+  h('app:refreshCapabilities', voidSchema, (_req, deps) => deps.capabilities.refresh()),
+
   h(
     'app:openExternal',
     async (req, deps) => {

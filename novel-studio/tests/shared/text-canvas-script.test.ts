@@ -14,7 +14,9 @@ import {
   CANVAS_CHARACTER_TABLE_HEADER,
   blankCanvasCharacterTables,
   detectCanvasScript,
+  extractSpeech,
   parseCanvasScript,
+  speakerContextOf,
   splitSpeakerTag,
 } from '../../src/shared/text/canvas-script.ts'
 
@@ -27,7 +29,72 @@ function table(rows: Array<{ no: string | number; cv: string; name: string; gend
   return out.join('\n')
 }
 
-describe('画本脚本解析 · 台词与旁白', () => {
+describe('画本脚本解析 · 群白标记不能落成垃圾旁白行', () => {
+  /**
+   * 真实缺陷（用户报「一行有旁白有角色音，结果复制了一行」）。
+   *
+   * 真实画本里的形态：
+   *
+   * ```
+   * 【异口同声】【阡陌丨平凡-男龙套 3】“对！哈哈哈！”【异口同声】【鱼头一颗糖-男龙套2】“对！哈哈哈！”
+   * ```
+   *
+   * `【异口同声】` 是**群白标记**：不含 `-`（`looksLikeSpeakerTag` 不认），
+   * 且后面紧跟的是**另一个 `【`** 而不是引号（`quotedAfter` 也是 false）。
+   * 于是它走进「取到下一个【 或行尾」的分支、取到**空串**，
+   * 调用方拿空串去 `pushNarration` —— 把**标记本身**落成了一条旁白行。
+   *
+   * 实测那本真实书里，这种源行每条会多出 3 条 `【异口同声】` 旁白行，
+   * 而用户看到的正是「凭空多出来几行旁白 / 像被复制了一行」。
+   */
+  it('【异口同声】不被落成旁白行（跳过前导标记后取引号台词）', () => {
+    const s = parseCanvasScript(
+      '第1章\n【异口同声】【阡陌丨平凡-男龙套 3】“对！哈哈哈！”\n',
+      { chapterTitle: '第1章' },
+    )
+    const texts = s.lines.map((l) => l.text)
+    assert.equal(
+      texts.some((t) => /^【[^】]*】$/.test(t.trim())),
+      false,
+      `不该出现「text 就是标记本身」的行，实际：${JSON.stringify(texts)}`,
+    )
+    assert.ok(
+      texts.some((t) => t.includes('对！哈哈哈！')),
+      `引号里的台词必须被取出来，实际：${JSON.stringify(texts)}`,
+    )
+  })
+
+  it('一条源行里多个群白标记 → 每个标记的台词各成一条，没有垃圾行', () => {
+    const s = parseCanvasScript(
+      '第1章\n【异口同声】【A-龙套1】“甲！”【异口同声】【B-龙套2】“乙！”\n',
+      { chapterTitle: '第1章' },
+    )
+    const garbage = s.lines.filter((l) => /^【[^】]*】$/.test(l.text.trim()))
+    assert.deepEqual(garbage, [], '不该有任何「标记本身」的行')
+    assert.deepEqual(
+      s.lines.map((l) => l.text),
+      ['甲！', '乙！'],
+    )
+    // speaker 取自标记里的名字（`异口同声` 作为一个说话人名）
+    assert.equal(s.lines[0]!.speaker, '异口同声')
+  })
+
+  it('群白标记后面直接跟引号时，仍然只出一条台词行', () => {
+    const s = parseCanvasScript('第1章\n【异口同声】“大家一起说！”\n', { chapterTitle: '第1章' })
+    assert.deepEqual(
+      s.lines.map((l) => l.text),
+      ['大家一起说！'],
+    )
+  })
+
+  it('extractSpeech 会跳过前导标记（供其它解析路径复用）', () => {
+    const r = extractSpeech('【异口同声】【A-龙套1】“台词”', 0)
+    assert.equal(r.quoted, true, '跳过标记后应当能识别出引号')
+    assert.equal(r.speech, '台词')
+  })
+})
+
+describe('画本脚本解析 · 台词的其它形态', () => {
   it('【角色-CV】“台词” → 角色行（去掉引号）', () => {
     const r = parseCanvasScript('【杨浩-嬉小天】“只有我才能帮助马竞保级！”')
     assert.equal(r.lines.length, 1)
@@ -289,3 +356,51 @@ describe('detectCanvasScript', () => {
     assert.equal(d.dialogueLines, 0)
   })
 })
+// ---------------------------------------------------------------------------
+// 真机样本：角色表列顺序/列数可变 + 说话人标记顺序相反
+// ---------------------------------------------------------------------------
+
+describe('角色表列可变 · 说话人标记消歧', () => {
+  it('6 列表头（无「性别」、顺序不同）也能整表识别，【CV-角色名】按表消歧', () => {
+    // 崛起香江样本：表头是「序号|CV|角色名|角色描述|台词数|音色」，且标记写成【CV-角色名】
+    const text = [
+      '第2201章 开篇',
+      '序号 | CV | 角色名 | 角色描述 | 台词数 | 音色',
+      '1 | 阿翼爱热闹 | 男龙套3 | 69',
+      '2 | 鱼头一颗糖 | 洪进宝 | 小胖子，武打明星洪金宝 | 34',
+      '【阿翼爱热闹-男龙套3】“扑你个街！”',
+    ].join('\n')
+    const r = parseCanvasScript(text)
+    assert.deepEqual(r.characters.map((c) => c.name), ['男龙套3', '洪进宝'])
+    assert.equal(r.characters[0]!.cv, '阿翼爱热闹')
+    // 表格行不能变成旁白
+    assert.deepEqual(r.lines.map((l) => l.text), ['第2201章 开篇', '扑你个街！'])
+    // 【CV-角色名】：说话人是角色名，CV 记进 cv
+    assert.equal(r.lines[1]!.speaker, '男龙套3')
+    assert.equal(r.lines[1]!.cv, '阿翼爱热闹')
+  })
+
+  it('角色表只在「前言」章时，逐章解析必须带 speakerContext（否则角色被建成 CV）', () => {
+    const chapterText = '【阿翼爱热闹-男龙套3】“扑你个街！”'
+    // 没有上下文：无从判断顺序，退回「角色名-CV」→ 左半边被当成角色（真机事故）
+    const without = parseCanvasScript(chapterText)
+    assert.equal(without.lines[0]!.speaker, '阿翼爱热闹')
+    // 带上从全书角色表汇总出来的上下文 → 正确解析成 角色=男龙套3 / CV=阿翼爱热闹
+    const ctx = speakerContextOf([{ name: '男龙套3', cv: '阿翼爱热闹' }])
+    const withCtx = parseCanvasScript(chapterText, { speakerContext: ctx })
+    assert.equal(withCtx.lines[0]!.speaker, '男龙套3')
+    assert.equal(withCtx.lines[0]!.cv, '阿翼爱热闹')
+  })
+
+  it('【角色名-CV】仍按原顺序解析（进球吧样本）', () => {
+    const text = [
+      '序号 | CV | 角色名 | 性别 | 角色描述 | 台词数 | 音色 | 年龄',
+      '1 | 嬉小天 | 杨浩 | 男 | 男主 | 1645 | 青叔音 | 25',
+      '【杨浩-嬉小天】“我来了。”',
+    ].join('\n')
+    const r = parseCanvasScript(text)
+    assert.equal(r.lines[0]!.speaker, '杨浩')
+    assert.equal(r.lines[0]!.cv, '嬉小天')
+  })
+})
+

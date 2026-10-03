@@ -72,6 +72,13 @@ export interface CanvasRepo {
    * 合并必须先拿到行 id 才能生成补丁（合并不是简单改一列，还要置 `decidedBy='human'`）。
    */
   listByCharacter(characterId: Id): Promise<CanvasLine[]>
+  /**
+   * 书中**全部旁白行**（`speaker_type='narration'`，`character_id` 恒为 null）。
+   *
+   * 为什么需要它：旁白在角色表里也有一个角色行（CV 绑定需要外键），
+   * 但旁白行的 `character_id` 是 null —— 按 `listByCharacter` 统计会永远得到 0 行。
+   */
+  listNarrationByBook(bookId: Id): Promise<CanvasLine[]>
   countByChapter(chapterId: Id): Promise<number>
   /** 人工确认过的行数（生成前提示「本章已有 N 行人工修改」，docs/11 §8） */
   countHumanDecided(chapterId: Id): Promise<number>
@@ -237,6 +244,13 @@ export function createMemoryCanvasRepo(seed?: { lines?: CanvasLine[]; now?: () =
     async listByCharacter(characterId) {
       return [...lines.values()]
         .filter((r) => r.deletedAt == null && r.line.characterId === characterId)
+        .map((r) => cloneLine(r.line))
+        .sort((a, b) => (a.chapterId === b.chapterId ? a.seq - b.seq : a.chapterId.localeCompare(b.chapterId)))
+    },
+
+    async listNarrationByBook(bookId) {
+      return [...lines.values()]
+        .filter((r) => r.deletedAt == null && r.line.bookId === bookId && r.line.speakerType === 'narration')
         .map((r) => cloneLine(r.line))
         .sort((a, b) => (a.chapterId === b.chapterId ? a.seq - b.seq : a.chapterId.localeCompare(b.chapterId)))
     },

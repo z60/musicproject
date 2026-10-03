@@ -21,7 +21,9 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import type { Take } from '@shared/types.ts'
+import { takeRangeDuration, takeSourceRange } from '@shared/audio/take-range.ts'
 import { mediaUrlWithCacheBust, segmentUrl } from '@/shared/lib/media-url.ts'
+import { playRange } from '@/shared/lib/media-element.ts'
 import { UNKNOWN, formatDate, formatDb, formatDuration, formatRelativeTime } from '@/shared/lib/format.ts'
 
 type CompareMode = 'side' | 'alternate' | 'split'
@@ -111,9 +113,20 @@ function syncVolumes(): void {
   if (audioB.value) audioB.value.volume = volumeB.value
 }
 
+/**
+ * 当前播放位置（**相对 take 起点**的毫秒）。
+ *
+ * 为什么要减 `range.startMs`：导入的 take 指向整段源文件，
+ * `<audio>.currentTime` 是**文件内**坐标（可能是第 739 秒），
+ * 而界面上的「时长/位置」是这一句自己的 0~N 秒（见 take-range.ts）。
+ */
 function currentPositionMs(): number {
-  const el = activeSide.value === 'a' ? audioA.value : audioB.value
-  return el ? el.currentTime * 1000 : positionMs.value
+  const side = activeSide.value
+  const el = side === 'a' ? audioA.value : audioB.value
+  if (!el) return positionMs.value
+  const take = side === 'a' ? takeA.value : takeB.value
+  const raw = el.currentTime * 1000
+  return take ? Math.max(0, raw - takeSourceRange(take).startMs) : raw
 }
 
 /** 切换模式：暂停 → 对齐位置 → 恢复（docs/12 §3.3 的「切换时保持播放位置」） */
@@ -137,11 +150,18 @@ function onModeInput(value: string | number | boolean | undefined): void {
   void changeMode(value as CompareMode)
 }
 
+/** 把「相对 take 起点的毫秒」落到两个元素上（元素坐标 = take 区间起点 + 相对位置） */
 function applyPosition(ms: number): void {
-  const seconds = Math.max(0, ms / 1000)
-  if (audioA.value) audioA.value.currentTime = Math.min(seconds, Math.max(0, (takeA.value?.durationMs ?? 0) / 1000))
-  if (audioB.value) audioB.value.currentTime = Math.min(seconds, Math.max(0, (takeB.value?.durationMs ?? 0) / 1000))
+  applySide(audioA.value, takeA.value, ms)
+  applySide(audioB.value, takeB.value, ms)
   positionMs.value = ms
+}
+
+function applySide(element: HTMLAudioElement | null, take: Take | null, ms: number): void {
+  if (!element || !take) return
+  const range = takeSourceRange(take)
+  const target = Math.min(range.startMs + Math.max(0, ms), Math.max(range.startMs, range.endMs - 1))
+  element.currentTime = target / 1000
 }
 
 function pauseAll(): void {
@@ -162,6 +182,14 @@ function stopTimers(): void {
   }
 }
 
+/** 播放某一侧的第 `ms` 毫秒（相对 take 起点）到区间终点 */
+async function startSide(element: HTMLAudioElement, take: Take | null, ms: number): Promise<void> {
+  if (!take) return
+  const range = takeSourceRange(take)
+  const target = Math.min(range.startMs + Math.max(0, ms), Math.max(range.startMs, range.endMs - 1))
+  await playRange(element, urlOf(take), target, range.endMs)
+}
+
 async function play(): Promise<void> {
   const elA = audioA.value
   const elB = audioB.value
@@ -170,15 +198,20 @@ async function play(): Promise<void> {
   if (context?.state === 'suspended') await context.resume().catch(() => undefined)
 
   playing.value = true
-  // 位置对齐：两轨从同一时间点开始，用户听到的才是「同一句」
+  // 位置对齐：两轨从同一时间点开始，用户听到的才是「同一句」。
+  // ★ 必须用 `playRange`（等元数据再 seek）：导入的 take 要跳过文件开头那几分钟，
+  //   设完 src 立刻赋 currentTime 会被浏览器忽略 —— 那正是「导入的音频放不出来」的原因之一。
   applyPosition(positionMs.value)
 
   if (mode.value === 'side' || mode.value === 'split') {
-    await Promise.allSettled([elA.play(), elB.play()])
+    await Promise.allSettled([
+      startSide(elA, takeA.value, positionMs.value),
+      startSide(elB, takeB.value, positionMs.value),
+    ])
     if (mode.value === 'side') activeSide.value = 'a'
   } else {
     activeSide.value = 'a'
-    await elA.play().catch(() => undefined)
+    await startSide(elA, takeA.value, positionMs.value).catch(() => undefined)
     switchTimer = setInterval(() => {
       void alternate()
     }, props.switchMs)
@@ -186,7 +219,12 @@ async function play(): Promise<void> {
 
   positionTimer = setInterval(() => {
     positionMs.value = currentPositionMs()
-    const duration = Math.max(takeA.value?.durationMs ?? 0, takeB.value?.durationMs ?? 0)
+    // 时长按「各自的 take 区间」算（`positionMs` 是相对量；导入的 take 指向整段源文件，
+    // 用 durationMs 之外的坐标会得到「永远播不完」）
+    const duration = Math.max(
+      takeA.value ? takeRangeDuration(takeA.value) : 0,
+      takeB.value ? takeRangeDuration(takeB.value) : 0,
+    )
     if (duration > 0 && positionMs.value >= duration) pauseAll()
   }, 100)
 }
@@ -200,9 +238,11 @@ async function alternate(): Promise<void> {
   elA.pause()
   elB.pause()
   activeSide.value = activeSide.value === 'a' ? 'b' : 'a'
-  const el = activeSide.value === 'a' ? elA : elB
-  el.currentTime = Math.max(0, position / 1000)
-  await el.play().catch(() => undefined)
+  const side = activeSide.value
+  const el = side === 'a' ? elA : elB
+  const take = side === 'a' ? takeA.value : takeB.value
+  // 换到另一轨的同一位置：位置是「相对 take 起点」的，元素坐标要各自加上区间起点
+  await startSide(el, take, position).catch(() => undefined)
 }
 
 function close(): void {

@@ -28,6 +28,11 @@ import type {
   ArrangementValidation,
   AudioDeviceInfo,
   AudioFormat,
+  AudioImportApplyResult,
+  AudioImportCandidate,
+  AudioImportCanvasScan,
+  AudioImportFileRequest,
+  AudioImportPlan,
   AudioMetrics,
   Book,
   CanvasGenerateOptions,
@@ -116,6 +121,13 @@ export interface IpcContract {
   'app:getInfo': { req: NoReq; res: AppInfo }
   'app:getPaths': { req: NoReq; res: AppPaths }
   'app:getCapabilities': { req: NoReq; res: AppCapabilities }
+  /**
+   * 重新探测能力（ffmpeg / 模型 / embedding），**会真的 spawn 进程**，因此与
+   * `app:getCapabilities`（廉价读快照）分开：设置页的「重新探测」按钮走这一条，
+   * 用户改了 ffmpeg 路径或放了模型之后不必重启应用。
+   * 完成后主进程会广播 `app:capabilitiesChanged`。
+   */
+  'app:refreshCapabilities': { req: NoReq; res: AppCapabilities }
   'app:openExternal': { req: { url: string }; res: { ok: boolean } }
   'app:showItemInFolder': { req: { path: string }; res: { ok: boolean } }
   'app:openFolderDialog': { req: { title?: string; defaultPath?: string }; res: { path: string | null } }
@@ -189,6 +201,12 @@ export interface IpcContract {
 
   // ── 画本 ──────────────────────────────────────────────────────────────────
   'canvas:generate': { req: { chapterId: Id; options: CanvasGenerateOptions }; res: { taskId: Id } }
+  /**
+   * 批量生成画本：**一条任务**跑完 N 章（章节管理的「批量生成画本」用它，
+   * 而不是逐章调 `canvas:generate` —— 否则会产生 N 条任务与 N 张进度卡）。
+   * 所有 chapterIds 必须属于同一本书。
+   */
+  'canvas:generateBatch': { req: { chapterIds: Id[]; options: CanvasGenerateOptions }; res: { taskId: Id } }
   'canvas:getGenerateReport': { req: { chapterId: Id }; res: CanvasGenerateReport | null }
   'canvas:getChapter': {
     req: {
@@ -234,6 +252,20 @@ export interface IpcContract {
   'voiceActor:unbind': { req: { characterId: Id; actorId: Id }; res: { ok: boolean } }
   'voiceActor:workload': { req: { bookId: Id }; res: ActorWorkload[] }
   'voiceActor:bindings': { req: { bookId: Id }; res: Array<{ characterId: Id; actorId: Id; isPrimary: boolean }> }
+  /**
+   * 从画本备注里的 `CV：xxx` 反向补齐配音员（角色表 → CV 表的数据来源）。
+   *
+   * 为什么需要它：`Character` 没有独立 CV 列，画本导入把 CV 写进 `note`
+   * （`CV：阿翼爱热闹｜音色：…`）。不补齐的话 CV 表永远是空的 ——
+   * 用户要点开「CV 表」看到的是一片空白，却没有任何入口把它填上。
+   *
+   * 幂等：已绑定的（角色, 配音员）不会重复绑定；`force` 省略时为**自动模式**，
+   * 只在这个项目从未自动同步过时执行（每次加载都重绑会撤销用户的解绑操作）。
+   */
+  'voiceActor:syncFromCanvas': {
+    req: { bookId: Id; force?: boolean }
+    res: { createdActors: number; boundCharacters: number; matchedCharacters: number; skipped: boolean }
+  }
 
   // ── 录音 ──────────────────────────────────────────────────────────────────
   'record:prepare': {
@@ -254,6 +286,56 @@ export interface IpcContract {
   'record:matchSlices': { req: { sessionId: Id; chapterId: Id; slices: VadSlice[]; useAsr?: boolean }; res: { matches: SliceMatch[]; unmatchedSlices: number[]; unrecordedLines: Id[] } }
   'record:acceptSlices': { req: { sessionId: Id; accepted: SliceMatch[] }; res: { createdTakes: number; createdSegments: number } }
   'record:optimizeTrim': { req: { takeId: Id; options: TrimOptions }; res: { trimmedInMs: number; trimmedOutMs: number } }
+
+  // ── 按说话人导入音频（docs/12 录音域、docs/91 §5.2.49）──────────────────────
+  // 刻意分成「扫描 → 规划 → 执行」三步，而不是一个「一把梭」的通道：
+  //   · 扫描与规划**不写库**，用户可以先看清「哪个文件会导入多少行」再决定
+  //   · 执行需要显式 `confirm: true` —— 写库是不可逆动作，
+  //     不该因为一次误触就发生
+  /**
+   * 扫描画本。**`canvasPath` 可省略**：省略时直接用数据库里已导入的画本
+   *（章节 / canvas_lines / characters）—— 音频导入不再要求用户再选一次画本文件。
+   */
+  'record:importScanCanvas': { req: { projectId: Id; bookId: Id; canvasPath?: string }; res: AudioImportCanvasScan }
+  'record:importScanFiles': { req: { dir: string; recursive?: boolean }; res: AudioImportCandidate[] }
+  'record:importPlan': {
+    /** `canvasPath` 省略 = 用数据库里已导入的画本（见 `record:importScanCanvas`） */
+    req: { projectId: Id; bookId: Id; canvasPath?: string; files: AudioImportFileRequest[] }
+    res: { plan: AudioImportPlan; scan: AudioImportCanvasScan }
+  }
+  /**
+   * 把「按说话人导入」交给**后台任务**（返回 taskId，结果由 `task:result` 取）。
+   *
+   * 为什么要任务：一个文件要「解码 → 逐帧能量 → VAD → 铺满每行」，几十个文件是几分钟；
+   * 同步做会让渲染进程一直转圈、用户不能离开向导（真机需求）。
+   */
+  'record:importStart': {
+    req: {
+      projectId: Id
+      bookId: Id
+      canvasPath?: string
+      files: AudioImportFileRequest[]
+      onlyFiles?: string[]
+      skipNeedsReview?: boolean
+      confirm: true
+    }
+    res: { taskId: Id }
+  }
+  'record:importApply': {
+    req: {
+      projectId: Id
+      bookId: Id
+      /** 省略 = 用数据库里已导入的画本 */
+      canvasPath?: string
+      files: AudioImportFileRequest[]
+      /** 只导入这些文件名；不传 = 全部就绪的 */
+      onlyFiles?: string[]
+      skipNeedsReview?: boolean
+      /** 必须是 `true` 才写库（防误触碰） */
+      confirm: boolean
+    }
+    res: AudioImportApplyResult
+  }
 
   'device:list': { req: NoReq; res: { devices: AudioDeviceInfo[]; preferred: string | null } }
   'device:savePreference': { req: { deviceId: string; label: string }; res: { ok: boolean } }
@@ -447,7 +529,7 @@ export type IpcSendPayload<S extends IpcSendName> = IpcSendMap[S]
  * tests 里有契约完整性测试比对两者（新增通道忘了登记会红）。
  */
 export const IPC_CHANNELS = [
-  'app:getInfo', 'app:getPaths', 'app:getCapabilities', 'app:openExternal',
+  'app:getInfo', 'app:getPaths', 'app:getCapabilities', 'app:refreshCapabilities', 'app:openExternal',
   'app:showItemInFolder', 'app:openFolderDialog', 'app:openFileDialog', 'app:saveFileDialog',
   'app:diagnostics', 'app:quit',
 
@@ -459,7 +541,7 @@ export const IPC_CHANNELS = [
   'chapter:list', 'chapter:get', 'chapter:update', 'chapter:reorder', 'chapter:merge',
   'chapter:split', 'chapter:delete', 'chapter:stats', 'chapter:inserTitleLine',
 
-  'canvas:generate', 'canvas:getGenerateReport', 'canvas:getChapter', 'canvas:getLine',
+  'canvas:generate', 'canvas:generateBatch', 'canvas:getGenerateReport', 'canvas:getChapter', 'canvas:getLine',
   'canvas:updateLine', 'canvas:batchUpdate', 'canvas:recomputeAttribution',
   'canvas:qualityCheck', 'canvas:snapshotCreate', 'canvas:insertLines',
   'canvas:deleteLine', 'canvas:exportText',
@@ -468,11 +550,13 @@ export const IPC_CHANNELS = [
   'character:extract', 'character:stats', 'character:rebuildCentroid',
 
   'voiceActor:list', 'voiceActor:upsert', 'voiceActor:delete', 'voiceActor:bind',
-  'voiceActor:unbind', 'voiceActor:workload', 'voiceActor:bindings',
+  'voiceActor:unbind', 'voiceActor:workload', 'voiceActor:bindings', 'voiceActor:syncFromCanvas',
 
   'record:prepare', 'record:attachPort', 'record:start', 'record:pause', 'record:resume',
   'record:stop', 'record:abort', 'record:punchIn', 'record:slice', 'record:matchSlices',
   'record:acceptSlices', 'record:optimizeTrim',
+  'record:importScanCanvas', 'record:importScanFiles', 'record:importPlan', 'record:importApply',
+  'record:importStart',
 
   'device:list', 'device:savePreference', 'device:selfTestResult',
 

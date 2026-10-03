@@ -159,7 +159,11 @@ export interface SafeStorageLike {
 }
 
 export interface ProtocolLike {
-  handle(scheme: string, handler: (request: { url: string }) => Promise<unknown> | unknown): void
+  /**
+   * 注册自定义协议 handler。`request.headers` 必须能被读到 ——
+   * `<audio>` 播放/拖动进度条会发 `Range` 请求，不读它就无法返回 206。
+   */
+  handle(scheme: string, handler: (request: { url: string; headers?: { get(name: string): string | null } }) => Promise<unknown> | unknown): void
   registerSchemesAsPrivileged(schemes: unknown[]): void
 }
 

@@ -46,6 +46,7 @@
     "check:template-types": "node --experimental-strip-types scripts/strip-template-types.ts --check",
     "fix:template-types": "node --experimental-strip-types scripts/strip-template-types.ts --write",
     "check:coverage": "node --experimental-strip-types scripts/check-coverage.ts",
+    "verify:import-sample": "node --experimental-strip-types scripts/verify-audio-import-sample.ts",
     "check:coverage:strict": "node --experimental-strip-types scripts/check-coverage.ts --strict",
     "fix:imports": "node --experimental-strip-types scripts/fix-relative-imports.ts --write",
     "fix:imports:check": "node --experimental-strip-types scripts/fix-relative-imports.ts --check",

@@ -19,8 +19,12 @@
  *     在这里抛会让「按退出码分支」的测试与重试逻辑无处安放。
  *   · **ffmpeg 路径由调用方给**：主进程启动时探测过一次（`capabilities.ffmpeg`），
  *     未探到时用 `'ffmpeg'` 交给 PATH —— 而不是硬编码一个绝对路径。
+ *   · **`ffmpeg` 与 `ffprobe` 分开解析**（见 `execute` 里的分派）：两者是不同的可执行文件，
+ *     把 `'ffprobe'` 也换成 ffmpeg 路径会让 ffprobe 的参数跑在 ffmpeg 上，
+ *     结果是一条永远失败、却只在真机上暴露的链路。
  */
 
+import { existsSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 
 import type {
@@ -38,6 +42,11 @@ export const KILL_GRACE_MS = 2000
 export interface CreateFfmpegRunnerOptions {
   /** ffmpeg 可执行文件路径（默认 `'ffmpeg'`，交给 PATH） */
   ffmpegPath?: () => string
+  /**
+   * ffprobe 可执行文件路径（默认 `'ffprobe'`，交给 PATH）。
+   * 生产装配用 `paths.ts` 的 `ffprobePathFor(capabilities.ffmpeg.path)` 与 ffmpeg 同目录派生。
+   */
+  ffprobePath?: () => string
   /** 默认超时（毫秒）；不传则不设超时（长任务如整本导出由调用方显式给） */
   defaultTimeoutMs?: number
   log?: {
@@ -48,9 +57,39 @@ export interface CreateFfmpegRunnerOptions {
 
 export function createFfmpegRunner(opts?: CreateFfmpegRunnerOptions): FfmpegRunner {
   const resolvePath = opts?.ffmpegPath ?? (() => 'ffmpeg')
+  const resolveProbe = opts?.ffprobePath ?? (() => 'ffprobe')
+
+  /**
+   * 解析 ffprobe 路径；**派生出来的路径不存在时退回 PATH 的 `ffprobe`**。
+   *
+   * 为什么要有这一步：有些人的 ffmpeg 是手动从别处拷来的单个 exe（目录里没有 ffprobe），
+   * 这时派生路径会 ENOENT，而 `spawn` 的 ENOENT 是**上抛**的 —— 上层只会看到一个
+   * 「进程起不来」。退回 PATH 至少给系统装的 ffprobe 一个机会。
+   *
+   * 缓存按「候选路径」为键（不是全局一次）：用户在设置里换了 ffmpeg 路径后，
+   * 候选变了会重新判定，不会拿着上一次的答案不放。同一条路径重复执行只 stat 一次，也就不会重复刷日志。
+   */
+  let probeCache: { key: string; path: string } | null = null
+  function resolveProbePath(): string {
+    const candidate = resolveProbe()
+    if (candidate === 'ffprobe') return candidate
+    if (probeCache && probeCache.key === candidate) return probeCache.path
+    const missing = !existsSync(candidate)
+    if (missing) {
+      // 派生路径不存在：如实记一条，别让「ffprobe 悄悄跑到了 PATH 上的另一个版本」无从查起
+      opts?.log?.warn?.('ffprobe.derivedPathMissing', {
+        event: 'ffprobe.derivedPathMissing',
+        hint: 'ffprobe-not-next-to-ffmpeg',
+      })
+    }
+    const path = missing ? 'ffprobe' : candidate
+    probeCache = { key: candidate, path }
+    return path
+  }
 
   async function probeCapabilities(): Promise<{ version: string | null; filters: string[]; encoders: string[] }> {
-    // 能力探测的真实实现在启动期（`bootstrap-steps` 的 probeFfmpeg），它会填进 capabilities。
+    // 能力探测的真实实现在 `../capabilities.ts` 的 probeFfmpeg（启动期与设置页的
+    // 「重新探测」共用），它会填进 capabilities。
     // 这里显式声明「没实现」，而不是返回空数组假装探测过（空数组意味着「一个滤镜都不支持」，
     // 那会让 UI 判定 ffmpeg 不可用）。
     return { version: null, filters: [], encoders: [] }
@@ -59,14 +98,19 @@ export function createFfmpegRunner(opts?: CreateFfmpegRunnerOptions): FfmpegRunn
   /**
    * 执行一条命令。
    *
-   * @param command 完整命令数组（第一项是 ffmpeg 路径；由 `build*Command` 产出）
-   * @throws 只在「进程根本起不来」时抛（ENOENT = ffmpeg 未安装）
+   * @param command 完整命令数组（第一项是 `'ffmpeg'` / `'ffprobe'` 或直接是路径；由 `build*Command` 产出）
+   * @throws 只在「进程根本起不来」时抛（ENOENT = 二进制不存在）
    */
   async function execute(command: string[], executeOpts?: FfmpegExecuteOptions): Promise<FfmpegExecuteResult> {
     const started = Date.now()
-    // 命令数组里第一项可能是 'ffmpeg'；调用方显式给了路径时优先用调用方的
+    // 命令数组第一项可能是 'ffmpeg' 或 'ffprobe'；调用方显式给了路径时优先用调用方的。
+    // ★ 两者**必须分开解析**（曾经把 'ffprobe' 也换成 ffmpeg 路径）：那会让 ffprobe 的
+    //   `-print_format json` 落到 ffmpeg 上，得到 `Unrecognized option 'print_format'`。
+    //   而单测只断言 `cmd[0] === 'ffprobe'`（命令构建层是对的），这层替换看不见，
+    //   于是「M4B 验收」「导入时长探测」在装了 ffmpeg 的真机上一直是坏的。
     const argv = [...command]
-    if (argv[0] === 'ffmpeg' || argv[0] === 'ffprobe') argv[0] = resolvePath()
+    if (argv[0] === 'ffmpeg') argv[0] = resolvePath()
+    else if (argv[0] === 'ffprobe') argv[0] = resolveProbePath()
 
     const timeoutMs = executeOpts?.timeoutMs ?? opts?.defaultTimeoutMs ?? 0
     const signal = executeOpts?.signal

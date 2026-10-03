@@ -65,26 +65,61 @@ const QUOTE_CLOSE: Record<string, string> = {
 
 /**
  * 从 from 起取一段台词。
- * 有引号就取到闭合引号（没有闭合就取到行尾）；没有引号就取到下一个【或行尾。
+ *
+ * ### 规则
+ *   1. 跳过空白
+ *   2. **跳过连续出现的 `【…】` 标记** —— 见下面「为什么」
+ *   3. 有引号就取到闭合引号（没有闭合就取到行尾）
+ *   4. 仍然没有引号，就取到下一个 `【` 或行尾
+ *
+ * ### 为什么第 2 步是必须的（真实缺陷）
+ *   真实画本里有这样的行：
+ *
+ *   ```
+ *   【异口同声】【阡陌丨平凡-男龙套 3】“对！哈哈哈！”【异口同声】【鱼头一颗糖-男龙套2】“对！哈哈哈！”…
+ *   ```
+ *
+ *   `【异口同声】` 是个**群白标记**：它不含 `-`（所以 `looksLikeSpeakerTag` 不认它），
+ *   而它后面紧跟的是**另一个 `【`** 而不是引号（所以 `quotedAfter` 也是 false）。
+ *   于是旧逻辑走到「取到下一个 `【` 或行尾」这条分支，取到**空串**，
+ *   而调用方拿这个空串去做 `pushNarration` —— 结果把 `【异口同声】` 这个**标记本身**
+ *   落成了一条旁白行。
+ *
+ *   一条这样的源行会因此多出 3 条 `【异口同声】` 旁白行（实测），
+ *   界面上看起来就是「凭空多出来几行旁白」。
+ *
+ *   跳掉这些前导标记之后，`probe.quoted` 就能正确反映「后面确实有引号台词」，
+ *   调用方也就能把它当成**群白台词**处理，而不是一条垃圾旁白。
+ *
+ * @returns `speech` 已去空白；`start` 是台词在原文里的起始位置（跳标记之后）
  */
 export function extractSpeech(
   text: string,
   from: number,
-): { speech: string; end: number; quoted: boolean } {
+): { speech: string; end: number; quoted: boolean; start: number } {
   let i = from
-  while (i < text.length && /\s/.test(text[i] ?? '')) i++
+  // 跳过空白与连续的【…】标记（只跳「整块标记」，不会吃掉正常文字）
+  for (;;) {
+    while (i < text.length && /\s/.test(text[i] ?? '')) i++
+    if (text[i] !== '【') break
+    const closeIdx = text.indexOf('】', i + 1)
+    if (closeIdx < 0) break // 没闭合的【：不再跳，交给下面的分支
+    i = closeIdx + 1
+  }
+  const start = i
+
   const open = text[i]
   const close = open === undefined ? undefined : QUOTE_CLOSE[open]
   if (open !== undefined && close !== undefined) {
     const closeIdx = text.indexOf(close, i + 1)
     if (closeIdx >= 0) {
-      return { speech: text.slice(i + 1, closeIdx).trim(), end: closeIdx + 1, quoted: true }
+      return { speech: text.slice(i + 1, closeIdx).trim(), end: closeIdx + 1, quoted: true, start }
     }
-    return { speech: text.slice(i + 1).trim(), end: text.length, quoted: true }
+    return { speech: text.slice(i + 1).trim(), end: text.length, quoted: true, start }
   }
   const nextTag = text.indexOf('【', i)
   const end = nextTag >= 0 ? nextTag : text.length
-  return { speech: text.slice(i, end).trim(), end, quoted: false }
+  return { speech: text.slice(i, end).trim(), end, quoted: false, start }
 }
 
 /** 一个【…】是不是说话人标记：含 -（角色-CV）或后面紧跟引号 */
@@ -121,18 +156,126 @@ export function splitCanvasTableRow(line: string): string[] | null {
   return cells.length >= 2 ? cells : null
 }
 
+/** 角色表的列位置（按**表头文字**定位，列顺序与列数都可变） */
+export interface CharacterTableColumns {
+  idx: number | null
+  cv: number | null
+  name: number | null
+  gender: number | null
+  description: number | null
+  lineCount: number | null
+  voice: number | null
+  age: number | null
+}
+
+/** 表头文字 → 列语义（真机样本里列顺序/列数都不一样，只能按文字认） */
+const COLUMN_LABELS: Array<{ key: keyof CharacterTableColumns; labels: readonly string[] }> = [
+  { key: 'idx', labels: ['序号'] },
+  { key: 'cv', labels: ['CV', 'cv', '配音员', '配音'] },
+  { key: 'name', labels: ['角色名', '角色', '人物', '姓名'] },
+  { key: 'gender', labels: ['性别'] },
+  { key: 'description', labels: ['角色描述', '描述'] },
+  { key: 'lineCount', labels: ['台词数', '台词'] },
+  { key: 'voice', labels: ['音色'] },
+  { key: 'age', labels: ['年龄'] },
+]
+
 /**
- * 是否是角色表表头。
- * 只校验**前 6 列前缀**（序号 / CV / 角色名 / 性别 / 角色描述 / 台词数）：
- * 空列被丢掉时，表头可能只剩 6 列（音色、年龄没了），按整体 8 列校验会整张漏掉。
+ * 按**表头文字**解析列位置。
+ *
+ * 真机样本列数/顺序都不同：
+ *   · `序号 | CV | 角色名 | 性别 | 角色描述 | 台词数 | 音色 | 年龄`（8 列，进球吧）
+ *   · `序号 | CV | 角色名 | 角色描述 | 台词数 | 音色`（**没有性别**，6 列，崛起香江）
+ * 只要认得 CV 与角色名两列就够（其余列缺失时对应字段为 null）。
  */
-export function isCanvasTableHeader(cells: readonly string[]): boolean {
-  const required = CANVAS_CHARACTER_TABLE_HEADER.slice(0, 6)
-  if (cells.length < required.length) return false
-  for (let k = 0; k < required.length; k++) {
-    if (cells[k] !== required[k]) return false
+export function mapCharacterColumns(cells: readonly string[]): CharacterTableColumns | null {
+  const norm = cells.map((c) => (c ?? '').trim())
+  const out: CharacterTableColumns = {
+    idx: null, cv: null, name: null, gender: null, description: null, lineCount: null, voice: null, age: null,
   }
-  return true
+  for (const { key, labels } of COLUMN_LABELS) {
+    const at = norm.findIndex((c) => c.length > 0 && labels.some((l) => c === l))
+    if (at >= 0) out[key] = at
+  }
+  // 至少要能定位「CV」与「角色名」，否则不是角色表头（避免把普通含 | 的正文当表）
+  if (out.cv === null || out.name === null) return null
+  return out
+}
+
+/** 固定 8 列形态（「每格一行」）的列位置 */
+const FIXED_COLUMNS: CharacterTableColumns = {
+  idx: 0, cv: 1, name: 2, gender: 3, description: 4, lineCount: 5, voice: 6, age: 7,
+}
+
+/** 是否是角色表表头（按列名识别，不要求固定列数/顺序） */
+export function isCanvasTableHeader(cells: readonly string[]): boolean {
+  return mapCharacterColumns(cells) !== null
+}
+
+/** 角色表：CV 集合与角色名集合，用于判定【A-B】里哪边是角色 */
+export interface SpeakerTableContext {
+  cvSet: ReadonlySet<string>
+  roleSet: ReadonlySet<string>
+}
+
+/**
+ * 解析说话人标记 `【A-B】`。
+ *
+ * ⚠️ **两份真机样本的顺序是相反的**：
+ *   · 进球吧：`【杨浩-嬉小天】` → 角色名-CV（表里 CV=嬉小天）
+ *   · 崛起香江：`【阿翼爱热闹-男龙套3】` → **CV-角色名**（表里 CV=阿翼爱热闹）
+ * 所以不能写死顺序，要用**角色表**判断哪边是 CV、哪边是角色名；
+ * 表里都查不到时（纯台词书没有角色表）沿用既有假设「角色名-CV名」。
+ */
+/**
+ * 由一批角色（可来自多章的角色表）汇总出说话人消歧上下文。
+ *
+ * ⚠️ 逐章解析时**必须**先把全书的角色表汇总再传进 `parseCanvasScript`：
+ * 真机样本的角色表只在全书最前面的「前言」章里，逐章解析时其它章根本没有表，
+ * `【CV-角色】` 的顺序无从判断，角色会被建成 CV。
+ */
+export function speakerContextOf(
+  characters: Iterable<{ name: string; cv: string | null }>,
+): SpeakerTableContext {
+  const cvSet = new Set<string>()
+  const roleSet = new Set<string>()
+  for (const c of characters) {
+    roleSet.add(c.name)
+    if (c.cv) cvSet.add(c.cv)
+  }
+  return { cvSet, roleSet }
+}
+
+export function resolveSpeakerTag(
+  tag: string,
+  ctx: SpeakerTableContext,
+): { speaker: string; cv: string | null } {
+  const dash = tag.indexOf('-')
+  if (dash < 0) return { speaker: tag.trim(), cv: null }
+  const a = tag.slice(0, dash).trim()
+  const b = tag.slice(dash + 1).trim()
+  if (a.length === 0) return { speaker: b, cv: null }
+  if (b.length === 0) return { speaker: a, cv: null }
+
+  const aCv = ctx.cvSet.has(a)
+  const bCv = ctx.cvSet.has(b)
+  const aRole = ctx.roleSet.has(a)
+  const bRole = ctx.roleSet.has(b)
+
+  // ① 一边是 CV、另一边是角色名 → 角色名当说话人，CV 记进 cv
+  if (bRole && !aRole && !aCv) return { speaker: b, cv: a } // 【CV-角色】
+  if (aRole && !bRole && !bCv) return { speaker: a, cv: b } // 【角色-CV】
+
+  // ② 只有一边在角色表出现 → 它就是角色名
+  if (aRole && !bRole) return { speaker: a, cv: b }
+  if (bRole && !aRole) return { speaker: b, cv: a }
+
+  // ③ 只有一边是 CV → 另一边就是角色名
+  if (aCv && !bCv) return { speaker: b, cv: a }
+  if (bCv && !aCv) return { speaker: a, cv: b }
+
+  // ④ 表里查不到：沿用「角色名-CV名」
+  return { speaker: a, cv: b }
 }
 
 /** 表头是否从第 i 行开始（每格一行的形态） */
@@ -153,19 +296,29 @@ function cellTableEnd(lines: readonly string[], start: number): number {
   return i
 }
 
-/** 8 个单元格 → 角色（角色名为空则丢弃） */
-function pushCharacter(cells: readonly string[], out: CanvasScriptCharacter[]): void {
-  const name = (cells[2] ?? '').trim()
+/** 一行单元格 → 角色（按列位置取值；角色名为空则丢弃） */
+function pushCharacter(
+  cells: readonly string[],
+  out: CanvasScriptCharacter[],
+  cols: CharacterTableColumns,
+): void {
+  const cell = (k: number | null): string => (k === null ? '' : (cells[k] ?? '').trim())
+  const name = cell(cols.name)
   if (name.length === 0) return
-  const cell = (k: number): string => (cells[k] ?? '').trim()
+  const cv = cell(cols.cv)
+  const gender = cell(cols.gender)
+  const description = cell(cols.description)
+  const lineCount = cell(cols.lineCount)
+  const voice = cell(cols.voice)
+  const age = cell(cols.age)
   out.push({
     name,
-    cv: cell(1).length > 0 ? cell(1) : null,
-    gender: cell(3).length > 0 ? cell(3) : null,
-    description: cell(4).length > 0 ? cell(4) : null,
-    lineCountText: cell(5).length > 0 ? cell(5) : null,
-    voiceType: cell(6).length > 0 ? cell(6) : null,
-    ageText: cell(7).length > 0 ? cell(7) : null,
+    cv: cv.length > 0 ? cv : null,
+    gender: gender.length > 0 ? gender : null,
+    description: description.length > 0 ? description : null,
+    lineCountText: lineCount.length > 0 ? lineCount : null,
+    voiceType: voice.length > 0 ? voice : null,
+    ageText: age.length > 0 ? age : null,
   })
 }
 
@@ -176,7 +329,7 @@ function scanCellTable(lines: readonly string[], start: number, out: CanvasScrip
     const cells = Array.from({ length: CANVAS_CHARACTER_TABLE_HEADER.length }, (_, k) =>
       (lines[i + k] ?? '').trim(),
     )
-    pushCharacter(cells, out)
+    pushCharacter(cells, out, FIXED_COLUMNS)
   }
   return end
 }
@@ -193,40 +346,80 @@ function scanCellTable(lines: readonly string[], start: number, out: CanvasScrip
  *
  * 失败语义：**不抛异常**。解析不出来就当普通旁白。
  */
+export interface ParseCanvasOptions {
+  chapterTitle?: string
+  /**
+   * 全书角色表上下文（由 `speakerContextOf` 从各章角色表汇总）。
+   * 逐章解析时**必须**传，否则 `【CV-角色】` 的顺序无法判断。
+   */
+  speakerContext?: SpeakerTableContext
+}
+
 export function parseCanvasScript(
   text: string,
-  options: { chapterTitle?: string } = {},
+  options: ParseCanvasOptions = {},
 ): CanvasScriptChapter {
   const lines = normalizeNewlines(text).split('\n')
   const outLines: CanvasScriptLine[] = []
   const characters: CanvasScriptCharacter[] = []
+  /** 角色表占用的行（第二遍要跳过，否则表格数据会变成旁白） */
+  const tableLines = new Set<number>()
 
+  // ── Pass 1：先把**角色表**整表收掉 ──────────────────────────────────────
+  //    为什么必须先扫一遍：说话人标记是【A-B】，哪边是 CV 要看角色表——
+  //    真机两份样本的顺序**相反**（进球吧=角色-CV，崛起香江=CV-角色），
+  //    没有表就无法判断。表通常在章末或前言，可能在台词之后。
+  {
+    let k = 0
+    while (k < lines.length) {
+      const t = (lines[k] ?? '').trim()
+      // 形态一：每格一行（固定 8 列）
+      if (t === CANVAS_CHARACTER_TABLE_HEADER[0] && isCellHeaderAt(lines, k)) {
+        const end = scanCellTable(lines, k, characters)
+        for (let x = k; x < end; x++) tableLines.add(x)
+        k = end
+        continue
+      }
+      // 形态二：整行 pipe（按列名识别，列数/顺序可变）
+      const header = splitCanvasTableRow(t)
+      const cols = header ? mapCharacterColumns(header) : null
+      if (header && cols) {
+        let j = k + 1
+        while (j < lines.length) {
+          const row = splitCanvasTableRow((lines[j] ?? '').trim())
+          if (!row) break
+          const first = row[cols.idx ?? 0] ?? ''
+          if (!/^\d+$/.test(first)) break
+          pushCharacter(row, characters, cols)
+          j++
+        }
+        for (let x = k; x < j; x++) tableLines.add(x)
+        k = j
+        continue
+      }
+      k++
+    }
+  }
+
+  /** 角色表 → 说话人标记消歧（调用方给的**全书**上下文 + 本章自己的表） */
+  const cvSet = new Set<string>(options.speakerContext?.cvSet ?? [])
+  const roleSet = new Set<string>(options.speakerContext?.roleSet ?? [])
+  for (const c of characters) {
+    roleSet.add(c.name)
+    if (c.cv) cvSet.add(c.cv)
+  }
+  const tagContext: SpeakerTableContext = { cvSet, roleSet }
+
+  // ── Pass 2：逐行解析（跳过角色表行）──────────────────────────────────────
   let offset = 0
   let i = 0
   while (i < lines.length) {
     const raw = lines[i] ?? ''
     const trimmed = raw.trim()
 
-    // 表格形态一：每格一行
-    if (trimmed === CANVAS_CHARACTER_TABLE_HEADER[0] && isCellHeaderAt(lines, i)) {
-      const end = scanCellTable(lines, i, characters)
-      for (let k = i; k < end; k++) offset += (lines[k] ?? '').length + 1
-      i = end
-      continue
-    }
-
-    // 表格形态二：整行 pipe 连接
-    const firstRow = splitCanvasTableRow(trimmed)
-    if (firstRow && isCanvasTableHeader(firstRow)) {
-      let j = i + 1
-      while (j < lines.length) {
-        const row = splitCanvasTableRow((lines[j] ?? '').trim())
-        if (!row || !/^\d+$/.test(row[0] ?? '')) break
-        pushCharacter(row, characters)
-        j++
-      }
-      for (let k = i; k < j; k++) offset += (lines[k] ?? '').length + 1
-      i = j
+    if (tableLines.has(i)) {
+      offset += raw.length + 1
+      i++
       continue
     }
 
@@ -264,7 +457,7 @@ export function parseCanvasScript(
         const note = onlyParenthetical(before)
         if (note === null) pushNarration(before, cursor)
 
-        const { speaker, cv } = splitSpeakerTag(tag)
+        const { speaker, cv } = resolveSpeakerTag(tag, tagContext)
         if (speaker.length > 0 && probe.speech.length > 0) {
           outLines.push({
             speaker,
@@ -342,13 +535,16 @@ export function blankCanvasCharacterTables(text: string): string {
       continue
     }
 
-    // 形态二：整行 pipe 连接（列数不固定，见 splitCanvasTableRow 说明）
+    // 形态二：整行 pipe 连接（列数/顺序不固定，按列名识别）
     const pipe = splitCanvasTableRow(trimmed)
-    if (pipe && isCanvasTableHeader(pipe)) {
+    const pipeCols = pipe ? mapCharacterColumns(pipe) : null
+    if (pipe && pipeCols) {
       let j = i + 1
       while (j < lines.length) {
         const row = splitCanvasTableRow((lines[j] ?? '').trim())
-        if (!row || !/^\d+$/.test(row[0] ?? '')) break
+        if (!row) break
+        const first = row[pipeCols.idx ?? 0] ?? ''
+        if (!/^\d+$/.test(first)) break
         j++
       }
       for (let k = i; k < j; k++) blank(k)
@@ -404,11 +600,14 @@ export function detectCanvasScript(text: string): CanvasScriptDetection {
     }
 
     const pipeCells = splitCanvasTableRow(trimmed)
-    if (pipeCells && isCanvasTableHeader(pipeCells)) {
+    const pipeCols = pipeCells ? mapCharacterColumns(pipeCells) : null
+    if (pipeCells && pipeCols) {
       let j = i + 1
       while (j < lines.length) {
         const row = splitCanvasTableRow((lines[j] ?? '').trim())
-        if (!row || !/^\d+$/.test(row[0] ?? '')) break
+        if (!row) break
+        const first = row[pipeCols.idx ?? 0] ?? ''
+        if (!/^\d+$/.test(first)) break
         characterRows++
         j++
       }

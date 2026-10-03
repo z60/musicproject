@@ -26,6 +26,7 @@ import {
   PORTABLE_DATA_DIR,
   PORTABLE_MARKER,
   ffmpegCandidates,
+  ffprobePathFor,
   isPortableLayout,
   resolveAppPaths,
 } from '../../src/main/paths.ts'
@@ -146,6 +147,25 @@ describe('路径解析', () => {
   it('Windows 下候选带 .exe 后缀（否则永远探测不到随包的 ffmpeg）', () => {
     const c = ffmpegCandidates({ paths: { resourceDir: 'C:\\app\\resources' }, platform: 'win32' })
     assert.equal(c[0], 'C:\\app\\resources\\bin\\ffmpeg.exe')
+  })
+
+  it('ffprobe 从 ffmpeg 同目录派生（不单独探测）', () => {
+    assert.equal(
+      ffprobePathFor('C:\\repo\\resources\\bin\\ffmpeg.exe', 'win32'),
+      'C:\\repo\\resources\\bin\\ffprobe.exe',
+    )
+    // 期望值用 join 算：`join` 的分隔符跟随**当前平台**（测试跑在 Windows 上就是反斜杠），
+    // 与 ffmpegCandidates 的既有断言同一写法
+    assert.equal(ffprobePathFor('/repo/resources/bin/ffmpeg', 'linux'), join('/repo/resources/bin', 'ffprobe'))
+  })
+
+  it('ffprobe 派生：裸名字与空值都交给 PATH，不能变成 .\\ffprobe.exe', () => {
+    // 裸名字的语义是「PATH 上找」；对它做 dirname 会拼出「当前工作目录」，
+    // 那是完全不同的语义 —— 也正是 runner 里最容易写错的一处。
+    assert.equal(ffprobePathFor('ffmpeg', 'win32'), 'ffprobe.exe')
+    assert.equal(ffprobePathFor('ffmpeg.exe', 'win32'), 'ffprobe.exe')
+    assert.equal(ffprobePathFor(null, 'win32'), 'ffprobe.exe')
+    assert.equal(ffprobePathFor('   ', 'linux'), 'ffprobe')
   })
 })
 
@@ -381,6 +401,28 @@ describe('electron-vite 入口约定（写错的话 npm run dev 起不来）', (
       stepsCode.includes('registerMediaSchemePrivileges('),
       false,
       'bootstrap-steps 在 ready 之后运行，不能再调用 registerMediaSchemePrivileges（时机要求）',
+    )
+  })
+
+  it('`ns-media://` 的 handler 真的注册了（否则所有音频都放不出来）', () => {
+    /**
+     * 真机事故（docs/91 §5.2.56）：「注册媒体协议」这一步只写了一条日志，
+     * 注释说 handler 注册在 ipc 层 —— 而 ipc 层根本没有那段代码。
+     * 结果 `<audio src="ns-media://…">` 全都没有 handler，音频一律放不出来。
+     */
+    const strip = (s: string): string =>
+      s
+        .split(/\r?\n/)
+        .filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l))
+        .join('\n')
+    const stepsCode = strip(readFileSync(join(ROOT, 'src/main/bootstrap-steps.ts'), 'utf8'))
+    assert.ok(
+      stepsCode.includes('registerMediaProtocol('),
+      '启动步骤必须真的调用 registerMediaProtocol —— 只打日志会得到「界面正常、音频全哑」',
+    )
+    assert.ok(
+      stepsCode.includes('resolveProjectPath('),
+      'handler 的 resolve 必须用 resolveProjectPath（项目内逃逸校验的安全边界）',
     )
   })
 })
