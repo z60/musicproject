@@ -15,7 +15,7 @@
 -->
 
 <script setup lang="ts">
-import { computed, onMounted } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import TaskProgressCard from '@/shared/ui/TaskProgressCard.vue'
 import { useTasksStore } from '@/app/store/tasks.store.ts'
@@ -29,6 +29,12 @@ onMounted(() => {
   // 启动时拉一次列表 + 订阅事件：窗口重建/崩溃恢复后仍能显示进行中的任务
   tasks.init()
   void tasks.refresh()
+  restorePos()
+  globalThis.addEventListener?.('resize', onViewportResize)
+})
+
+onBeforeUnmount(() => {
+  globalThis.removeEventListener?.('resize', onViewportResize)
 })
 
 /** 展示顺序：进行中在前，失败次之，其余按创建时间倒序 */
@@ -44,6 +50,120 @@ const visible = computed(() => {
 })
 
 const collapsed = computed(() => ui.dockCollapsed)
+
+/**
+ * ---- 拖动 ----
+ * 真机反馈：「任务模块 可以拖动，初期固定右下角」。
+ * 默认仍是 CSS 的 right/bottom（右下角）；按住标题栏拖动后改为按 left/top 定位，
+ * 位置记到 localStorage，重启后还在原地。拖动全程夹在视口内，不会拖出屏幕外找不回来。
+ */
+const STORAGE_KEY = 'ns.dock.pos'
+const dockRef = ref<HTMLElement | null>(null)
+/** null = 还没拖过，用 CSS 默认的右下角 */
+const pos = ref<{ left: number; top: number } | null>(null)
+const dragging = ref(false)
+/** 拖动过就不该再触发「折叠」（否则拖完一松手面板自己合上） */
+let suppressClick = false
+const drag = { pointerId: -1, startX: 0, startY: 0, originLeft: 0, originTop: 0, moved: false }
+
+const dockStyle = computed<Record<string, string>>(() => {
+  if (!pos.value) return {} as Record<string, string>
+  return {
+    left: `${Math.round(pos.value.left)}px`,
+    top: `${Math.round(pos.value.top)}px`,
+    right: 'auto',
+    bottom: 'auto',
+  }
+})
+
+/** 夹在视口内：至少留 8px 可见，别拖出去找不回来 */
+function clampPos(left: number, top: number): { left: number; top: number } {
+  const rect = dockRef.value?.getBoundingClientRect()
+  const w = rect?.width ?? 320
+  const h = rect?.height ?? 240
+  const vw = globalThis.innerWidth ?? 1280
+  const vh = globalThis.innerHeight ?? 800
+  const margin = 8
+  return {
+    left: Math.min(Math.max(margin, left), Math.max(margin, vw - w - margin)),
+    top: Math.min(Math.max(margin, top), Math.max(margin, vh - h - margin)),
+  }
+}
+
+function onHeadPointerDown(event: PointerEvent): void {
+  if (event.button !== 0 || !dockRef.value) return
+  const rect = dockRef.value.getBoundingClientRect()
+  drag.pointerId = event.pointerId
+  drag.startX = event.clientX
+  drag.startY = event.clientY
+  drag.originLeft = rect.left
+  drag.originTop = rect.top
+  drag.moved = false
+  suppressClick = false
+  dragging.value = true
+  // 注意：这里**不**写 pos —— 单纯点一下（没拖动）不该把右下角的 CSS 定位换成绝对像素，
+  // 否则「点一下折叠」之后窗口再变大，坞就不再贴着右下角了。
+  // 真正越过死区时再按 origin + 总位移一次性定位（像素完全对得上，不会跳）。
+  const head = event.currentTarget as HTMLElement | null
+  head?.setPointerCapture?.(event.pointerId)
+}
+
+function onHeadPointerMove(event: PointerEvent): void {
+  if (!dragging.value || event.pointerId !== drag.pointerId) return
+  const dx = event.clientX - drag.startX
+  const dy = event.clientY - drag.startY
+  // 4px 死区：手抖不算拖动，别把「点一下折叠」吃掉
+  if (Math.abs(dx) > 4 || Math.abs(dy) > 4) drag.moved = true
+  if (!drag.moved) return
+  pos.value = clampPos(drag.originLeft + dx, drag.originTop + dy)
+}
+
+function onHeadPointerUp(event: PointerEvent): void {
+  if (event.pointerId !== drag.pointerId) return
+  dragging.value = false
+  drag.pointerId = -1
+  const head = event.currentTarget as HTMLElement | null
+  head?.releasePointerCapture?.(event.pointerId)
+  if (!drag.moved) return
+  // 拖过：吞掉随后的 click，避免松手就折叠
+  suppressClick = true
+  if (pos.value) persistPos(pos.value)
+}
+
+/** 标题栏的点击：拖动结束那一下不当作点击 */
+function onHeadClick(): void {
+  if (suppressClick) {
+    suppressClick = false
+    return
+  }
+  ui.toggleDock()
+}
+
+function persistPos(next: { left: number; top: number }): void {
+  try {
+    globalThis.localStorage?.setItem(STORAGE_KEY, JSON.stringify(next))
+  } catch {
+    // 无 localStorage（隐私模式/测试环境）：位置不持久化，功能不受影响
+  }
+}
+
+function restorePos(): void {
+  try {
+    const raw = globalThis.localStorage?.getItem(STORAGE_KEY)
+    if (!raw) return
+    const parsed = JSON.parse(raw) as { left?: unknown; top?: unknown }
+    if (typeof parsed.left === 'number' && typeof parsed.top === 'number') {
+      pos.value = clampPos(parsed.left, parsed.top)
+    }
+  } catch {
+    // 数据坏了就当没存过
+  }
+}
+
+/** 窗口尺寸变化后原来的位置可能跑到屏幕外，重新夹一次 */
+function onViewportResize(): void {
+  if (pos.value) pos.value = clampPos(pos.value.left, pos.value.top)
+}
 
 async function onCancel(taskId: string): Promise<void> {
   await tasks.cancel(taskId)
@@ -63,8 +183,22 @@ function onClose(taskId: string): void {
 </script>
 
 <template>
-  <div class="ns-dock" :class="{ 'ns-dock--collapsed': collapsed }">
-    <button type="button" class="ns-dock__head" @click="ui.toggleDock()">
+  <div
+    ref="dockRef"
+    class="ns-dock"
+    :class="{ 'ns-dock--collapsed': collapsed, 'ns-dock--dragging': dragging }"
+    :style="dockStyle"
+  >
+    <button
+      type="button"
+      class="ns-dock__head"
+      title="按住可拖动，点一下折叠/展开"
+      @pointerdown="onHeadPointerDown"
+      @pointermove="onHeadPointerMove"
+      @pointerup="onHeadPointerUp"
+      @pointercancel="onHeadPointerUp"
+      @click="onHeadClick"
+    >
       <span class="ns-dock__title">任务</span>
       <span v-if="tasks.runningCount" class="ns-dock__count">{{ tasks.runningCount }}</span>
       <span v-else-if="tasks.hasFailure" class="ns-dock__count ns-dock__count--alert">!</span>
@@ -117,11 +251,18 @@ function onClose(taskId: string): void {
 .ns-dock--collapsed {
   width: 128px;
 }
+.ns-dock--dragging {
+  /* 拖动中不要选中文字，也不要有过渡，跟手 */
+  transition: none;
+  user-select: none;
+}
 .ns-dock__head {
   display: flex;
   align-items: center;
   gap: 8px;
   padding: 8px 12px;
+  /* 触屏/触控板拖动：别把拖动当成滚动 */
+  touch-action: none;
   border: none;
   border-bottom: 1px solid var(--ns-border, #dcdfe6);
   background: transparent;

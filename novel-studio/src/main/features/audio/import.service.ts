@@ -730,6 +730,8 @@ export function createAudioImportService(deps: AudioImportServiceDeps): AudioImp
             segments: asr.segments,
             // token 级时间戳（whisper.cpp -ojf）：逐字对齐靠它把长句的尾音也框进去
             tokens: asr.tokens,
+            // 音频量出来的静音：最后一道吸附，挡住「下一句第一个字的起音切进上一行」
+            silences: asr.silences ?? [],
             lines: input.orderedHits.map((h) => ({ lineId: h.lineId, text: h.ref.dialogueText ?? '' })),
             durationMs: input.fallbackDurationMs,
             charsPerSecond: deps.vadOptions?.charsPerSecond,
@@ -742,6 +744,7 @@ export function createAudioImportService(deps: AudioImportServiceDeps): AudioImp
               shape: asr.shape,
               segments: asr.segments.length,
               tokens: asr.tokens?.length ?? 0,
+              silences: asr.silences?.length ?? 0,
               lines: input.orderedHits.length,
               matched: aligned.matchedCount,
               unclaimedLines: aligned.unclaimedLines,
@@ -1484,13 +1487,32 @@ export function createAudioImportService(deps: AudioImportServiceDeps): AudioImp
              */
             const partIndex = Math.max(1, (await deps.takeRepo().maxPartIndex(hit.lineId)) + 1)
             /**
-             * 这一行**已经有成品**了吗？有就不覆盖（人工/上次导入的选择优先）。
+             * 这一行**已经有成品**了吗？
              *
              * ⚠️ 判断用「有没有 selected take」而不是「是不是第一条 take」：
              * 上一版（每文件只设一行）留下的 take 都是未选中的，
              * 用 `partIndex === 1` 会让这些行**永远补不上成品**，已录依旧是 0%。
              */
-            const existingSelected = (await deps.takeRepo().listByLine(hit.lineId)).some((t) => t.isSelected)
+            const existing = await deps.takeRepo().listByLine(hit.lineId)
+            const existingSelected = existing.some((t) => t.isSelected)
+            /**
+             * ★ 但**重新导入**必须让新的自动切分接管旧的自动切分。
+             *
+             * 原来的规则是「已有成品就不动」，于是用户「按新算法重导一遍」之后
+             * 新 take 建出来却是**未选中**的，听到的仍是上一次的区间 ——
+             * 真机连续几轮复报（长句尾音、下一句起音、切在自己的字上）都有这一层：
+             * 改好的区间一直在库里，只是没被选中。
+             *
+             * 只接管「自动导入的成品」（`source==='import'` 且带 `imported` 标）；
+             * **人工录制 / 手工挑过的成品一律不动**（那是用户的明确选择）。
+             * 旧 take 不会被删，只是变成未选中的备选。
+             */
+            const currentSelected = existing.find((t) => t.isSelected) ?? null
+            const selectedIsAutoImport =
+              currentSelected !== null &&
+              currentSelected.source === 'import' &&
+              (currentSelected.flags ?? []).includes('imported')
+            const takeOver = !existingSelected || selectedIsAutoImport
             const takePk = newId('take')
 
             /**
@@ -1552,7 +1574,7 @@ export function createAudioImportService(deps: AudioImportServiceDeps): AudioImp
              * 该行此前**没有成品**才自动设成品；已有成品的行（已录过/重叠导入）
              * 不覆盖用户的选择。
              */
-            if (!existingSelected) {
+            if (takeOver) {
               try {
                 await materializeSegment(hit.lineId, take)
                 await deps.takeRepo().setSelected(hit.lineId, takePk)

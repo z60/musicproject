@@ -170,11 +170,9 @@ function toggleMergeSelection(characterId: Id, checked: boolean): void {
   mergeSelection.value = next
 }
 
-/** 合并多选（el-checkbox）：载荷为 boolean | string | number，v-for 内需带上角色上下文 */
-function onMergeSelectionInput(characterId: Id): (value: boolean | string | number) => void {
-  return (value: boolean | string | number): void => {
-    toggleMergeSelection(characterId, Boolean(value))
-  }
+/** 合并多选（v-for 内需带上角色上下文；模板用内联箭头绑定） */
+function setMergeSelected(characterId: Id, value: unknown): void {
+  toggleMergeSelection(characterId, Boolean(value))
 }
 
 /** 「含归档」开关（el-switch）：载荷为 boolean | string | number */
@@ -345,18 +343,14 @@ async function unbindActor(characterId: Id, actorId: Id): Promise<void> {
   emit('changed')
 }
 
-/** 配音员下拉（el-select）：选项值为配音员 Id，v-for 内需带上角色上下文 */
-function onBindActorInput(characterId: Id): (value: Id) => void {
-  return (value: Id): void => {
-    bindActorId.value = { ...bindActorId.value, [characterId]: value || null }
-  }
+/** 配音员下拉（选项值为配音员 Id，v-for 内需带上角色上下文；模板用内联箭头绑定） */
+function setBindActorFor(characterId: Id, value: unknown): void {
+  bindActorId.value = { ...bindActorId.value, [characterId]: (value as Id) || null }
 }
 
-/** 主/备复选框（el-checkbox）：载荷为 boolean | string | number，v-for 内需带上角色上下文 */
-function onBindPrimaryInput(characterId: Id): (value: boolean | string | number) => void {
-  return (value: boolean | string | number): void => {
-    bindPrimary.value = { ...bindPrimary.value, [characterId]: Boolean(value) }
-  }
+/** 主/备复选框（v-for 内需带上角色上下文；模板用内联箭头绑定） */
+function setBindPrimaryFor(characterId: Id, value: unknown): void {
+  bindPrimary.value = { ...bindPrimary.value, [characterId]: Boolean(value) }
 }
 
 async function rebuildCentroid(): Promise<void> {
@@ -672,7 +666,7 @@ onMounted(async () => {
           <el-checkbox
             :model-value="mergeSelection.has(character.id)"
             @click.stop
-            @update:model-value="onMergeSelectionInput(character.id)"
+            @update:model-value="(value) => setMergeSelected(character.id, value)"
           />
           <i class="ns-chars__dot" :style="{ background: character.color ?? characters.colorOf(character.id) }" />
           <span class="ns-chars__name">{{ character.name }}</span>
@@ -734,7 +728,7 @@ onMounted(async () => {
               placeholder="选择配音员"
               class="ns-chars__actor-select"
               :disabled="readonly"
-              @update:model-value="onBindActorInput(character.id)"
+              @update:model-value="(value) => setBindActorFor(character.id, value)"
             >
               <el-option v-for="actor in characters.actors" :key="actor.id" :label="actor.name" :value="actor.id" />
             </el-select>
@@ -742,7 +736,7 @@ onMounted(async () => {
               :model-value="bindPrimary[character.id] ?? false"
               size="small"
               :disabled="readonly"
-              @update:model-value="onBindPrimaryInput(character.id)"
+              @update:model-value="(value) => setBindPrimaryFor(character.id, value)"
             >
               主
             </el-checkbox>

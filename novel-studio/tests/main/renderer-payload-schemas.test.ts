@@ -203,6 +203,40 @@ const SAMPLES: Sample[] = [
     channel: 'canvas:snapshotCreate',
     payload: { chapterId: 'c1', label: '生成前', reason: 'manual' },
   },
+  {
+    /**
+     * 真机事故（docs/91 §5.2.75）：导出向导【元数据与封面】点「下一步」直接 INVALID_PAYLOAD。
+     *
+     * 载荷来自：
+     *   · export.store 的 initFromSettings —— 书籍没有作者时 `artist: ''`；
+     *   · MetadataEditor 的「清除封面」→ `clearCover()` → `coverPath: null`。
+     * 两者在领域类型里都是合法的（`artist?: string` / `coverPath?: string | null`），
+     * 所以 schema 必须跟着可空、且允许空串。
+     */
+    name: 'export.store · Step 5 元数据（无作者 + 已清除封面）',
+    channel: 'export:preCheck',
+    payload: {
+      bookId: 'b1',
+      chapterIds: ['c1'],
+      mixProjectId: null,
+      params: {
+        format: 'mp3',
+        mp3Bitrate: 192,
+        m4bBitrate: 128,
+        sampleRate: 44100,
+        targetLufs: -16,
+        truePeakDb: -1,
+        lra: 11,
+        headSilenceMs: 500,
+        tailSilenceMs: 1500,
+        outputDir: 'D:/out',
+        fileNameTemplate: '{chapterNo}-{chapterTitle}',
+        metadata: { title: '{chapterTitle}', artist: '', album: '', narrator: '', genre: 'Audiobook', date: '2026', coverPath: null },
+        overwrite: 'skip',
+        splitM4bEvery: 0,
+      },
+    },
+  },
 ]
 
 describe('契约 schema · 必须接受渲染侧真实载荷', () => {
@@ -232,6 +266,30 @@ describe('契约 schema · 必须接受渲染侧真实载荷', () => {
       ['canvas:updateLine', { lineId: 'l1', patch: { emotion: null, note: null, pronunciation: null } }],
       ['character:upsert', { character: { bookId: 'b1', name: '甲', description: null, note: null, color: null } }],
       ['voiceActor:upsert', { actor: { projectId: 'p1', name: '甲', contact: null, note: null } }],
+      // 导出元数据：整张表被清空也要能过（title/artist/... 全是 null）
+      [
+        'export:preCheck',
+        {
+          bookId: 'b1',
+          mixProjectId: null,
+          params: {
+            format: 'mp3',
+            mp3Bitrate: 192,
+            m4bBitrate: 128,
+            sampleRate: 44100,
+            targetLufs: -16,
+            truePeakDb: -1,
+            lra: 11,
+            headSilenceMs: 0,
+            tailSilenceMs: 0,
+            outputDir: 'D:/out',
+            fileNameTemplate: '{chapterTitle}',
+            metadata: { title: null, artist: null, album: null, narrator: null, genre: null, date: null, coverPath: null },
+            overwrite: 'skip',
+            splitM4bEvery: 0,
+          },
+        },
+      ],
     ]
     for (const [channel, payload] of nullChecks) {
       assert.doesNotThrow(() => schemaFor(channel)!.parse(payload), `${channel} 拒收 null`)

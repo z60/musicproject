@@ -347,11 +347,9 @@ function onManualPick(row: PairRow, lineId: Id | null): void {
   void bind(lineId, row.segmentId)
 }
 
-/** 手动绑定下拉：el-select 的选项值为行 Id，v-for 内需带上行上下文 */
-function onManualPickInput(row: PairRow): (lineId: Id | null) => void {
-  return (lineId: Id | null): void => {
-    onManualPick(row, lineId)
-  }
+/** 手动绑定下拉（选项值为行 Id，v-for 内需带上行上下文；模板用内联箭头绑定） */
+function pickManualFor(row: PairRow, lineId: unknown): void {
+  onManualPick(row, (lineId as Id | null) ?? null)
 }
 
 /** 候选行：优先给「还没上行的行」（未录行），再给全部行 */
@@ -465,7 +463,7 @@ const candidateLines = computed(() => {
               class="ns-matcher__picker"
               placeholder="选一行绑定"
               filterable
-              @update:model-value="onManualPickInput(row)"
+              @update:model-value="(lineId) => pickManualFor(row, lineId)"
             >
               <el-option
                 v-for="candidate in candidateLines"

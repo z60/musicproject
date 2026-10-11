@@ -218,11 +218,9 @@ function setModuleEnabled(key: ChainModuleKey, enabled: boolean): void {
   chain.setModuleEnabled(key, enabled)
 }
 
-/** 模块总开关：el-switch 的载荷是 boolean | string | number，按模块 key 逐项固定处理器 */
-function onModuleSwitchInput(key: ChainModuleKey): (value: boolean | string | number) => void {
-  return (value: boolean | string | number): void => {
-    setModuleEnabled(key, value === true)
-  }
+/** 模块总开关（v-for 内需带上模块 key；模板用内联箭头绑定） */
+function setModuleEnabledOf(key: ChainModuleKey, value: unknown): void {
+  setModuleEnabled(key, value === true)
 }
 
 /** 降噪「跟随噪声底」（tn）：el-switch 的载荷是 boolean | string | number */
@@ -252,18 +250,14 @@ function commitEqRow(bandId: string, key: ParamKey, value: number): void {
   chain.patchEqBand(bandId, patch)
 }
 
-/** EQ 频段类型：el-select 的载荷即选项值（peak / lowshelf / highshelf / lowpass / highpass，即 EqBand['type']） */
-function onBandTypeChange(bandId: string): (value: EqBand['type']) => void {
-  return (value: EqBand['type']): void => {
-    chain.patchEqBand(bandId, { type: value })
-  }
+/** EQ 频段类型（载荷即选项值 peak / lowshelf / highshelf / lowpass / highpass；模板用内联箭头绑定） */
+function setBandTypeOf(bandId: string, value: unknown): void {
+  chain.patchEqBand(bandId, { type: value as EqBand['type'] })
 }
 
-/** EQ 频段开关：el-switch 的载荷是 boolean | string | number */
-function onBandEnabledSwitchInput(bandId: string): (value: boolean | string | number) => void {
-  return (value: boolean | string | number): void => {
-    chain.patchEqBand(bandId, { enabled: value === true })
-  }
+/** EQ 频段开关（v-for 内需带上频段 id；模板用内联箭头绑定） */
+function setBandEnabledOf(bandId: string, value: unknown): void {
+  chain.patchEqBand(bandId, { enabled: value === true })
 }
 
 const eqError = ref<string | null>(null)
@@ -441,7 +435,7 @@ const appliedPresetName = computed(() => {
             :model-value="enabledOf(module.key)"
             :disabled="isBlocked(module.key)"
             size="small"
-            @change="onModuleSwitchInput(module.key)"
+            @change="(value) => setModuleEnabledOf(module.key, value)"
           />
         </header>
 
@@ -465,7 +459,7 @@ const appliedPresetName = computed(() => {
                   <el-select
                     :model-value="band.type"
                     size="small"
-                    @change="onBandTypeChange(band.id)"
+                    @change="(value) => setBandTypeOf(band.id, value)"
                   >
                     <el-option label="峰值" value="peak" />
                     <el-option label="低架" value="lowshelf" />
@@ -476,7 +470,7 @@ const appliedPresetName = computed(() => {
                   <el-switch
                     :model-value="band.enabled"
                     size="small"
-                    @change="onBandEnabledSwitchInput(band.id)"
+                    @change="(value) => setBandEnabledOf(band.id, value)"
                   />
                   <el-button size="small" text type="danger" @click="chain.removeEqBand(band.id)">删除</el-button>
                 </div>

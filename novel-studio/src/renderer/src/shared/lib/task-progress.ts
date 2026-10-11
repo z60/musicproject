@@ -364,7 +364,17 @@ export function useTaskProgress(
   const stage = computed(() => state.value?.stage ?? '')
   const etaMs = computed(() => state.value?.etaMs ?? null)
   const status = computed<TaskProgressStatus>(() => state.value?.status ?? 'queued')
+  /**
+   * ★ 「没有任务」绝不算「进行中」（真机事故 docs/91 §5.2.77）。
+   *
+   * 老写法只判 `status.value`，而上面 `status` 在没有任务时**默认 'queued'** ——
+   * 于是 `useTaskProgress(null).isRunning` 恒为 true。后果不只是 UI 显示错：
+   * 导出向导的 `isBusy = starting || live.isRunning` 永远为真 →
+   * 点「开始导出」被 `if (isBusy) return null` **静默拦下**，界面完全没反应；
+   * 离开页面也会一直被「导出正在进行，确定要离开吗？」拦着。
+   */
   const isRunning = computed(() => {
+    if (state.value === null) return false
     const s = status.value
     return s === 'running' || s === 'queued' || s === 'waiting'
   })

@@ -39,6 +39,7 @@ const ITEM_COLUMNS: readonly string[] = [
   'timeline_start_ms',
   'src_in_ms',
   'src_out_ms',
+  'src_duration_ms',
   'fade_in_ms',
   'fade_out_ms',
   'locked',
@@ -72,6 +73,7 @@ interface ItemRow {
   timeline_start_ms: number
   src_in_ms: number
   src_out_ms: number
+  src_duration_ms: number
   fade_in_ms: number
   fade_out_ms: number
   locked: number
@@ -105,6 +107,7 @@ export function itemFromRow(row: ItemRow): ArrangementItem {
     timelineStartMs: row.timeline_start_ms,
     srcInMs: row.src_in_ms,
     srcOutMs: row.src_out_ms,
+    srcDurationMs: row.src_duration_ms,
     fadeInMs: row.fade_in_ms,
     fadeOutMs: row.fade_out_ms,
     locked: row.locked === 1,
@@ -159,6 +162,8 @@ export function createSqliteArrangementRepo(
       Math.round(item.timelineStartMs),
       Math.round(item.srcInMs),
       Math.round(item.srcOutMs),
+      // 只有 insert 写它：用户手工拖裁剪（updateItem）不该改这笔「当时依据的音频长度」
+      Math.round(Math.max(0, item.srcDurationMs ?? 0)),
       Math.round(item.fadeInMs),
       Math.round(item.fadeOutMs),
       item.locked ? 1 : 0,

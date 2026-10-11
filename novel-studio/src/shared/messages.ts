@@ -1056,6 +1056,28 @@ export const MESSAGES = {
       '常见成因：文件其实被截断/加密、或只有视频流没有音轨（`-map 0:a:0` 会失败）。' +
       'stderr 摘录在 details.stderr 里；**不要**把 stderr 原文给用户看（含绝对路径与滤镜名）。',
   },
+  /**
+   * 追加在 RECORD 段末尾（编号纪律：只追加）。
+   *
+   * 真机事故：对轨页点播放报「发生了未预期的错误 … 原因链：TypeError: Failed to fetch」，
+   * 因为试听走的是渲染进程 `fetch('ns-media://…')` + `decodeAudioData`，
+   * 而 `fetch` 受 **connect-src** 管辖 —— CSP 里只写了 `connect-src 'self'`，
+   * 于是请求在发出去之前就被 CSP 拦掉，Chromium 只给一个没有细节的 `Failed to fetch`。
+   * 原来这里用 `reportError(error)` 包装，落到 INTERNAL 兜底码，用户在界面上看不到「是哪一步坏了」。
+   */
+  MEDIA_FETCH_FAILED: {
+    title: '读不到片段音频',
+    detail: '播放需要读取「{path}」，但渲染进程没能把它读进来。',
+    hint: '先重试；若一直这样，请确认该文件还在（录音页能看到），并导出诊断包反馈。',
+    severity: 'error', action: 'retry', retryable: true,
+    params: ['path'],
+    dev:
+      '两类成因：(1) **CSP 拦了自定义协议的 fetch** —— `fetch` 走 connect-src，' +
+      '必须允许 `ns-media:`（media-src 只管 <audio>/<video>，管不到 fetch；' +
+      '真机事故就是漏了这一条，见 src/renderer/index.html 与 docs/01 §4.3）；' +
+      '(2) 文件真的不在/不可读（此时 details.cause 里是 ENOENT/EACCES）。' +
+      'details.url 是完整 URL，details.source 是项目内相对路径。',
+  },
 } as const satisfies Record<string, ErrorMessage>
 /** 语义键联合类型（代码里的自动补全来源） */
 export type MessageKey = keyof typeof MESSAGES
@@ -1087,7 +1109,7 @@ const SEGMENTS: ReadonlyArray<{ segment: number; label: string; keys: readonly M
            'PROCESS_CHAIN_EMPTY', 'PROCESS_PRESET_INVALID', 'PROCESS_ABORTED', 'DECLICK_FAILED',
            // ⚠️ 新增消息**只能在段末追加**（否则历史错误编号会漂移，见本文件头部纪律）
            'FILTER_UNSUPPORTED', 'RECORD_CAPTURE_UNAVAILABLE', 'AUDIO_IMPORT_SOURCE_NOT_WAV',
-           'AUDIO_IMPORT_TRANSCODE_FAILED'],
+           'AUDIO_IMPORT_TRANSCODE_FAILED', 'MEDIA_FETCH_FAILED'],
   },
   {
     segment: 3, label: 'BOOK',

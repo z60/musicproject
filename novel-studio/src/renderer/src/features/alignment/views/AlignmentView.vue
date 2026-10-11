@@ -35,6 +35,7 @@ import Inspector from '../components/Inspector.vue'
 import MiniMap from '../components/MiniMap.vue'
 import OverlapResolver from '../components/OverlapResolver.vue'
 import PreviewRenderDialog from '../components/PreviewRenderDialog.vue'
+import TextReferencePanel from '../components/TextReferencePanel.vue'
 import TimelineCanvas from '../components/TimelineCanvas.vue'
 import TimelineRuler from '../components/TimelineRuler.vue'
 import TrackHeader from '../components/TrackHeader.vue'
@@ -57,8 +58,18 @@ const playback = usePlaybackStore()
 const validation = useValidationStore()
 
 // ── 本地展示态（不进 store） ────────────────────────────────────────────────
-type JudgeTab = 'inspector' | 'validation' | 'overlaps'
-const judgeTab = ref<JudgeTab>('inspector')
+/**
+ * Judge 区标签。
+ *
+ * `script`（文本参照）是**真机需求**「对轨模块需要可以听、并且可以参照文本」加的那一页：
+ * 整章台词按画本顺序列出，带时间与单行试听，缺录/无音频的也标出来。
+ */
+type JudgeTab = 'script' | 'inspector' | 'validation' | 'overlaps'
+/**
+ * 默认落在「文本」页：对轨的第一件事是「看着台词听」，
+ * 检查器会在用户点中某个片段时自动接管（见下面的 watch）。
+ */
+const judgeTab = ref<JudgeTab>('script')
 const previewVisible = ref(false)
 const selectedTrackId = ref<TrackId | null>(null)
 const interactionHint = ref('')
@@ -79,7 +90,18 @@ const scheduler = usePlaybackScheduler({
   resolveSource: item => arrangement.resolveSource(item, playback.useProcessed),
   loop: () => timeline.loop,
   getPlayheadMs: () => timeline.playheadMs,
-  setPlayheadMs: (ms) => { timeline.setPlayhead(ms); playback.setCurrentMs(ms) },
+  /**
+   * 播放头写回（rAF 每帧调用一次）：
+   *   · 两个 store 一起更新 —— 画布读 `timeline.playheadMs`、MiniMap 读 `playback.currentMs`；
+   *   · **跟随播放头**：播放中让视口跟着走（docs/13 §4.6）。
+   *     `ensureTimeVisible` 在视口内不动，所以逐帧调用不会抖动；
+   *     关掉开关（状态条「跟随」）或没在播放时都不跟随 —— 用户手动拖播放头时不该被抢。
+   */
+  setPlayheadMs: (ms) => {
+    timeline.setPlayhead(ms)
+    playback.setCurrentMs(ms)
+    if (playback.isPlaying && timeline.followPlayhead) timeline.ensureTimeVisible(ms)
+  },
   expectedSampleRate: () => settings.audio?.sampleRate ?? null,
 })
 
@@ -96,6 +118,40 @@ async function auditionItem(itemId: Id): Promise<void> {
   const ready = await scheduler.init()
   if (!ready) return
   await scheduler.auditionItem(item)
+}
+
+/**
+ * 文本参照面板里点 ▶：
+ *   · 点的就是**正在试听**的那一行 → 停（再点一下停，是列表里最自然的交互）；
+ *   · 否则先停掉整章播放，再只放这一行（auditionItem 内部会 stopAllSources）。
+ */
+async function onAuditionLine(itemId: Id): Promise<void> {
+  if (playback.auditionItemId === itemId) {
+    scheduler.pause()
+    playback.setAuditionItem(null)
+    return
+  }
+  await auditionItem(itemId)
+}
+
+/**
+ * 播放/暂停：**在用户手势里**初始化 AudioContext。
+ *
+ * ⚠️ 原来那个播放键是「音频上下文就绪之后才可点」—— 而「就绪」只有点过按钮（或点过「试听」）
+ * 才会变 true，于是键一开始就是灰的、用户点不到（鸡生蛋问题，真机「对轨听不了」）。
+ * 现在改为：只要有排布结果就能点，点击时才在用户手势里 init。
+ */
+async function onTogglePlay(): Promise<void> {
+  if (playback.isPlaying) {
+    scheduler.pause()
+    return
+  }
+  await togglePlay()
+}
+
+function onStopPlay(): void {
+  scheduler.stop()
+  timeline.setHint('已停止播放并回到章节开头')
 }
 
 // ── 初始化 ─────────────────────────────────────────────────────────────────
@@ -188,6 +244,13 @@ const hoverLabel = computed(() => {
   if (!item) return ''
   const seq = arrangement.lineSeq(item)
   return `悬停：${seq === null ? '' : `#${seq} `}${arrangement.lineLabel(item, 10)} @ ${formatDuration(item.timelineStartMs, { showMs: true })}`
+})
+
+/** 选中项对应的**画本原文**（状态条上直接看得到，边听边对） */
+const selectionFullText = computed(() => {
+  const item = selectedItem.value
+  if (!item) return ''
+  return (arrangement.lineOf(item)?.text ?? '').replace(/\s+/g, ' ').trim()
 })
 
 const durationLabel = computed(() => formatDuration(arrangement.totalDurationMs))
@@ -362,9 +425,26 @@ async function onTrackReset(trackId: TrackId): Promise<void> {
   timeline.setHint('该轨已重置为自动排布结果')
 }
 
-// ── 键盘：只接管 Ctrl+S / Ctrl+M（其余在画布交互层） ───────────────────────
+// ── 键盘：接管道具级键（Space / Ctrl+S / Ctrl+M），其余在画布交互层 ─────────
 function onWindowKeydown(event: KeyboardEvent): void {
   if (isEditableTarget(event.target)) return
+
+  /**
+   * `Space` = 播放/暂停，**从播放头所在位置开始**（scheduler.play(playheadMs)）。
+   *
+   * 画布自己有 Space 处理器（它有 `tabindex`，聚焦时生效），但用户常常刚点完右侧
+   * 「文本」列表或刻度尺，焦点并不在画布上 —— 那时按空格什么都不发生。
+   * 这里补一个**窗口级**处理器；焦点在画布里时让画布处理（避免一次按键切两次）。
+   */
+  if (matchEvent(event, 'Space')) {
+    const target = event.target as Element | null
+    if (!target?.closest?.('.ns-tl-canvas')) {
+      event.preventDefault()
+      void onTogglePlay()
+    }
+    return
+  }
+
   if (matchEvent(event, 'Ctrl+S')) {
     event.preventDefault()
     void onSaveNow()
@@ -379,8 +459,16 @@ function onWindowKeydown(event: KeyboardEvent): void {
 onMounted(() => globalThis.addEventListener?.('keydown', onWindowKeydown))
 onBeforeUnmount(() => globalThis.removeEventListener?.('keydown', onWindowKeydown))
 
-/** 选中项出现时自动切到检查器（用户点画布就是想看属性） */
-watch(() => timeline.primarySelectedId, id => { if (id) judgeTab.value = 'inspector' })
+/**
+ * 选中项出现时自动切到检查器（用户点画布就是想看属性）。
+ *
+ * ★ 但**停在「文本」页时不切**：文本列表里点一行本来就会选中片段，
+ *   若因此跳到检查器，用户每点一行就被弹走一次，等于没法连着听。
+ *   画布自己的选择事件（`onCanvasSelection`）仍会显式切到检查器。
+ */
+watch(() => timeline.primarySelectedId, id => {
+  if (id && judgeTab.value !== 'script') judgeTab.value = 'inspector'
+})
 watch(() => arrangement.lastError, error => { if (error) timeline.setHint('加载对轨数据失败：详见提示（可重试）') })
 </script>
 
@@ -489,6 +577,7 @@ watch(() => arrangement.lastError, error => { if (error) timeline.setHint('加�
       <!-- Judge 区：检查器 / 校验报告 / 重叠消解 -->
       <aside class="ns-align__judge">
         <div class="ns-align__tabs">
+          <button type="button" class="ns-align__tab" :class="{ 'is-active': judgeTab === 'script' }" @click="judgeTab = 'script'">文本</button>
           <button type="button" class="ns-align__tab" :class="{ 'is-active': judgeTab === 'inspector' }" @click="judgeTab = 'inspector'">检查器</button>
           <button type="button" class="ns-align__tab" :class="{ 'is-active': judgeTab === 'validation' }" @click="judgeTab = 'validation'">
             校验{{ validation.totalCount ? `(${validation.totalCount})` : '' }}
@@ -499,8 +588,12 @@ watch(() => arrangement.lastError, error => { if (error) timeline.setHint('加�
         </div>
 
         <div class="ns-align__judge-body">
+          <TextReferencePanel
+            v-if="judgeTab === 'script'"
+            @audition="onAuditionLine" @jump-line="onJumpLine"
+          />
           <Inspector
-            v-if="judgeTab === 'inspector'" :item-id="timeline.primarySelectedId"
+            v-else-if="judgeTab === 'inspector'" :item-id="timeline.primarySelectedId"
             @audition="auditionItem" @jump-line="onJumpLine"
           />
           <ValidationPanel
@@ -519,6 +612,11 @@ watch(() => arrangement.lastError, error => { if (error) timeline.setHint('加�
     <!-- ───────── 状态条（docs/13 §4.5 第三行） ───────── -->
     <footer class="ns-align__status">
       <div class="ns-align__status-info">
+        <span
+          v-if="selectionFullText"
+          class="ns-align__fulltext"
+          :title="selectionFullText"
+        >{{ selectionFullText }}</span>
         <span class="ns-align__selection" :title="selectionText">{{ selectionText }}</span>
         <span v-if="multiSelectionText" class="ns-align__muted">{{ multiSelectionText }}</span>
         <span v-if="hoverLabel" class="ns-align__muted">{{ hoverLabel }}</span>
@@ -529,6 +627,13 @@ watch(() => arrangement.lastError, error => { if (error) timeline.setHint('加�
       <div class="ns-align__status-actions">
         <el-button size="small" :disabled="!selectedItem && !timeline.selectedIds.length" @click="onToggleLock">🔒 锁定</el-button>
         <el-button size="small" @click="timeline.toggleSnap()">吸附{{ timeline.snapEnabled ? '✓' : '✗' }}</el-button>
+        <el-button
+          size="small"
+          :title="timeline.followPlayhead ? '播放时视口跟随播放头（点一下关掉）' : '播放时视口不跟随（点一下打开）'"
+          @click="timeline.toggleFollowPlayhead()"
+        >
+          跟随{{ timeline.followPlayhead ? '✓' : '✗' }}
+        </el-button>
         <el-select :model-value="timeline.gridMs" size="small" class="ns-align__grid" @update:model-value="onGridInput">
           <el-option v-for="option in gridOptions" :key="option.value" :value="option.value" :label="option.label" />
         </el-select>
@@ -536,9 +641,15 @@ watch(() => arrangement.lastError, error => { if (error) timeline.setHint('加�
         <el-button size="small" :disabled="!selectedItem" @click="onNudge(10)">+10ms →</el-button>
         <el-button size="small" :disabled="!selectedItem" @click="onResetPosition">重置位置</el-button>
         <el-button size="small" :disabled="!selectedItem" @click="selectedItem && auditionItem(selectedItem.id)">试听</el-button>
-        <el-button size="small" :disabled="!scheduler.isReady.value && !playback.isPlaying" @click="togglePlay">
+        <el-button
+          size="small"
+          type="primary"
+          :disabled="!arrangement.items.length && !playback.isPlaying"
+          @click="onTogglePlay"
+        >
           {{ playback.isPlaying ? '暂停' : '播放' }}
         </el-button>
+        <el-button size="small" :disabled="!playback.isPlaying && playback.currentMs === 0" @click="onStopPlay">停止</el-button>
       </div>
     </footer>
 
@@ -638,6 +749,19 @@ watch(() => arrangement.lastError, error => { if (error) timeline.setHint('加�
   text-overflow: ellipsis;
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
+}
+/**
+ * 选中项的**画本原文**（边听边对的参照）。
+ * 放在状态条最左边、限宽省略，完整内容看 title —— 状态条不该被一整段台词撑高。
+ */
+.ns-align__fulltext {
+  overflow: hidden;
+  max-width: 46ch;
+  padding: 0 6px;
+  border-left: 2px solid var(--ns-primary, #409eff);
+  color: var(--ns-text-primary, #303133);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .ns-align__muted { color: var(--ns-text-secondary, #909399); }
 .ns-align__hint { color: var(--ns-primary, #409eff); }

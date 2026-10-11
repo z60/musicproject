@@ -368,15 +368,26 @@ const MixProjectShape = v.object({
   updatedAt: v.number(),
 })
 
-/** docs/15 §4 导出参数 */
+/**
+ * 导出元数据的文本字段：**允许 null、也允许空串**（docs/15 §4、docs/91 §5.2.75）。
+ *
+ * 为什么不能写成 `OptString`：领域类型里 `title/artist/…` 是 `string?`、
+ * `coverPath` 是 `string | null`，而界面上的「清空输入框 / 清除封面」天然产生
+ * `''` 与 `null`（与 OptNullableString 的注释同一条规矩：**领域类型可空 ⇒ schema 必须可空**）。
+ * 真机事故：书籍没有作者 → `artist: ''`；「清除封面」→ `coverPath: null` ——
+ * 在【元数据与封面】点「下一步」直接 INVALID_PAYLOAD（载荷校验失败）。
+ * 主进程侧 `metadataPairs` 本来就把 `''`/`null` 当「未设置」跳过，边界没必要更严。
+ */
+const ExportMetadataText = (max: number) => v.optional(v.nullable(v.string({ max, nonEmpty: false })))
+
 const ExportMetadataShape = v.object({
-  title: OptString,
-  artist: OptString,
-  album: OptString,
-  narrator: OptString,
-  genre: OptString,
-  date: OptString,
-  coverPath: OptString,
+  title: ExportMetadataText(300),
+  artist: ExportMetadataText(200),
+  album: ExportMetadataText(300),
+  narrator: ExportMetadataText(200),
+  genre: ExportMetadataText(100),
+  date: ExportMetadataText(40),
+  coverPath: ExportMetadataText(1000),
 })
 
 const ExportParamsShape = v.object({

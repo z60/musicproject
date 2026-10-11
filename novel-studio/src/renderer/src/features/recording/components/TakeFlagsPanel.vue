@@ -21,7 +21,13 @@ import { AppError } from '@shared/errors.ts'
 import type { Take } from '@shared/types.ts'
 import { formatDb } from '@/shared/lib/format.ts'
 import { reportError } from '@/shared/lib/error-bus.ts'
-import { TAKE_FLAG_PRESETS, useTakesStore } from '../stores/takes.store.ts'
+import {
+  TAKE_FLAG_PRESETS,
+  isSevereTakeFlag,
+  takeFlagHint,
+  takeFlagLabel,
+  useTakesStore,
+} from '../stores/takes.store.ts'
 
 const props = withDefaults(defineProps<{
   /** 当前 take（没有 take 时面板只做筛选） */
@@ -80,15 +86,15 @@ const extraFlags = computed(() => {
 })
 
 function labelOf(flag: string): string {
-  return TAKE_FLAG_PRESETS.find(p => p.key === flag)?.label ?? flag
+  return takeFlagLabel(flag)
 }
 
 function hintOf(flag: string): string {
-  return TAKE_FLAG_PRESETS.find(p => p.key === flag)?.hint ?? '自定义标记'
+  return takeFlagHint(flag)
 }
 
 function isSevere(flag: string): boolean {
-  return TAKE_FLAG_PRESETS.find(p => p.key === flag)?.severe ?? false
+  return isSevereTakeFlag(flag)
 }
 
 function hasFlag(flag: string): boolean {

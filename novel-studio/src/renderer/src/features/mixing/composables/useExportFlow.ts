@@ -172,6 +172,12 @@ export function useExportFlow() {
   /** 任务是否正在跑（离开守卫与按钮禁用都用它） */
   const isBusy = computed(() => starting.value || live.isRunning.value)
 
+  /**
+   * 「点了开始导出但没能启动」的原因（没有原因就一定是 bug —— 界面必须说得出话）。
+   * 真机事故 docs/91 §5.2.77：这里原来直接 `return null`，界面上一点反应都没有。
+   */
+  const startBlockedReason = ref<string | null>(null)
+
   /** 本次导出的范围描述（进度面板顶部显示） */
   const scopeLabel = computed(() => store.rangeLabel)
 
@@ -180,11 +186,22 @@ export function useExportFlow() {
    * 失败不抛给调用方：`call()` 已经把错误交给 error-bus，这里只把状态收回来。
    */
   async function start(): Promise<string | null> {
-    if (isBusy.value) return null
+    if (isBusy.value) {
+      // 只有真的有任务在跑才算忙（见 task-progress.ts 里 isRunning 的注释）
+      startBlockedReason.value = '上一次导出还在进行中，请等它结束后再试（可到「任务中心」查看）'
+      return null
+    }
     const bookId = store.bookId
     const chapterIds = cloneForIpc(store.targetChapterIds)
-    if (!bookId || chapterIds.length === 0) return null
-
+    if (!bookId) {
+      startBlockedReason.value = '没有可导出的书籍：请先在第 1 步绑定书籍'
+      return null
+    }
+    if (chapterIds.length === 0) {
+      startBlockedReason.value = '没有选到任何章节：请回到第 1 步选择导出范围'
+      return null
+    }
+    startBlockedReason.value = null
     starting.value = true
     store.report = null
     reportUnavailable.value = false
@@ -534,7 +551,7 @@ export function useExportFlow() {
 
   return {
     // 状态
-    live, progressEvent, starting, isBusy, scopeLabel, reportUnavailable, leaveConfirmVisible,
+    live, progressEvent, starting, isBusy, startBlockedReason, scopeLabel, reportUnavailable, leaveConfirmVisible,
     // 动作
     start, mergeM4bOnly, cancel, retry, loadReport, runVerify, openOutputFolder,
     saveReportJson, restart, jumpToIssue,

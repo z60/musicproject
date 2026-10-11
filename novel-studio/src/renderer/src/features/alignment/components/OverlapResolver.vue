@@ -83,11 +83,14 @@ function onStrategyInput(value: ArrangeStrategy): void {
   resolver.strategy.value = value
 }
 
-/** 单条冲突行的策略覆盖：el-select 的选项值即 ArrangeStrategy，v-for 内需带上行上下文 */
-function onRowStrategyInput(row: SameTrackConflictRow): (value: ArrangeStrategy) => void {
-  return (value: ArrangeStrategy): void => {
-    overrides.value = { ...overrides.value, [row.key]: value }
-  }
+/**
+ * 单条冲突行的策略覆盖（v-for 内需带上行上下文）。
+ *
+ * ⚠️ 模板里必须用**内联箭头**绑定。写成「工厂函数返回处理器」那种写法（调用它当处理器）时，
+ * Vue 会把带调用的绑定编译成内联语句、**丢掉返回值** —— 下拉改了不生效。
+ */
+function setRowStrategy(row: SameTrackConflictRow, value: unknown): void {
+  overrides.value = { ...overrides.value, [row.key]: value as ArrangeStrategy }
 }
 
 function effectOf(row: SameTrackConflictRow): string {
@@ -228,7 +231,7 @@ const batchDetails = computed(() => {
             :model-value="strategyOf(row)"
             size="small"
             class="ns-overlap__select ns-overlap__select--row"
-            @update:model-value="onRowStrategyInput(row)"
+            @update:model-value="(value) => setRowStrategy(row, value)"
           >
             <el-option v-for="option in strategyOptions" :key="option.value" :value="option.value" :label="option.label" />
           </el-select>

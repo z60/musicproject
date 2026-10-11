@@ -206,7 +206,7 @@ const interaction = useTimelineInteraction({
 
   snapEnabled: () => props.snapEnabled,
   gridMs: () => props.gridMs,
-  sourceDurationMs: item => arrangement.resolveSource(item, playback.useProcessed)?.durationMs ?? null,
+  sourceDurationMs: item => arrangement.resolveSource(item, playback.useProcessed)?.sourceEndMs ?? null,
 
   togglePlay: () => emit('request-play-toggle'),
   nudge: deltaMs => emit('nudge', deltaMs),
@@ -326,9 +326,14 @@ watch(
   },
 )
 
-/** 键盘：全部交给交互层；返回 false（未消费）的键继续冒泡给视图（如 Ctrl+S） */
+/**
+ * 键盘：全部交给交互层；返回 false（未消费）的键继续冒泡给视图（如 Ctrl+S）。
+ *
+ * 消费掉的键必须 `preventDefault`：否则 `Space` 会让页面滚动、方向键也会滚 ——
+ * 用户看到的是「按了空格没反应、页面自己跑掉了」。
+ */
 function onKeydown(event: KeyboardEvent): void {
-  interaction.onKeydown(event)
+  if (interaction.onKeydown(event)) event.preventDefault()
 }
 
 /** 拖播放头期间阻止文本选中（否则整页会被拖蓝） */

@@ -303,6 +303,31 @@ describe('排布：locked 与缺录行', () => {
     })
     assert.equal(r.items[0]!.srcOutMs, 2000)
   })
+
+  it('srcOut 的上界是 srcIn + 片段长度（src 是源文件坐标，导入的一行常在文件中间）', () => {
+    // 导入链路不复制音频：一段 6919 ms 的音频可能落在整个导入文件的 18961–25880 ms 处。
+    // 上界若写成「片段长度 6919」，srcOut 会被夹到 6919 —— 从文件开头切，播的是别人的音。
+    const r = autoArrange({
+      arrangementId: 'arr-1',
+      lines: [
+        line({ lineId: 'l1', seq: 1, trackId: NARRATION, segmentDurationMs: 6919, srcInMs: 18961, srcOutMs: 25880 }),
+        line({ lineId: 'l2', seq: 2, trackId: NARRATION, segmentDurationMs: 6919, srcInMs: 18961, srcOutMs: 99999 }),
+      ],
+    })
+    assert.equal(r.items[0]!.srcOutMs, 25880)
+    assert.equal(r.items[1]!.srcOutMs, 25880, '越界裁剪要夹到 srcIn + 片段长度')
+    assert.equal(r.items[0]!.srcInMs, 18961)
+  })
+
+  it('item 要记下这次排布依据的音频长度（srcDurationMs）', () => {
+    // 录音侧换成品会**复用同一个 segment id**、只换音频文件（docs/12 §8.1），
+    // 于是「这段裁剪是按哪段音频定的」只能靠 item 自己记 —— 见 shared/types.ts 的同名注释。
+    const r = autoArrange({
+      arrangementId: 'arr-1',
+      lines: [line({ lineId: 'l1', seq: 1, trackId: NARRATION, segmentDurationMs: 2000, srcInMs: 0, srcOutMs: 1200 })],
+    })
+    assert.equal(r.items[0]!.srcDurationMs, 2000, '记的是**音频**长度，不是裁剪长度')
+  })
 })
 
 // ---------------------------------------------------------------------------

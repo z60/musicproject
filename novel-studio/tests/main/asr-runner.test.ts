@@ -38,6 +38,10 @@ interface HarnessOptions {
   exists?: (path: string) => boolean
   ffmpegAvailable?: boolean
   ffmpegCode?: number
+  /** 假 ffmpeg 写到 stderr 的内容（用来喂 silencedetect 输出） */
+  ffmpegStderr?: string
+  /** 假装目录里装着哪些模型（用于「出厂默认 → 自动改用更准的」那条） */
+  listDir?: (path: string) => string[]
   spawnResult?: { code: number | null; stderr?: string }
   /** 第一次跑 `-ojf` 的结果（不传就用 `spawnResult`）：用于验证「老引擎不支持 -ojf」的退路 */
   spawnResults?: Array<{ code: number | null; stderr?: string }>
@@ -49,10 +53,11 @@ function harness(opts: HarnessOptions = {}) {
   const spawned: Array<{ command: string; args: string[] }> = []
   const ffmpegCalls: string[][] = []
   const readPaths: string[] = []
+  const logged: string[] = []
   const ffmpeg = {
     async execute(command: string[]) {
       ffmpegCalls.push([...command])
-      return { exitCode: opts.ffmpegCode ?? 0, stdout: '', stderr: '' }
+      return { exitCode: opts.ffmpegCode ?? 0, stdout: '', stderr: opts.ffmpegStderr ?? '' }
     },
   } as unknown as FfmpegRunner
   const spawn: AsrSpawn = async (command, args) => {
@@ -68,15 +73,19 @@ function harness(opts: HarnessOptions = {}) {
     exists: opts.exists ?? (() => true),
     // 模型必须「像样」（≥ 20 MB）才认：半截下载的 ggml 会让 whisper 直接失败
     sizeOf: () => 200 * 1024 * 1024,
-    listDir: () => [],
+    listDir: opts.listDir ?? (() => []),
     spawn,
     readTextFile: (path: string) => {
       readPaths.push(path)
       return (opts.readTextFile ?? (() => WHISPER_JSON))(path)
     },
-    log: { info: () => undefined, warn: () => undefined, error: () => undefined },
+    log: {
+      info: (event: string) => logged.push(event),
+      warn: (event: string) => logged.push(event),
+      error: () => undefined,
+    },
   })
-  return { runner, spawned, ffmpegCalls, readPaths }
+  return { runner, spawned, ffmpegCalls, readPaths, logged }
 }
 
 describe('ASR 引擎可用性', () => {
@@ -152,6 +161,43 @@ describe('ASR 识别调用', () => {
     assert.match(h.readPaths[0]!, /-plain\.json$/, '退回 -oj 后读的是另一个输出前缀，不会拿到半截文件')
   })
 
+  it('转码那一步顺带量静音，并把区间带回来（识别时间戳之外的音频证据）', async () => {
+    const h = harness({
+      ffmpegStderr: [
+        '[silencedetect @ 0x1] silence_start: 36.399',
+        '[silencedetect @ 0x1] silence_end: 37.138 | silence_duration: 0.739',
+      ].join('\n'),
+    })
+    const res = await h.runner.transcribe({ absolutePath: 'C:/a.wav' })
+    assert.ok(res)
+    const convert = h.ffmpegCalls[0]!
+    assert.match(
+      convert.join(' '),
+      /silencedetect=noise=-30dB:d=0\.12/,
+      '转 16 kHz 那一步要顺带做静音检测（不额外起进程）',
+    )
+    assert.deepEqual(res!.silences, [{ startMs: 36_399, endMs: 37_138 }])
+  })
+
+  it('设置里还是出厂默认模型、而本机装着更准的 → 用更准的那个并记日志', async () => {
+    const h = harness({
+      settings: () => ({ language: 'zh', threads: 4, modelId: 'ggml-base.bin' }),
+      listDir: () => ['ggml-base.bin', 'ggml-small.bin'],
+    })
+    assert.match(h.runner.availability().model!, /ggml-small\.bin/)
+    await h.runner.transcribe({ absolutePath: 'C:/a.wav' })
+    assert.ok(h.logged.includes('asr.modelUpgraded'), '换了模型必须留痕')
+  })
+
+  it('用户主动选了别的模型 → 尊重它（不擅自升级）', async () => {
+    const h = harness({
+      settings: () => ({ language: 'zh', threads: 4, modelId: 'ggml-medium.bin' }),
+      listDir: () => ['ggml-medium.bin', 'ggml-small.bin'],
+    })
+    assert.match(h.runner.availability().model!, /ggml-medium\.bin/)
+    await h.runner.transcribe({ absolutePath: 'C:/a.wav' })
+    assert.ok(!h.logged.includes('asr.modelUpgraded'))
+  })
   it('引擎缺失 → 直接返回 null（连 ffmpeg 都不该跑）', async () => {
     const h = harness({ exists: () => false })
     const res = await h.runner.transcribe({ absolutePath: 'C:/a.wav' })

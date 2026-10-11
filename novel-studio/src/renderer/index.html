@@ -16,7 +16,10 @@
         · `worker-src 'self' blob:` 同理（AudioWorklet 在规范上归属 worker 类）
         · style-src 需要 unsafe-inline：Element Plus 与 Vue SFC 的 <style> 会注入内联样式
         · media-src/img-src 允许 blob: 与 ns-media:（录音试听与波形读取走自定义协议）
-        · connect-src 'self'：渲染进程不直接访问外网，全部经主进程
+        · connect-src 'self' ns-media:：渲染进程不直接访问外网（全部经主进程），
+        但**必须允许 ns-media:** —— 对轨试听用 fetch('ns-media://…') + decodeAudioData，
+        而 fetch 受 connect-src 管辖（media-src 只管 <audio>/<video> 元素）。
+        漏掉它的后果是「点播放报 Failed to fetch」（真机事故，docs/91 §5.2.71）。
       开发模式下 Vite 需要注入 HMR 客户端，因此 devServer 会放宽 script-src；
       生产构建严格按下列策略执行。
     -->
@@ -30,7 +33,7 @@
         img-src 'self' data: blob: ns-media:;
         media-src 'self' blob: ns-media:;
         font-src 'self' data:;
-        connect-src 'self';
+        connect-src 'self' ns-media:;
         object-src 'none';
         base-uri 'none';
         form-action 'none';

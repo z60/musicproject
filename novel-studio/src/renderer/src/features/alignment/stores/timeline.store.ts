@@ -244,6 +244,17 @@ export const useTimelineStore = defineStore('alignment/timeline', () => {
     setScrollMs(ms - viewportDurationMs(viewportWidthPx.value, viewport.value) / 2)
   }
 
+  /**
+   * 切换「跟随播放头」（docs/13 §4.6）。
+   *
+   * 播放时视口跟着播放头滚动；关掉后视口不动，方便盯着某一处反复听。
+   * 该开关一直存在，但此前**没有任何入口**（既没接进播放循环、界面上也没按钮）——
+   * 真机反馈「对轨里的位置需要跟着播放音的时间移动」才把它接通。
+   */
+  function toggleFollowPlayhead(next?: boolean): void {
+    followPlayhead.value = next ?? !followPlayhead.value
+  }
+
   /** 保证某个时间点在视口内（跟随播放头用；已在视口内则不动，避免抖动） */
   function ensureTimeVisible(ms: number, marginPx = 64): void {
     const left = xToTime(0, viewport.value)
@@ -455,7 +466,7 @@ export const useTimelineStore = defineStore('alignment/timeline', () => {
     pxPerMs, scrollMs, scrollTopPx, viewportWidthPx, viewportHeightPx,
     trackHeight, trackOrderPreference,
     selectedIds, primarySelectedId, playheadMs, loop,
-    snapEnabled, gridMs, followPlayhead,
+    snapEnabled, gridMs, followPlayhead, toggleFollowPlayhead,
     durationMs, chapterId, hint,
     // 计算
     viewport, visibleDurationMs, visibleEndMs, pxPerSecond, trackHeightPx,

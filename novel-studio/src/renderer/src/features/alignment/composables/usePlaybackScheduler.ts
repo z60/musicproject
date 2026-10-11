@@ -31,6 +31,7 @@
 import { onScopeDispose, ref } from 'vue'
 import type { Ref } from 'vue'
 import type { ArrangementItem, Id, TrackId } from '@shared/types.ts'
+import { AppError } from '@shared/errors.ts'
 import { reportError } from '@/shared/lib/error-bus.ts'
 import { mediaUrlWithCacheBust, processedUrl, segmentUrl } from '@/shared/lib/media-url.ts'
 import { itemDurationMs } from '@shared/arrange/layout.ts'
@@ -210,10 +211,27 @@ export function usePlaybackScheduler(options: PlaybackSchedulerOptions): Playbac
         return buffer
       } catch (error) {
         if (!silent) {
-          reportError(error, {
-            event: 'alignment.playback.decodeFailed',
-            detailOverride: `无法加载片段音频：${source.path}。若该文件已被移动或删除，请重新录制或在录音页重新定位文件。`,
-          })
+          /**
+           * ★ 用**精确错误码**，不要交给 `reportError` 去猜。
+           *
+           * 真机事故：这里原来只传了原始错误 + 一段 detailOverride，于是落到 INTERNAL 兜底码，
+           * 界面上只有一句「发生了未预期的错误 … TypeError: Failed to fetch」——
+           * 看不出是「读音频」这一步坏的。原因链里的 `Failed to fetch` 是 CSP 拦了
+           * `fetch('ns-media://…')`（connect-src 没允许该 scheme），详见 messages.ts 的该条 dev 说明。
+           */
+          reportError(
+            new AppError('MEDIA_FETCH_FAILED', {
+              cause: error,
+              params: { path: source.path },
+              details: {
+                url,
+                source: source.path,
+                processed: source.isProcessed,
+                segmentId: source.segmentId,
+              },
+            }),
+            { event: 'alignment.playback.mediaFetchFailed' },
+          )
         }
         return null
       } finally {
@@ -468,7 +486,15 @@ export function usePlaybackScheduler(options: PlaybackSchedulerOptions): Playbac
         return
       }
 
-      playback.setCurrentMs(current)
+      /**
+       * ★ 播放头要**跟着音频时间走**，而不是只更新内部的 currentMs。
+       *
+       * 画布画的是 `timeline.playheadMs`（视图把它接在 `setPlayheadMs` 上）。
+       * 这里原来只写 `playback.setCurrentMs`，于是播放时：音频在放、
+       * MiniMap 在动（它读 currentMs），**时间线上的播放头却冻在原处**
+       * （真机反馈：「对轨里的位置需要跟着播放音的时间移动」）。
+       */
+      options.setPlayheadMs(current)
       // 播放头走到窗口末尾前补调度下一段（滚动窗口，避免长章节一次性调度几千个节点）
       if (current - startedAtMs > PLAY_WINDOW_MS * 0.5) {
         startedAtMs = current

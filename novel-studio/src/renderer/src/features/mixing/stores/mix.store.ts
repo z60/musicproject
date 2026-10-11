@@ -40,6 +40,7 @@ import type {
 } from '@shared/types.ts'
 import { EXPORT_DEFAULTS, LOUDNESS_TARGETS } from '@shared/constants.ts'
 import { call, callSafe, callCollecting } from '@/shared/lib/ipc.ts'
+import { cloneForIpc } from '@/shared/lib/clone.ts'
 import { debounce } from '@/shared/lib/editable-debounce.ts'
 import type { SaveStatus } from '@/shared/lib/editable-debounce.ts'
 import { reportBatchFailures, reportError } from '@/shared/lib/error-bus.ts'
@@ -457,7 +458,15 @@ export const useMixStore = defineStore('mixing/mix', () => {
     }
     const target = projects.value.find(item => item.id === mixProjectId)
     if (!target) return
-    const updated = await callSafe('mix:save', { mixProject: { ...target, name } }) as MixProject | null
+    /**
+     * ★ 必须 cloneForIpc：`{ ...target }` 只是**浅**拷贝，`tracks[].music` 这些嵌套对象
+     * 仍然是 Vue 的 Proxy，而 IPC 用结构化克隆序列化参数 —— 直接抛
+     * `DataCloneError: An object could not be cloned.`（真机日志：ipc.mix:save.transportFailed）。
+     * 见 shared/lib/clone.ts 的说明。
+     */
+    const updated = await callSafe('mix:save', {
+      mixProject: cloneForIpc({ ...target, name }),
+    }) as MixProject | null
     if (updated) {
       const index = projects.value.findIndex(item => item.id === mixProjectId)
       if (index >= 0) projects.value[index] = updated

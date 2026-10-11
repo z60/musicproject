@@ -80,11 +80,9 @@ function onFlagToggle(value: string, checked: boolean | string | number): void {
   setFlags(next)
 }
 
-/** 标志位勾选框（el-checkbox）：载荷为 boolean | string | number，v-for 内需带上标志位名 */
-function onFlagToggleInput(value: string): (checked: boolean | string | number) => void {
-  return (checked: boolean | string | number): void => {
-    onFlagToggle(value, checked)
-  }
+/** 标志位勾选框（v-for 内需带上标志位名；模板用内联箭头绑定） */
+function onFlagToggleOf(flag: string, checked: unknown): void {
+  onFlagToggle(flag, checked as boolean | string | number)
 }
 
 // ---------------------------------------------------------------------------
@@ -596,7 +594,7 @@ watch(() => props.line?.id, syncFields, { immediate: true })
               :model-value="line?.flags.includes(option.value) === true"
               :disabled="readonly"
               size="small"
-              @update:model-value="onFlagToggleInput(option.value)"
+              @update:model-value="(checked) => onFlagToggleOf(option.value, checked)"
             >
               {{ option.label }}
             </el-checkbox>

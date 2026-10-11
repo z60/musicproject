@@ -356,6 +356,7 @@ function makeService(overrides: Partial<AudioImportServiceDeps> = {}): {
   segments: VoiceSegment[]
   copied: Array<{ sourcePath: string; relativeTarget: string }>
   logged: Array<{ event: string; fields?: Record<string, unknown> }>
+  takeRepo: ReturnType<typeof createMemoryTakeRepo>
 } {
   const takeRepo = createMemoryTakeRepo()
   const segmentRepo = createMemoryVoiceSegmentRepo()
@@ -423,7 +424,7 @@ function makeService(overrides: Partial<AudioImportServiceDeps> = {}): {
     ...overrides,
   }
 
-  return { service: createAudioImportService(deps), takes, segments, copied, logged }
+  return { service: createAudioImportService(deps), takes, segments, copied, logged, takeRepo: wrappedTakeRepo as never }
 }
 
 const PROJECT = 'proj1'
@@ -1210,6 +1211,59 @@ describe('applyImport：落库', () => {
     assert.equal(res.skipped.length, 0)
   })
 
+  it('重新导入：新的自动切分接管旧的自动切分（否则重导后听到的还是旧区间）', async () => {
+    const file = writeSource('2221-2225-石玉凤-德钦.wav')
+    const h = makeService()
+    const importOnce = () =>
+      h.service.applyImport({
+        projectId: PROJECT,
+        bookId: BOOK,
+        canvasPath: CANVAS_PATH,
+        files: [{ filePath: file }],
+      })
+    await importOnce()
+    const lineIds = [...new Set(h.takes.map((t) => t.lineId))]
+    assert.ok(lineIds.length > 0, '第一次导入要建出 take')
+    for (const lineId of lineIds) {
+      const list = await h.takeRepo.listByLine(lineId)
+      assert.equal(list.filter((t) => t.isSelected).length, 1, '第一次导入即成品')
+    }
+
+    await importOnce()
+    for (const lineId of lineIds) {
+      const list = await h.takeRepo.listByLine(lineId)
+      assert.equal(list.length, 2, '同一行两条 take（旧的 + 重导的）')
+      const selected = list.filter((t) => t.isSelected)
+      assert.equal(selected.length, 1, '成品仍然唯一')
+      assert.equal(selected[0]!.partIndex, 2, '★ 成品必须是**最新那次导入**的 take')
+    }
+  })
+
+  it('人工录制的成品不会被重新导入抢走', async () => {
+    const file = writeSource('2221-2225-石玉凤-德钦.wav')
+    const h = makeService()
+    await h.service.applyImport({
+      projectId: PROJECT,
+      bookId: BOOK,
+      canvasPath: CANVAS_PATH,
+      files: [{ filePath: file }],
+    })
+    const lineId = h.takes[0]!.lineId
+    /** 人工录制/手工挑过的成品：source 不是 'import'（'local' 代表录音产物） */
+    const manual = { ...h.takes.find((t) => t.lineId === lineId)!, id: 'take_manual', source: 'local' as const, flags: [] }
+    await h.takeRepo.insert(manual)
+    await h.takeRepo.setSelected(lineId, manual.id)
+
+    await h.service.applyImport({
+      projectId: PROJECT,
+      bookId: BOOK,
+      canvasPath: CANVAS_PATH,
+      files: [{ filePath: file }],
+    })
+    const selected = (await h.takeRepo.listByLine(lineId)).filter((t) => t.isSelected)
+    assert.equal(selected.length, 1)
+    assert.equal(selected[0]!.id, 'take_manual', '人工成品优先，导入不许抢')
+  })
   it('文件名解析不出且没补区间 → 跳过，但原因里说明怎么补', async () => {
     const badPath = writeSource('另一个-看不懂的名字.wav')
     const { service } = makeService()

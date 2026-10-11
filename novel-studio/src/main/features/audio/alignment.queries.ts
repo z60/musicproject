@@ -77,7 +77,7 @@ export function createAlignmentLineQueries(db: () => DbLike): AlignmentLineQueri
   }
 }
 
-const SEGMENT_SELECT = `SELECT id, line_id, chapter_id, file_path, processed_path, duration_ms, rms_db, peak_db, flags
+const SEGMENT_SELECT = `SELECT id, line_id, chapter_id, file_path, processed_path, src_in_ms, src_out_ms, duration_ms, rms_db, peak_db, flags
                           FROM voice_segments`
 
 interface SegmentSqlRow {
@@ -86,6 +86,8 @@ interface SegmentSqlRow {
   chapter_id: string
   file_path: string
   processed_path: string | null
+  src_in_ms: number
+  src_out_ms: number
   duration_ms: number
   rms_db: number | null
   peak_db: number | null
@@ -99,6 +101,9 @@ function toSegmentRow(r: SegmentSqlRow): AlignmentSegmentRow {
     chapterId: r.chapter_id,
     filePath: r.file_path,
     processedPath: r.processed_path,
+    // 源文件坐标：导入链路不复制音频，segment 就指向那一整个导入文件
+    srcInMs: r.src_in_ms,
+    srcOutMs: r.src_out_ms,
     durationMs: r.duration_ms,
     rmsDb: r.rms_db,
     peakDb: r.peak_db,

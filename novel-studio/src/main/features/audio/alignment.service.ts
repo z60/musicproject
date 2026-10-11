@@ -61,6 +61,19 @@ export interface AlignmentSegmentRow {
   chapterId: Id
   filePath: string
   processedPath: string | null
+  /**
+   * ★ 这段音频在 **`filePath` 文件里**的区间（源文件坐标）。
+   *
+   * 必须带出来：导入链路**不复制音频**（import.service 的 materializeSegment 是有意为之的
+   * 简化，见其注释），segment 直接指向那一整个导入文件 —— 于是「这一行是哪一段音频」
+   * 只由 `srcInMs/srcOutMs` 决定。自动对轨若默认 `0 … durationMs`，排出来的就是整个
+   * 导入文件的**开头几秒**，而不是用户选中的那一段（真机：「自动对轨没有按录音里
+   * 选择的音频来排」）。渲染/导出侧一开始就当它是源文件坐标（见 arrangement-render.ts
+   * 的注释与 useTimelineRenderer 的 peaks 窗口），这里是唯一漏掉的一处。
+   */
+  srcInMs: number
+  srcOutMs: number
+  /** 区间长度（= srcOutMs - srcInMs），用于展示与夹取 */
   durationMs: number
   rmsDb: number | null
   peakDb: number | null
@@ -194,10 +207,41 @@ export function createAlignmentService(deps: AlignmentServiceDeps): AlignmentSer
     for (const it of existing) byLine.set(it.lineId, it)
     const segments = await deps.segments.listByChapter(chapterId)
     const segById = new Map(segments.map((s) => [s.segmentId, s] as const))
+    /**
+     * 裁剪点被作废（音频换过了）的行，只用于日志。
+     * 真机反馈：「自动对轨功能需要根据录音里选择的音频来排」。
+     */
+    const rebased: Id[] = []
 
-    return lines.map((line) => {
+    const mapped = lines.map((line) => {
       const item = byLine.get(line.lineId) ?? null
       const seg = line.segmentId ? (segById.get(line.segmentId) ?? null) : null
+      /**
+       * ★ 这段音频在**整个文件**里的区间（源文件坐标）。没有 segment 时为 0（不会被排进去）。
+       *
+       * 导入链路**不复制音频**：segment 直接指向那一整个导入文件，所以「这一行是哪一段音频」
+       * 完全由 `srcInMs/srcOutMs` 决定。默认区间必须是它，而不是 `0 … durationMs` ——
+       * 后者排的是导入文件的**开头几秒**（真机：「自动对轨没有按录音里选择的音频来排」）。
+       */
+      const segStartMs = seg ? Math.max(0, seg.srcInMs) : 0
+      const segEndMs = seg ? Math.max(segStartMs, seg.srcOutMs) : 0
+      /**
+       * ★ 既有 item 的裁剪点（`srcInMs/srcOutMs`）**只有在它还是在当前这段音频上定的**才保留。
+       *
+       * 判据三条一起看（input 侧只有这些信息可用，见 ArrangementItem.srcDurationMs 的注释）：
+       *   1. 长度一致：`item.srcDurationMs` 是「排布时那段音频的长度」，与当前 segment 相等；
+       *   2. 起点不早于 segment 起点：手工修剪只会把起点往右推，绝不可能往左；
+       *   3. 终点不晚于 segment 终点：越界说明换成了另一段音频。
+       * 长度相等 + 区间被包含 ⇒ 两个区间**必然完全相同**（等长区间互相包含只有相等一种可能），
+       * 所以「换了等长但偏移不同的 take」也会被 2/3 抓到。老数据 `srcDurationMs = 0` 一律重排。
+       */
+      const sameAudio =
+        item !== null &&
+        seg !== null &&
+        item.srcDurationMs === seg.durationMs &&
+        item.srcInMs >= segStartMs &&
+        item.srcOutMs <= segEndMs
+      if (item && !sameAudio) rebased.push(line.lineId)
       /**
        * 既有 item 的人工状态：**只带 locked 与非默认值**。
        *
@@ -220,14 +264,29 @@ export function createAlignmentService(deps: AlignmentServiceDeps): AlignmentSer
         seq: line.seq,
         segmentId: line.segmentId,
         ...(seg ? { segmentDurationMs: seg.durationMs } : {}),
-        // 裁剪点以既有 item 为准（用户可能手工拖过边缘），没有就用整段
-        srcInMs: item?.srcInMs ?? 0,
-        srcOutMs: item?.srcOutMs ?? seg?.durationMs ?? 0,
+        /**
+         * 裁剪点：同一段音频才沿用既有 item（用户可能手工拖过边缘），否则取**当前选中音频**
+         * 的完整源区间 —— 不是 `0 … durationMs`，那是「文件开头」，不是这一行。
+         */
+        srcInMs: sameAudio ? item.srcInMs : segStartMs,
+        srcOutMs: sameAudio ? item.srcOutMs : segEndMs,
         pauseAfterMs: line.pauseAfterMs,
         characterPauseMs: line.characterPauseMs,
         existing: state,
       }
     })
+    if (rebased.length > 0) {
+      // 换成品后第一次重排必然走到这里：让「旧裁剪点已按当前音频重排」有据可查
+      deps.log?.info?.('alignment.clipRebasedToSelectedAudio', {
+        event: 'alignment.clipRebasedToSelectedAudio',
+        arrangementId,
+        chapterId,
+        count: rebased.length,
+        firstLines: rebased.slice(0, 5),
+        note: '这些行的既有裁剪点属于换掉之前的音频，已按录音里当前选中的片段整段重排',
+      })
+    }
+    return mapped
   }
 
   /** 整体重排：算 → 原子替换 → 更新方案摘要（version +1） */

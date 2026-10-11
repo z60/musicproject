@@ -75,6 +75,12 @@ export const MIGRATION_ENTRIES: readonly MigrationEntry[] = [
     hash: 'sha256:e69d256a534585e6572639e91ebb7cd5593f8e3133914a9544a122ae6e18d810',
     file: '005_export_jobs_duration.sql',
   },
+  {
+    version: 6,
+    name: 'arrangement_item_src_duration',
+    hash: 'sha256:d1d6234aac4f23244693add198999f73f5b3880afd7b6003077bc417acbae222',
+    file: '006_arrangement_item_src_duration.sql',
+  },
 ]
 
 const migrationsDir = dirname(fileURLToPath(import.meta.url))

@@ -21,7 +21,7 @@ import { takeSourceRange } from '@shared/audio/take-range.ts'
 import { mediaUrlWithCacheBust, segmentUrl } from '@/shared/lib/media-url.ts'
 import { playRange } from '@/shared/lib/media-element.ts'
 import { UNKNOWN, formatDate, formatDb, formatDuration, formatRelativeTime } from '@/shared/lib/format.ts'
-import { TAKE_FLAG_PRESETS } from '../stores/takes.store.ts'
+import { TAKE_FLAG_PRESETS, isSevereTakeFlag, takeFlagHint, takeFlagLabel } from '../stores/takes.store.ts'
 
 const props = withDefaults(defineProps<{
   takes: Take[]
@@ -219,13 +219,18 @@ defineExpose({
           <span v-if="take.partIndex > 0" class="ns-take__badge">分段 {{ take.partIndex + 1 }}</span>
           <span v-if="showSource" class="ns-take__badge ns-take__badge--source">{{ SOURCE_LABELS[take.source] }}</span>
           <span v-if="take.isSelected" class="ns-take__badge ns-take__badge--ok">成品</span>
+          <!--
+            系统标记（导入 / 导入需确认）也要显示：真机复报「音频和文本错误」时，
+            用户必须能看出「这行音频是按字数硬切的」，否则只能归因成软件出错。
+          -->
           <span
             v-for="flag in take.flags"
             :key="flag"
             class="ns-take__badge ns-take__badge--flag"
-            :title="TAKE_FLAG_PRESETS.find(p => p.key === flag)?.hint ?? flag"
+            :class="{ 'is-severe': isSevereTakeFlag(flag) }"
+            :title="takeFlagHint(flag)"
           >
-            {{ TAKE_FLAG_PRESETS.find(p => p.key === flag)?.label ?? flag }}
+            {{ takeFlagLabel(flag) }}
           </span>
 
           <span class="ns-take__time" :title="formatDate(take.recordedAt, 'YYYY-MM-DD HH:mm:ss')">
@@ -420,6 +425,11 @@ defineExpose({
 .ns-take__badge--flag {
   background: rgb(230 162 60 / 18%);
   color: var(--ns-warning, #e6a23c);
+}
+/* 需要立刻处理的系统标记（导入需确认）：标红，别让用户以为是软件坏了 */
+.ns-take__badge--flag.is-severe {
+  background: rgb(245 108 108 / 18%);
+  color: var(--ns-danger, #f56c6c);
 }
 .ns-take__time {
   margin-left: auto;

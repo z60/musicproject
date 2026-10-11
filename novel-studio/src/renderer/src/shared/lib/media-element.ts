@@ -11,13 +11,90 @@
  * 并在 `timeupdate` 里播到区间终点就停（否则一条 22 分钟的文件会一直放下去）。
  */
 
-/** 播放到区间终点就暂停（返回取消订阅函数） */
-export function clipToEnd(element: HTMLAudioElement, endMs: number): () => void {
-  const handler = (): void => {
-    if (element.currentTime * 1000 >= endMs) element.pause()
+/**
+ * `<audio>` 里这个模块用到的部分。
+ *
+ * 写成**结构类型**而不是直接写 `HTMLAudioElement`：主进程/测试工程的 `lib` 里没有 DOM，
+ * 而测试要 import 这个文件（渲染进程其它模块都没引用 DOM 类型，所以从前没暴露这个问题）。
+ * 真实的 `<audio>` 元素天然满足它。
+ */
+export interface ClipAudioElement {
+  currentTime: number
+  src: string
+  readyState: number
+  load(): void
+  play(): Promise<void>
+  pause(): void
+  addEventListener(type: ClipEventName, listener: () => void): void
+  removeEventListener(type: ClipEventName, listener: () => void): void
+}
+
+type ClipEventName = 'loadedmetadata' | 'error' | 'timeupdate' | 'ended' | 'pause'
+
+/**
+ * 播放到区间终点就暂停（返回取消订阅函数）。
+ *
+ * ⚠️ **只用 `timeupdate` 是不够的**：它每 ~250ms 才触发一次，于是播放会冲过区间终点
+ * 最多 250ms。真机症状就是「这一行的末尾有下一段的杂音」——
+ * 2221 章那一行的 take 止于 36990，而下一句开头的「众」从 37138 才开始，
+ * 差 148ms：区间本身没错，是**播放冲过头**把那个字放出来了。
+ *
+ * 所以这里三层保险：
+ *   ① `requestAnimationFrame`（约 16ms 一次）—— 主判据，冲到终点立刻暂停；
+ *   ② `timeupdate` —— rAF 在后台窗口被节流时的兜底；
+ *   ③ `ended`/`pause` —— 放完或用户手动暂停时收摊，别留下 rAF 空转。
+ */
+/** `globalThis` 上可能的 rAF（浏览器有、Node/测试环境没有） */
+interface RafHost {
+  requestAnimationFrame?: (callback: () => void) => number
+  cancelAnimationFrame?: (handle: number) => void
+}
+
+export function clipToEnd(element: ClipAudioElement, endMs: number): () => void {
+  let frameId: number | null = null
+  let done = false
+
+  /** 浏览器里 rAF 必须带 window 作为 this（裸调用会 Illegal invocation），所以包一层 */
+  const host = globalThis as unknown as RafHost
+  const requestFrame: ((cb: () => void) => number) | null =
+    typeof host.requestAnimationFrame === 'function' ? (cb) => host.requestAnimationFrame!(cb) : null
+  const cancelFrame: ((handle: number) => void) | null =
+    typeof host.cancelAnimationFrame === 'function' ? (handle) => host.cancelAnimationFrame!(handle) : null
+
+  const reachedEnd = (): boolean => element.currentTime * 1000 >= endMs
+
+  const stop = (): void => {
+    if (done) return
+    done = true
+    if (frameId !== null && cancelFrame) cancelFrame(frameId)
+    frameId = null
+    element.removeEventListener('timeupdate', onTimeUpdate)
+    element.removeEventListener('ended', stop)
+    element.removeEventListener('pause', stop)
   }
-  element.addEventListener('timeupdate', handler)
-  return () => element.removeEventListener('timeupdate', handler)
+
+  const onTimeUpdate = (): void => {
+    if (reachedEnd()) {
+      element.pause()
+      stop()
+    }
+  }
+
+  const tick = (): void => {
+    if (done) return
+    if (reachedEnd()) {
+      element.pause()
+      stop()
+      return
+    }
+    frameId = requestFrame ? requestFrame(tick) : (setTimeout(tick, 16) as unknown as number)
+  }
+
+  element.addEventListener('timeupdate', onTimeUpdate)
+  element.addEventListener('ended', stop)
+  element.addEventListener('pause', stop)
+  frameId = requestFrame ? requestFrame(tick) : (setTimeout(tick, 16) as unknown as number)
+  return stop
 }
 
 /**
@@ -27,7 +104,7 @@ export function clipToEnd(element: HTMLAudioElement, endMs: number): () => void 
  * **不会去取数据**，没有超时的话这里会永远挂着 —— 用户看到的是「点播放没反应」，
  * 正是这次要修的故障形态。超时后由调用方按「音频不可用」上报。
  */
-function waitForMetadata(element: HTMLAudioElement, timeoutMs = 15_000): Promise<void> {
+function waitForMetadata(element: ClipAudioElement, timeoutMs = 15_000): Promise<void> {
   // 1 = HAVE_METADATA：有了它 currentTime 才能可靠地赋值
   if (element.readyState >= 1) return Promise.resolve()
   return new Promise((resolve, reject) => {
@@ -46,7 +123,7 @@ function waitForMetadata(element: HTMLAudioElement, timeoutMs = 15_000): Promise
 }
 
 /** 上一次 clipToEnd 的取消函数（同一个元素反复播不同 take 时不能越积越多） */
-const clipCancels = new WeakMap<HTMLAudioElement, () => void>()
+const clipCancels = new WeakMap<ClipAudioElement, () => void>()
 
 /**
  * 播放 `url` 的 `[startMs, endMs)` 这一段。
@@ -55,7 +132,7 @@ const clipCancels = new WeakMap<HTMLAudioElement, () => void>()
  * 这里不做静默降级 —— 「点了播放没反应」正是这次要修的问题。
  */
 export async function playRange(
-  element: HTMLAudioElement,
+  element: ClipAudioElement,
   url: string,
   startMs: number,
   endMs: number,

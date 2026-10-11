@@ -107,8 +107,15 @@ export interface SegmentSource {
   /** 相对项目根的路径（ns-media:// 与 analysis:peaks 都用相对路径） */
   path: string
   isProcessed: boolean
-  /** 源文件时长（用于夹紧 srcIn/srcOut 与右边缘拖动） */
-  durationMs: number | null
+  /**
+   * 该片段音频在**源文件里**的终点（源文件坐标）—— 右边缘拖拽与 srcOut 输入的夹取上界。
+   *
+   * ★ 不是「时长」：导入链路**不复制音频**，segment 直接指向那一整个导入文件，
+   *   一行可能落在文件的 18961–25880 ms 处（长度只有 6919 ms）。
+   *   `item.srcInMs/srcOutMs` 与 `analysis:peaks{fromMs,toMs}` 全都是源文件坐标
+   *   （见 arrangement-render.ts 与 useTimelineRenderer 的窗口计算），这里必须同口径。
+   */
+  sourceEndMs: number | null
 }
 
 /** 一条待提交的改动（批量队列的元素） */
@@ -316,6 +323,19 @@ export const useArrangementStore = defineStore('alignment/arrangement', () => {
    *   试听按钮禁用，并在 Inspector 里说明「该片段没有可用的音频文件」。
    *   处理后的文件（processed_path）来自 `process:listApplied({ segmentIds })`。
    */
+  /**
+   * 片段音频在源文件里的终点 = `take.srcInMs + take.durationMs`。
+   *
+   * 为什么不是 `take.durationMs`：那是**区间长度**。导入的 take 是「整个导入文件里的
+   * 某一段」（take 自己记着 srcIn/srcOut），拿长度当上界会把右边缘拖拽与 srcOut 输入
+   * 夹在文件开头 —— 于是拖不出真正的这一段。
+   */
+  function sourceEndOf(take: Take | null): number | null {
+    if (!take) return null
+    const end = take.srcInMs + take.durationMs
+    return Number.isFinite(end) ? end : null
+  }
+
   function resolveSource(item: ArrangementItem | null, preferProcessed = false): SegmentSource | null {
     if (!item) return null
     const processedPath = processedBySegment.value.get(item.segmentId) ?? null
@@ -326,7 +346,7 @@ export const useArrangementStore = defineStore('alignment/arrangement', () => {
         lineId: item.lineId,
         path: processedPath,
         isProcessed: true,
-        durationMs: takeByLine.value.get(item.lineId)?.durationMs ?? null,
+        sourceEndMs: sourceEndOf(takeByLine.value.get(item.lineId) ?? null),
       }
     }
     const take = takeByLine.value.get(item.lineId)
@@ -337,7 +357,7 @@ export const useArrangementStore = defineStore('alignment/arrangement', () => {
       lineId: item.lineId,
       path: take.filePath,
       isProcessed: false,
-      durationMs: Number.isFinite(take.durationMs) ? take.durationMs : null,
+      sourceEndMs: sourceEndOf(take),
     }
   }
 
@@ -731,17 +751,17 @@ export const useArrangementStore = defineStore('alignment/arrangement', () => {
 
     const headMs = Math.max(0, firstIndex * bucketMs - TRIM_DEFAULTS.headPaddingMs)
     const tailMs = (lastIndex + 1) * bucketMs + TRIM_DEFAULTS.tailPaddingMs
-    const sourceDurationMs = source.durationMs
-    const targetOut = Number.isFinite(sourceDurationMs)
-      ? Math.min(tailMs, sourceDurationMs as number)
-      : tailMs
+    // 源内可用终点（源文件坐标）：tailMs 也是源文件坐标，两者口径必须一致
+    const sourceEndMs = source.sourceEndMs
+    const targetOut = Number.isFinite(sourceEndMs) ? Math.min(tailMs, sourceEndMs as number) : tailMs
     const minDuration = ARRANGE_DEFAULTS.minSegmentMs
     // ★ 起点必须按「拖左边缘」语义：timelineStartMs 与 srcInMs **反向补偿**，
     //   内容在时间线上的绝对位置不变（docs/05 §5.4 / docs/13 §4.7 都单独标注过）。
     const targetStart = item.timelineStartMs + (headMs - item.srcInMs)
     const left = resizeLeftEdge(item, targetStart, {
       minDurationMs: minDuration,
-      sourceDurationMs: Number.isFinite(sourceDurationMs) ? (sourceDurationMs as number) : undefined,
+      // 该选项名是 shared/arrange/manual 的历史命名，语义就是「srcOut 的上界」
+      sourceDurationMs: Number.isFinite(sourceEndMs) ? (sourceEndMs as number) : undefined,
     })
     const before = [{ ...item }]
     patchLocalInPlace(itemId, {

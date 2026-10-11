@@ -66,9 +66,16 @@ export interface CharAlignLineSpan {
    * 用它当边界，既不会切掉本行的尾音，也不会吃掉下一行的开头。
    */
   endHintMs: number | null
-  /** 第一个/最后一个命中的字的时刻 */
+  /** 第一个/最后一个命中的字的时刻（字的**中心**，用来说明「命中落在哪里」） */
   firstMs: number | null
   lastMs: number | null
+  /**
+   * 本行第一个命中字的**起点**时刻 —— 它才是「上一行的右界」该用的值。
+   *
+   * 用字的**中心**会让上一行多切进这个字的一半（真机症状：「石志坚笑了…」这一行的末尾
+   * 混进了下一句开头那个「众」的起音）。字中心只保留给「判断命中在哪」用。
+   */
+  firstBoundaryMs: number | null
   matchedChars: number
   totalChars: number
   /** 命中率 0~1（这一行有多少字在识别结果里找到了） */
@@ -180,6 +187,183 @@ const VARIANT_PAIRS: ReadonlyArray<readonly [string, string]> = [
   ['牆', '墙'],
 ]
 
+/**
+ * 相邻两行之间的「夹层」该从哪里切开
+ * ============================================================================
+ * 真机需求：「【石志坚笑了，端起茶杯饮一口，看向众人。】的切割有问题，
+ * 而且还有一些下一句的音放上一句里面了 —— 这个需要严格」。
+ *
+ * ## 什么叫夹层
+ * 逐字对齐之后，前一行最后一个命中的单位与后一行第一个命中的单位之间，
+ * 常常还夹着几个**谁都没认领**的单位（识别把这一句听成了别的字，或干脆漏了）。
+ * 这些音频只能属于这两行之一：整段塞给前一行，就是「下一句的音放上一句里」；
+ * 整段塞给后一行，就是「长句尾音没了」。**必须切开，而且要切在对的地方。**
+ *
+ * ## 三个判据（按可信度排序）
+ *   ① **ASR 段边界**：whisper 的段 ≈ 一句话，段的起止就是天然的句子边界。
+ *      真机例：`…心說那能鬥得過嗎?` 与 `實至間就像是會讀心術…` 是两段，
+ *      夹层 `嗎?實至間就` 就正好该在段边界处切开（前一行得「嗎?」，后一行得「實至間就」）。
+ *   ② **语音停顿**：标点 token 会**吃掉停顿时长**（真机里一个逗号 token 横跨 520 ms），
+ *      所以量停顿时要跳过标点，用「前一个真字结束 → 后一个真字开始」：
+ *      `…表情難以置信,實至間捏著茶杯…` 的 520 ms 停顿就落在这对真字之间。
+ *   ③ **文字像谁**：拿切开后的两半分别与前一行尾部、后一行头部比相似度
+ *      （繁简已折叠）。识别错字时它可能对两边都不像 —— 那就交给①②。
+ *
+ * 三项都拿不到信息（既无段边界、也无停顿、文字都不像）时，**归后一行**：
+ * 宁可让前一行少一点，也不要它吃到下一句的开头（用户明确要求「严格」）。
+ */
+
+/** 折叠 + 去标点后的字符数组（比较用） */
+function foldChars(text: string): string[] {
+  return Array.from(foldVariants(normalizeForCompare(text)))
+}
+
+/** 字符多重集上的 Dice 系数（与 `text-match.ts` 同口径，输入已是归一化字符） */
+function diceChars(a: readonly string[], b: readonly string[]): number {
+  if (a.length === 0 || b.length === 0) return 0
+  const counts = new Map<string, number>()
+  for (const ch of a) counts.set(ch, (counts.get(ch) ?? 0) + 1)
+  let overlap = 0
+  for (const ch of b) {
+    const n = counts.get(ch)
+    if (n === undefined || n === 0) continue
+    counts.set(ch, n - 1)
+    overlap++
+  }
+  return (2 * overlap) / (a.length + b.length)
+}
+
+export interface InterRegionCutInput {
+  /** 夹层里的识别单位（至少 1 个，时间升序） */
+  units: readonly TimedText[]
+  /** 每个单位属于哪一 ASR 段（与 `units` 等长） */
+  segmentOf: readonly number[]
+  /** 夹层前一个单位的段序号（null = 夹层就在单位流最前面） */
+  prevSegment: number | null
+  /** 夹层后一个单位的段序号（null = 夹层就在单位流最后面） */
+  nextSegment: number | null
+  /** 夹层前一个单位的结束时刻（null = 没有前一个单位） */
+  prevUnitEndMs: number | null
+  /** 夹层后一个单位的开始时刻（null = 没有后一个单位） */
+  nextUnitStartMs: number | null
+  /** 夹层左边那一行的文本 */
+  prevText: string
+  /** 夹层右边那一行的文本 */
+  nextText: string
+}
+
+export interface InterRegionCut {
+  /** 切在夹层第几个单位**之前**：0 = 全归后一行，units.length = 全归前一行 */
+  cut: number
+  /** 判定依据（进日志/reasons，便于抽查） */
+  reason: string
+}
+
+/** 这个单位的文本里有没有「真字」（纯标点 token 不算语音） */
+export function isSpeechText(text: string): boolean {
+  return foldChars(text).length > 0
+}
+
+/** 折叠后（去标点 + 繁→简）的两段文字相似度 0~1 */
+export function foldedSimilarity(a: string, b: string): number {
+  return diceChars(foldChars(a), foldChars(b))
+}
+
+/**
+ * 「这段识别文本更像哪一边」：更像后一行返回 true。
+ *
+ * 夹层归属与「识别段头属于谁」都用它 —— 真机里 whisper 会把「石志坚」听成「實至間」
+ * （字面完全不重合），这时候只能看**段**：段头那几个单位像谁，这段就归谁。
+ * 两边都不像（或一样像）时返回 true（严格：宁可前一行少一点）。
+ */
+export function looksLikeNext(regionText: string, prevText: string, nextText: string): boolean {
+  const region = foldChars(regionText)
+  if (region.length === 0) return true
+  const len = region.length + 3
+  const prevFit = diceChars(region, foldChars(prevText).slice(-len))
+  const nextFit = diceChars(region, foldChars(nextText).slice(0, len))
+  return nextFit >= prevFit
+}
+/** 「一半像前、一半像后」时的中性分（不是 0，也不是 1） */
+const AFFINITY_NEUTRAL = 0.5
+
+/**
+ * 在夹层里挑一个切点。评分 = 段边界(1.0) + 停顿(最多 0.5) + 文字像谁(最多 0.6)。
+ * 平分时取**更靠前**的切点（= 多分给后一行，严格）。
+ */
+export function chooseInterRegionCut(input: InterRegionCutInput): InterRegionCut {
+  const units = input.units
+  const n = units.length
+  if (n === 0) return { cut: 0, reason: '夹层为空（左界即下一单位起点）' }
+
+  const isSpeech = units.map((u) => foldChars(u.text).length > 0)
+  /** 从第 k 个单位往后找第一个「真字」的开始时刻 */
+  const speechStart = (k: number): number | null => {
+    for (let t = k; t < n; t++) if (isSpeech[t]!) return units[t]!.startMs
+    return input.nextUnitStartMs
+  }
+  /** 从第 k 个单位往前找第一个「真字」的结束时刻 */
+  const speechEnd = (k: number): number | null => {
+    for (let t = k - 1; t >= 0; t--) if (isSpeech[t]!) return units[t]!.endMs
+    return input.prevUnitEndMs
+  }
+
+  const prevChars = foldChars(input.prevText)
+  const nextChars = foldChars(input.nextText)
+
+  let best: InterRegionCut = { cut: 0, reason: '兜底：整段归后一行（严格）' }
+  let bestScore = Number.NEGATIVE_INFINITY
+  for (let k = 0; k <= n; k++) {
+    const segmentBreak =
+      k === 0
+        ? input.prevSegment !== null && input.segmentOf[0] !== input.prevSegment
+        : k === n
+          ? input.nextSegment !== null && input.segmentOf[n - 1] !== input.nextSegment
+          : input.segmentOf[k] !== input.segmentOf[k - 1]
+
+    const from = speechStart(k)
+    const to = speechEnd(k)
+    const pause = from !== null && to !== null ? Math.max(0, from - to) : 0
+
+    const before = units.slice(0, k).flatMap((u) => foldChars(u.text))
+    const after = units.slice(k).flatMap((u) => foldChars(u.text))
+    const prevFit =
+      before.length === 0
+        ? AFFINITY_NEUTRAL
+        : diceChars(before, prevChars.slice(-(before.length + 3)))
+    const nextFit =
+      after.length === 0 ? AFFINITY_NEUTRAL : diceChars(after, nextChars.slice(0, after.length + 3))
+
+    const score =
+      (segmentBreak ? 1 : 0) + 0.5 * (Math.min(pause, 500) / 500) + 0.6 * ((prevFit + nextFit) / 2)
+    if (score > bestScore + 1e-9) {
+      bestScore = score
+      const why: string[] = []
+      if (segmentBreak) why.push('识别段边界')
+      if (pause >= 120) why.push('停顿 ' + Math.round(pause) + 'ms')
+      if (before.length > 0 && after.length > 0 && Math.abs(prevFit - nextFit) > 0.1) {
+        why.push(prevFit > nextFit ? '前半更像前一行' : '后半更像后一行')
+      } else if (before.length > 0 && prevFit > AFFINITY_NEUTRAL + 0.1) {
+        why.push('夹层更像前一行的尾音')
+      } else if (after.length > 0 && nextFit > AFFINITY_NEUTRAL + 0.1) {
+        why.push('夹层更像后一行的开头')
+      }
+      best = {
+        cut: k,
+        reason:
+          why.length > 0
+            ? why.join(' + ')
+            : k === 0
+              ? '没有可用信号，整段归后一行（严格）'
+              : k === n
+                ? '没有可用信号，整段归前一行'
+                : '没有可用信号，切在停顿最小的位置',
+      }
+    }
+  }
+  return best
+}
+
 const VARIANT_MAP: Map<string, string> = new Map(VARIANT_PAIRS.map((p) => [p[0], p[1]]))
 
 /** 把繁体字折成简体（未知字原样保留） */
@@ -205,19 +389,25 @@ function buildAsrStream(units: readonly TimedText[]): AsrStream {
   const unitOf: number[] = []
   const timeMs: number[] = []
   const unitStart: number[] = []
+  const unitEnd: number[] = []
+  const unitChars: number[] = []
+  const charInUnit: number[] = []
   units.forEach((u, ui) => {
     const start = Number.isFinite(u.startMs) ? Math.max(0, u.startMs) : 0
     const end = Number.isFinite(u.endMs) ? Math.max(start, u.endMs) : start
     unitStart.push(start)
+    unitEnd.push(end)
     const cs = alignChars(u.text)
     const n = cs.length
+    unitChars.push(n)
     for (let k = 0; k < n; k++) {
       chars.push(cs[k]!)
       unitOf.push(ui)
+      charInUnit.push(k)
       timeMs.push(n > 0 ? start + (end - start) * ((k + 0.5) / n) : start)
     }
   })
-  return { chars, unitOf, timeMs, unitStart }
+  return { chars, unitOf, timeMs, unitStart, unitEnd, unitChars, charInUnit }
 }
 
 export interface CharAlignOptions {
@@ -244,6 +434,11 @@ interface AsrStream {
   unitOf: number[]
   timeMs: number[]
   unitStart: number[]
+  unitEnd: number[]
+  /** 每个单位的字符数（摊时间用） */
+  unitChars: number[]
+  /** 每个字符在它所属单位里的序号（0 基）—— 用来算「这个字的起点时刻」 */
+  charInUnit: number[]
 }
 
 interface RawMatch {
@@ -454,6 +649,7 @@ export function alignCharsMonotone(
     endHintMs: null,
     firstMs: null,
     lastMs: null,
+    firstBoundaryMs: null,
     matchedChars: 0,
     totalChars: alignChars(l.text).length,
     coverage: 0,
@@ -471,6 +667,14 @@ export function alignCharsMonotone(
     }
   })
 
+  /** 识别流里第 j 个字符的**起点**时刻（单位内按时长摊） */
+  const asrCharStart = (j: number): number => {
+    const u = asr.unitOf[j]!
+    const n = asr.unitChars[u] ?? 0
+    if (n <= 0) return asr.unitStart[u]!
+    return asr.unitStart[u]! + (asr.unitEnd[u]! - asr.unitStart[u]!) * ((asr.charInUnit[j] ?? 0) / n)
+  }
+
   const raw = alignByDp(lineChars, asr.chars, opts.maxDpCells ?? DEFAULT_MAX_DP_CELLS)
   const unitClaimed = new Set<number>()
   for (const match of raw) {
@@ -478,6 +682,7 @@ export function alignCharsMonotone(
     span.matchedChars++
     const unit = asr.unitOf[match.asrIndex]!
     if (span.firstUnit === null) span.firstUnit = unit
+    if (span.firstBoundaryMs === null) span.firstBoundaryMs = asrCharStart(match.asrIndex)
     span.lastUnit = unit
     const t = asr.timeMs[match.asrIndex]!
     if (span.firstMs === null || t < span.firstMs) span.firstMs = t

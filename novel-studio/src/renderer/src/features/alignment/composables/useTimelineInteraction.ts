@@ -7,7 +7,8 @@
  *   · §9 命中检测：**按轨道行分组（先按 y 判断轨道），轨内按 timelineStartMs 二分查找**；
  *        边缘把手命中区 ≥ 6px
  *   · §4.6 滚轮：`Ctrl+滚轮` 以鼠标为锚点缩放、`Shift+滚轮` 平移、纵向滚动轨道区；
- *        `Space` 播放/暂停；点击空白定位播放头；**框选区间循环播放**
+ *        `Space` 播放/暂停（**从播放头所在位置开始**）；单击片段 = 选中它并把播放头放到它的起点；
+ *        点击空白定位播放头；双击片段 = 定位 + 选中；**框选区间循环播放**
  *   · §4.7 手动微调：拖动整体 / 拖左边缘 / 拖右边缘 / 吸附（`Alt` 临时关闭）
  *   · §4.6 性能：拖动**只重绘脏矩形**（`computeDirtyRect` + `timeRangeToDirtyRect`）
  * 算法细节：docs/05 §5.4（手动微调的**时间陷阱**）、§11.4（命中检测）
@@ -557,6 +558,17 @@ export function useTimelineInteraction(options: TimelineInteractionOptions): Tim
             : '拖动右边缘（改终点）'
         // 一次性提交：一条撤销命令 + 一次批量落库（docs/13 §4.8）
         options.commit(label, context.before)
+      } else if (context.mode === 'dragging' && context.itemId) {
+        /**
+         * **单击片段（没有拖动）= 把播放头放到它的起点**。
+         *
+         * 真机需求：「对轨模块里按空格从选择的位置开始播放」——
+         * 用户选中的是**片段**，不是刻度尺上的某个位置。只选中不动播放头的话，
+         * 按空格播的还是上一次的位置（看起来就是「没从这一句开始」）。
+         * 拖动过（`context.moved`）就不动播放头：那时用户在意的是位置微调，不是试听。
+         */
+        const clicked = options.itemById(context.itemId)
+        if (clicked) options.setPlayhead(clicked.timelineStartMs)
       }
       hintText.value = ''
       options.renderer.requestDraw(null)

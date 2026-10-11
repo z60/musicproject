@@ -13,7 +13,7 @@
 import { strict as assert } from 'node:assert'
 import { describe, it } from 'node:test'
 
-import { alignCharsMonotone, foldVariants, type TimedText } from '../../src/shared/audio/char-align.ts'
+import { alignCharsMonotone, chooseInterRegionCut, foldVariants, type TimedText } from '../../src/shared/audio/char-align.ts'
 
 describe('繁简折叠', () => {
   it('常见繁体字折成简体；未知字原样保留', () => {
@@ -119,6 +119,96 @@ describe('逐字单调对齐', () => {
     assert.deepEqual(empty.unmatchedUnits, [])
     assert.deepEqual(alignCharsMonotone([{ text: '甲', startMs: 0, endMs: 1 }], []).spans, [])
   })
+
+
+describe('夹层切点（严格：前一行不许吃到下一句的开头）', () => {
+  it('识别段边界优先：段内跨了两行时，在段边界处切开', () => {
+    // 「嗎?」属于上一段，「實至間就」是新的一段 —— 真机 2221 章就是这么切的
+    const units: TimedText[] = [
+      { text: '嗎', startMs: 0, endMs: 100 },
+      { text: '?', startMs: 100, endMs: 600 },
+      { text: '實至間就', startMs: 600, endMs: 1200 },
+    ]
+    const picked = chooseInterRegionCut({
+      units,
+      segmentOf: [0, 0, 1],
+      prevSegment: 0,
+      nextSegment: 1,
+      prevUnitEndMs: 0,
+      nextUnitStartMs: 2000,
+      prevText: '心说那能斗得过吗？',
+      nextText: '邵大亨等人愣住了',
+    })
+    assert.equal(picked.cut, 2, '前两个单位归前一行，「實至間就」归后一行')
+    assert.match(picked.reason, /识别段边界/)
+  })
+
+  it('没有段边界时看停顿，而且标点吞掉的停顿时长要算在真字之间', () => {
+    // 逗号 token 自己横跨 520ms（真机里 whisper 就是这样），停顿要按「真字→真字」量
+    const units: TimedText[] = [
+      { text: ',', startMs: 0, endMs: 520 },
+      { text: '實至間', startMs: 520, endMs: 1000 },
+    ]
+    const picked = chooseInterRegionCut({
+      units,
+      segmentOf: [0, 0],
+      prevSegment: 0,
+      nextSegment: 0,
+      prevUnitEndMs: 0,
+      nextUnitStartMs: 1400,
+      prevText: '表情难以置信，',
+      nextText: '石志坚捏着茶杯',
+    })
+    assert.equal(picked.cut, 0, '520ms 的停顿说明这是一个新句子，整段归后一行')
+    assert.match(picked.reason, /停顿/)
+  })
+
+  it('既没段边界也没停顿时看文字：像前一行的尾巴就归前一行', () => {
+    const units: TimedText[] = [{ text: '轉動著杯身', startMs: 0, endMs: 1000 }]
+    const picked = chooseInterRegionCut({
+      units,
+      segmentOf: [0],
+      prevSegment: 0,
+      nextSegment: 0,
+      prevUnitEndMs: 0,
+      nextUnitStartMs: 1000,
+      prevText: '石志坚捏着茶杯转动杯身：',
+      nextText: '邵大亨等人愣住了',
+    })
+    assert.equal(picked.cut, 1, '这段识别文本就是前一行没被认出来的尾巴')
+    assert.match(picked.reason, /更像前一行/)
+  })
+
+  it('什么信号都没有时归后一行（严格）', () => {
+    const units: TimedText[] = [{ text: '甲乙', startMs: 0, endMs: 1000 }]
+    const picked = chooseInterRegionCut({
+      units,
+      segmentOf: [0],
+      prevSegment: 0,
+      nextSegment: 0,
+      prevUnitEndMs: 0,
+      nextUnitStartMs: 1000,
+      prevText: '丙丁',
+      nextText: '戊己',
+    })
+    assert.equal(picked.cut, 0)
+    assert.match(picked.reason, /严格/)
+  })
+
+  it('夹层为空 → 切在 0（等价于原来的「下一个单位起点」）', () => {
+    const picked = chooseInterRegionCut({
+      units: [],
+      segmentOf: [],
+      prevSegment: null,
+      nextSegment: null,
+      prevUnitEndMs: null,
+      nextUnitStartMs: null,
+      prevText: '甲',
+      nextText: '乙',
+    })
+    assert.equal(picked.cut, 0)
+  })
+})
 
   it('超过动态规划上限时退回贪心（不抛错，简单情况仍然全对）', () => {
     const units: TimedText[] = [

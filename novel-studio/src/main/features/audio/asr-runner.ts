@@ -26,6 +26,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { parseAsrOutput, type AsrOutputShape, type AsrToken } from '../../../shared/audio/asr-output.ts'
+import { parseSilencedetect, type AudioSilence } from '../../../shared/audio/silence.ts'
 import type { AsrSegment } from '../../../shared/audio/text-match.ts'
 import type { FfmpegRunner } from '../../../shared/ffmpeg/commands.ts'
 import type { Logger } from '../../infra/log/index.ts'
@@ -84,6 +85,13 @@ export interface AsrTranscribeResult {
    * 引擎不给 token 时为空数组，调用方退回按段对齐。
    */
   tokens: AsrToken[]
+  /**
+   * 音频里量出来的**静音区间**（ffmpeg `silencedetect`，转 16 kHz 那一步顺便做）。
+   *
+   * 识别给的时间戳有几十~几百毫秒误差（还随模型/线程数变），
+   * 但「这里有没有声音」是音频自己的事实 —— 对齐的最后一道吸附靠它。
+   */
+  silences: AudioSilence[]
   /** 输出形状（whisper.cpp / openai-whisper / plain），记日志用 */
   shape: AsrOutputShape
   /** 识别耗时（毫秒，仅用于日志） */
@@ -98,6 +106,15 @@ export interface AsrRunner {
    */
   transcribe(input: { absolutePath: string; durationMs?: number }): Promise<AsrTranscribeResult | null>
 }
+
+/**
+ * 静音检测的 ffmpeg 滤镜（-30dB 以下、持续 ≥120ms 算静音）。
+ *
+ * 阈值是**绝对** dBFS，所以它只影响「细不细」，不影响安全：
+ * 吸附永远被限制在「上一行认出来的话结束 ~ 下一行认出来的话开始」之间，
+ * 量不到静音就保持识别给的边界（见 `shared/audio/silence.ts`）。
+ */
+const SILENCE_FILTER = 'silencedetect=noise=-30dB:d=0.12'
 
 /** 默认的 whisper.cpp 可执行文件名（发布时把二进制放进 resources/bin） */
 function defaultBinaryName(): string {
@@ -136,33 +153,64 @@ export function createAsrRunner(deps: AsrRunnerDeps): AsrRunner {
     return candidates.find((p) => exists(p)) ?? null
   }
 
-  function resolveModel(): string | null {
-    const configured = deps.settings().modelPath?.trim()
-    if (configured) return configured
+  /**
+   * 只认**像样的**模型文件（≥ 20 MB）：下载中途的残文件（半截 ggml）会让 whisper 直接失败，
+   * 而那时用户看到的是「按停顿估计」—— 比「没有模型」更难查。
+   */
+  const MIN_MODEL_BYTES = 20 * 1024 * 1024
+  /** 精度顺序（越靠前越准、越慢）。边界靠时间戳定，越准的模型越不该省。 */
+  const MODEL_BY_ACCURACY = ['ggml-large-v3.bin', 'ggml-medium.bin', 'ggml-small.bin', 'ggml-base.bin']
+
+  /** 本机装了哪些「像样」的模型，按**精度从高到低**排 */
+  function installedModels(): string[] {
     const dir = deps.resourcePath('models/whisper')
-    const modelId = deps.settings().modelId?.trim() || 'ggml-base.bin'
-    const candidate = deps.resourcePath('models/whisper/' + modelId)
-    if (exists(candidate) && sizeOf(candidate) >= 20 * 1024 * 1024) return candidate
-    /**
-     * 配置的那个模型不在时**退一步扫目录**：用户常常只丢了一个模型进来
-     * （例如只下载了 ggml-small.bin，而设置的默认值是 ggml-base.bin），
-     * 这时若直接判「不可用」，用户会以为「装了也没用」。
-     * 优先级：small > medium > base > large > 其它 ggml 文件（精度优先，导入慢一点无所谓）。
-     */
-    /**
-     * 只认**像样的**模型文件（≥ 20 MB）：下载中途的残file（半截 ggml）会让 whisper 直接失败，
-     * 而那时用户看到的是「按停顿估计」—— 比「没有模型」更难查。
-     */
-    const MIN_MODEL_BYTES = 20 * 1024 * 1024
     const bins = listDir(dir).filter(
       (n) => n.startsWith('ggml-') && n.endsWith('.bin') && sizeOf(join(dir, n)) >= MIN_MODEL_BYTES,
     )
-    if (bins.length === 0) return null
-    const preferred = ['ggml-small.bin', 'ggml-medium.bin', 'ggml-base.bin', 'ggml-large-v3.bin']
-    for (const name of preferred) {
-      if (bins.includes(name)) return deps.resourcePath('models/whisper/' + name)
+    const rank = (n: string): number => {
+      const i = MODEL_BY_ACCURACY.indexOf(n)
+      return i < 0 ? MODEL_BY_ACCURACY.length : i
     }
-    return deps.resourcePath('models/whisper/' + bins.sort()[0]!)
+    return bins.sort((a, b) => rank(a) - rank(b) || a.localeCompare(b))
+  }
+
+  /**
+   * 挑模型：**显式路径 > 设置里选的（若装了）> 本机最准的**。
+   *
+   * 唯一一处「不听设置」的例外：设置里还是**出厂默认的 `ggml-base.bin`**、而本机装着更准的模型时，
+   * 用更准的那个（并记一条日志）。理由是用户已明确说过「导入速度无所谓，要的是音频和文本能对上」，
+   * 而真机实测同一段音频：base 把「众人」的起点报早了 238ms、还把停顿塞进一个 640ms 的「。」token 里，
+   * small 的时间戳紧得多。用户**主动**选过的其它模型一律尊重。
+   */
+  const SHIPPED_DEFAULT_MODEL = 'ggml-base.bin'
+
+  function modelPlan(): { configured: string | null; picked: string | null; upgraded: boolean } {
+    const configuredPath = deps.settings().modelPath?.trim() || null
+    if (configuredPath) return { configured: configuredPath, picked: configuredPath, upgraded: false }
+    const modelId = deps.settings().modelId?.trim() || null
+    const better = installedModels()[0] ?? null
+    if (modelId) {
+      const candidate = deps.resourcePath('models/whisper/' + modelId)
+      const installed = exists(candidate) && sizeOf(candidate) >= MIN_MODEL_BYTES
+      if (installed) {
+        if (modelId === SHIPPED_DEFAULT_MODEL && better !== null && better !== modelId) {
+          return {
+            configured: modelId,
+            picked: deps.resourcePath('models/whisper/' + better),
+            upgraded: true,
+          }
+        }
+        return { configured: modelId, picked: candidate, upgraded: false }
+      }
+    }
+    if (better !== null) {
+      return { configured: modelId, picked: deps.resourcePath('models/whisper/' + better), upgraded: false }
+    }
+    return { configured: modelId, picked: null, upgraded: false }
+  }
+
+  function resolveModel(): string | null {
+    return modelPlan().picked
   }
 
   function availability(): AsrAvailability {
@@ -207,9 +255,17 @@ export function createAsrRunner(deps: AsrRunnerDeps): AsrRunner {
         //   这里曾经直接传参数数组，于是 spawn 的「命令」变成了 `-hide_banner`，
         //   真机日志就是 `asr.failed: spawn -hide_banner ENOENT` —— 每个文件都退回 VAD，
         //   用户看到的是「装了 whisper 也没用、长句尾音对不上」。
+        /**
+         * 转码顺带量一次静音（`silencedetect` 只分析、不改音频）。
+         *
+         * 阈值取 -30dB / 最短 120ms：真机 2221 章旁白里「看向众人。| 众人心中一凉」之间
+         * 那段 739ms 的停顿就是这么量出来的（识别把它报在 36399~37138，
+         * 而 whisper 认为下一句的「众」从 36900 就开始了 —— 早了 238ms）。
+         */
         const convert = await deps.ffmpeg.execute([
           'ffmpeg', '-hide_banner', '-nostdin', '-y', '-i', input.absolutePath,
-          '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', wavPath,
+          '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le',
+          '-af', SILENCE_FILTER, wavPath,
         ])
         if (convert.exitCode !== 0) {
           deps.log?.warn?.('asr.convertFailed', {
@@ -218,6 +274,21 @@ export function createAsrRunner(deps: AsrRunnerDeps): AsrRunner {
             stderr: String(convert.stderr ?? '').slice(0, 400),
           })
           return null
+        }
+        /** 静音区间：量不到就是空数组（吸附这一步会自然跳过，不影响对齐） */
+        const silences = parseSilencedetect(String(convert.stderr ?? ''), input.durationMs)
+
+        /** 模型选择（含「出厂默认 base → 自动改用本机更准的模型」这一条）写进日志，便于排查 */
+        {
+          const plan = modelPlan()
+          if (plan.upgraded) {
+            deps.log?.info?.('asr.modelUpgraded', {
+              event: 'asr.modelUpgraded',
+              configured: plan.configured,
+              picked: plan.picked,
+              note: '设置里还是出厂默认的模型；本机装着更准的，已按「精度优先」使用（可在设置里指定别的）',
+            })
+          }
         }
 
         /**
@@ -278,13 +349,14 @@ export function createAsrRunner(deps: AsrRunnerDeps): AsrRunner {
           event: 'asr.transcribed',
           shape: parsed.shape,
           segments: parsed.segments.length,
+          silences: silences.length,
           // token 数=0 说明引擎只给了整段的时间（按段对齐，长句会粗一点）
           tokens: parsed.tokens.length,
           elapsedMs,
           binary: ready.binary,
           model: ready.model,
         })
-        return { segments: parsed.segments, tokens: parsed.tokens, shape: parsed.shape, elapsedMs }
+        return { segments: parsed.segments, tokens: parsed.tokens, silences, shape: parsed.shape, elapsedMs }
       } catch (e) {
         deps.log?.warn?.('asr.failed', {
           event: 'asr.failed',

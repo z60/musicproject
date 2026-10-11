@@ -24,6 +24,7 @@ import EmptyState from '@/shared/ui/EmptyState.vue'
 import { useMixStore } from '../stores/mix.store.ts'
 import { useSessionStore } from '@/app/store/session.store.ts'
 import { call } from '@/shared/lib/ipc.ts'
+import { cloneForIpc } from '@/shared/lib/clone.ts'
 import { formatDb, formatLufs } from '@/shared/lib/format.ts'
 import type { Id, MixProject } from '@shared/types.ts'
 
@@ -202,10 +203,12 @@ async function setDefault(project: MixProject): Promise<void> {
       await mix.writeNow()
       const current = mix.current
       if (!current) return
-      await call('mix:save', { mixProject: { ...current, isDefault: true } })
+      // ★ cloneForIpc：浅拷贝留下的 Proxy 会被结构化克隆直接拒收（真机：mix:save 报
+      //   「An object could not be cloned.」，见 shared/lib/clone.ts）
+      await call('mix:save', { mixProject: cloneForIpc({ ...current, isDefault: true }) })
       await mix.loadProject(project.id)
     } else {
-      await call('mix:save', { mixProject: { ...project, isDefault: true } })
+      await call('mix:save', { mixProject: cloneForIpc({ ...project, isDefault: true }) })
       await mix.listProjects(mix.current?.chapterId ?? session.chapterId ?? '')
     }
     hint.value = `已把「${project.name}」设为默认方案（下次进入本章会优先打开它）`

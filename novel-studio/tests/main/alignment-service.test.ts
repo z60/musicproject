@@ -331,6 +331,91 @@ describe('对轨域 · 自动排布', () => {
     }
   })
 
+  it('★ 换成品后重排必须按录音里当前选中的音频（旧裁剪点作废）', async () => {
+    const h = await harness()
+    try {
+      const arr = await h.service.create('c1', 'A', 'serialize')
+      const first = await h.service.autoArrange(arr.id, 'serialize', true, 500)
+      const before = first.items.find((i) => i.lineId === 'l1')!
+      assert.equal(before.srcOutMs, 2000, 'seg1 时长 2000')
+      const row = h.db.prepare('SELECT src_duration_ms FROM arrangement_items WHERE id = ?').get(before.id) as {
+        src_duration_ms: number
+      }
+      assert.equal(row.src_duration_ms, 2000, 'item 必须落库里记下「当时依据的音频长度」')
+
+      // ① 用户手工拖过边缘：同一段音频，重排必须保住手工裁剪
+      await h.service.updateItem(before.id, { srcInMs: 100, srcOutMs: 1800 })
+      const trimmed = await h.service.autoArrange(arr.id, 'serialize', true, 500)
+      const kept = trimmed.items.find((i) => i.lineId === 'l1')!
+      assert.equal(kept.srcInMs, 100, '同一段音频上的手工裁剪不能被重排冲掉')
+      assert.equal(kept.srcOutMs, 1800)
+
+      // ② 录音侧「设为成品」：take:setSelected **复用同一个 segment id**，只把音频换成新 take。
+      //    真机实测：选中的是 6919 ms（18961–25880），item 上还留着上一版 take 的 0–6300 ms。
+      //    take 换了 → 源区间与长度一起变（模拟成「换到文件另一处、长度也不同」）。
+      h.db.exec("UPDATE voice_segments SET src_in_ms = 300, src_out_ms = 3300, duration_ms = 3000 WHERE id = 'seg1'")
+      const after = await h.service.autoArrange(arr.id, 'serialize', true, 500)
+      const rebased = after.items.find((i) => i.lineId === 'l1')!
+      assert.equal(rebased.srcInMs, 300, '★ 音频换过了：旧裁剪点必须作废，按新 take 的源起点')
+      assert.equal(rebased.srcOutMs, 3300, '★ 必须按当前选中的音频整段排')
+      assert.equal(rebased.srcDurationMs, 3000, '重排后记住的是新音频的长度')
+      const persisted = h.db.prepare('SELECT src_in_ms, src_out_ms, src_duration_ms FROM arrangement_items WHERE id = ?').get(
+        rebased.id,
+      ) as { src_in_ms: number; src_out_ms: number; src_duration_ms: number }
+      // 逐字段断言（node:sqlite 的行是 null 原型对象，deepEqual 会因为原型不同而假红）
+      assert.equal(persisted.src_in_ms, 300)
+      assert.equal(persisted.src_out_ms, 3300)
+      assert.equal(persisted.src_duration_ms, 3000)
+
+      // ③ 再来一次「等长但换到别处」的 take：长度判据看不出来，必须靠区间包含关系抓到
+      h.db.exec("UPDATE voice_segments SET src_in_ms = 5000, src_out_ms = 8000, duration_ms = 3000 WHERE id = 'seg1'")
+      const moved = await h.service.autoArrange(arr.id, 'serialize', true, 500)
+      const movedItem = moved.items.find((i) => i.lineId === 'l1')!
+      assert.equal(movedItem.srcInMs, 5000, '★ 等长的另一段音频也要重排（长度相等 + 偏移不同）')
+      assert.equal(movedItem.srcOutMs, 8000)
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  it('★ 导入的音频：区间必须是「源文件里的那一段」，不是文件开头', async () => {
+    const h = await harness()
+    try {
+      /**
+       * 真机根因（第 2221 章实测）：
+       * 导入链路**不复制音频**（import.service 的 materializeSegment 有意简化），
+       * 一行可能落在整个导入文件的 18961–25880 ms 处，而 voice_segments.duration_ms 只有 6919。
+       * 老实现把 item 的区间写成 `0 … duration_ms` —— 于是**从文件开头开始播**：
+       * 第一行（srcIn=0）听不出问题，第二行起全部错位。
+       */
+      h.db.exec("UPDATE voice_segments SET src_in_ms = 18961, src_out_ms = 25880, duration_ms = 6919 WHERE id = 'seg1'")
+      const arr = await h.service.create('c1', 'A', 'serialize')
+      const result = await h.service.autoArrange(arr.id, 'serialize', true, 500)
+      const item = result.items.find((i) => i.lineId === 'l1')!
+      assert.equal(item.srcInMs, 18961, '★ 起点必须是源文件坐标，不能是 0')
+      assert.equal(item.srcOutMs, 25880, '★ 终点同样；写成 6919 就是从文件开头切 6.9 秒')
+      assert.equal(item.srcDurationMs, 6919, '长度仍是区间长度（用于判断「音频换没换」）')
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  it('历史数据（src_duration_ms=0 = 不知道）在下次重排按当前音频重排一次', async () => {
+    const h = await harness()
+    try {
+      const arr = await h.service.create('c1', 'A', 'serialize')
+      await h.service.autoArrange(arr.id, 'serialize', true, 500)
+      // 模拟本次迁移之前写下的行：没有「当时依据的音频长度」，只有一对裁剪点
+      h.db.exec('UPDATE arrangement_items SET src_duration_ms = 0, src_in_ms = 100, src_out_ms = 1800')
+      const after = await h.service.autoArrange(arr.id, 'serialize', true, 500)
+      const item = after.items.find((i) => i.lineId === 'l1')!
+      assert.equal(item.srcInMs, 0)
+      assert.equal(item.srcOutMs, 2000, '不知道就按当前音频重排（对已经跑偏的时间线来说正是想要的）')
+    } finally {
+      h.cleanup()
+    }
+  })
+
   it('单轨重置只动那一轨，其它轨的位置不变', async () => {
     const h = await harness()
     try {

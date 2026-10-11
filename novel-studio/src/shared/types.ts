@@ -651,6 +651,18 @@ export interface ArrangementItem {
   locked: boolean
   orderInTrack: number
   overlapWith: Id | null
+  /**
+   * 生成这条 item 时，`segmentId` 那段音频的**时长**（ms）。
+   *
+   * 为什么必须记下来：录音侧「设为成品」换 take 时 **复用同一个 `voice_segments.id`**、
+   * 只把 `segments/{id}.wav` 换成新 take 的音频（见 docs/12 §8.1）。于是 item 上按旧音频
+   * 定的 `srcInMs/srcOutMs` 不再指向用户选中的那段音频，而它与「用户手工拖过的裁剪」
+   * 在库里长得**一模一样**，无法区分。有了这个字段：
+   *   · 与当前 segment 时长相等 → 裁剪仍属于这段音频，保留（手工微调不丢）；
+   *   · 不等 → 音频换过了，按当前音频整段重排（自动对轨必须按「录音里选中的音频」来排）。
+   * 0 = 不知道（本列之前的历史数据）→ 下次自动对轨按当前音频重排一次。
+   */
+  srcDurationMs?: number
 }
 
 export interface ArrangementItemPatch {

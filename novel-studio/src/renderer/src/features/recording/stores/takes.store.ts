@@ -37,6 +37,63 @@ export const TAKE_FLAG_PRESETS: TakeFlagPreset[] = [
   { key: 'reported', label: '文本有问题', severe: false, hint: '任务包模式下反馈给导演侧（docs/12 §5）' },
 ]
 
+/**
+ * **系统打的**标记（不是用户手打的）：只有标签与说明，不进「可打标记」列表。
+ *
+ * ★ 真机复报（2221 章旁白第 13 行「音频和文本错误」）：导入时「识别文本没对上」的行
+ * 只能拿**按字数硬切的占位音**，take 上打了 `import-needs-review` —— 但界面上从来没显示过它，
+ * 用户在录音页试听时只会看到「这一行的音频不对」，无从知道原因。这里给它中文标签与说明。
+ */
+export interface SystemTakeFlag {
+  key: string
+  label: string
+  severe: boolean
+  hint: string
+}
+
+export const SYSTEM_TAKE_FLAGS: SystemTakeFlag[] = [
+  {
+    key: 'imported',
+    label: '导入',
+    severe: false,
+    hint: '来自「按说话人导入音频」的切片，不是本地录的',
+  },
+  {
+    key: 'import-needs-review',
+    label: '导入需确认',
+    severe: true,
+    hint:
+      '导入时识别文本没有与这一行对上，边界是按字数估算硬切的 —— 开头/末尾可能带进相邻台词，请试听确认或重录（docs/12 §8.1）',
+  },
+]
+
+/** 标记的中文标签：用户手打的预置 > 系统标记 > 原样显示 */
+export function takeFlagLabel(flag: string): string {
+  return (
+    TAKE_FLAG_PRESETS.find(p => p.key === flag)?.label ??
+    SYSTEM_TAKE_FLAGS.find(p => p.key === flag)?.label ??
+    flag
+  )
+}
+
+/** 标记的说明（鼠标悬停） */
+export function takeFlagHint(flag: string): string {
+  return (
+    TAKE_FLAG_PRESETS.find(p => p.key === flag)?.hint ??
+    SYSTEM_TAKE_FLAGS.find(p => p.key === flag)?.hint ??
+    '自定义标记'
+  )
+}
+
+/** 是否属于「需要立刻处理」的标记（列表里标红） */
+export function isSevereTakeFlag(flag: string): boolean {
+  return (
+    TAKE_FLAG_PRESETS.find(p => p.key === flag)?.severe ??
+    SYSTEM_TAKE_FLAGS.find(p => p.key === flag)?.severe ??
+    false
+  )
+}
+
 export interface TakeSelectionUndo {
   lineId: string
   /** 撤销时要选回的 take（可能为 null：此前根本没有成品） */

@@ -194,11 +194,20 @@ export function autoArrange(input: AutoArrangeInput): AutoArrangeResult {
     const fadeInMs = line.existing?.fadeInMs ?? defaultFadeMs
     const fadeOutMs = line.existing?.fadeOutMs ?? defaultFadeMs
     const srcInMs = Math.max(0, line.srcInMs ?? 0)
-    const srcOutCandidate = line.srcOutMs ?? line.segmentDurationMs ?? srcInMs
+    /**
+     * 夹取上界 = **srcIn + 片段长度**，而不是片段长度本身。
+     *
+     * ★ `srcInMs/srcOutMs` 是**源文件坐标**（见 arrangement-render.ts 的注释）：导入链路不复制
+     * 音频，一行可能落在整个导入文件的 18961–25880 ms 处，而片段长度只有 6919 ms。
+     * 老写法把 `srcOut` 夹到 6919（= 文件开头）—— 排出来的是别人的音，而且 Export 也一样错。
+     */
+    const segmentEndMs =
+      typeof line.segmentDurationMs === 'number' ? srcInMs + Math.max(0, line.segmentDurationMs) : null
+    const srcOutCandidate = line.srcOutMs ?? segmentEndMs ?? srcInMs
     const srcOutMs =
-      typeof line.segmentDurationMs === 'number'
-        ? Math.min(Math.max(srcOutCandidate, srcInMs), line.segmentDurationMs)
-        : Math.max(srcOutCandidate, srcInMs)
+      segmentEndMs === null
+        ? Math.max(srcOutCandidate, srcInMs)
+        : Math.min(Math.max(srcOutCandidate, srcInMs), segmentEndMs)
 
     const pauseBeforeMs = resolvePauseAfterMs(prevLine, defaultPauseMs)
     let startMs = Math.max(cursor + pauseBeforeMs, 0)
@@ -215,6 +224,11 @@ export function autoArrange(input: AutoArrangeInput): AutoArrangeResult {
       timelineStartMs: Math.round(startMs),
       srcInMs: Math.round(srcInMs),
       srcOutMs: Math.round(srcOutMs),
+      /**
+       * 记下这次排布**依据的音频长度**：录音侧换成品后 segment id 不变、音频被换掉，
+       * 下次自动对轨靠它判断「item 上的裁剪点还算不算数」（见 shared/types.ts 的同名注释）。
+       */
+      srcDurationMs: Math.round(Math.max(0, line.segmentDurationMs ?? 0)),
       fadeInMs,
       fadeOutMs,
       locked: line.existing?.locked ?? false,

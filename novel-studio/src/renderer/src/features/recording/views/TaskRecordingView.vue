@@ -34,6 +34,7 @@ import { useShortcuts } from '../composables/useShortcuts.ts'
 import { useDeviceStore } from '../stores/device.store.ts'
 import { useRecordingStore } from '../stores/recording.store.ts'
 import { useTakesStore } from '../stores/takes.store.ts'
+import { useChaptersStore } from '@/features/book/stores/chapters.store.ts'
 import { useSessionStore } from '@/app/store/session.store.ts'
 import { useSettingsStore } from '@/app/store/settings.store.ts'
 import { useUiStore } from '@/app/store/ui.store.ts'
@@ -47,6 +48,8 @@ const recording = useRecordingStore()
 const takes = useTakesStore()
 const devices = useDeviceStore()
 const recorder = useRecorder()
+/** 书内章节顺序（「下一章」按钮要用；与对轨页同一个 store） */
+const chapters = useChaptersStore()
 
 /** 任务包 id（路由参数可选：手动进入时按角色模式，docs/12 §1 的模式表） */
 const packageId = computed(() => (typeof route.params.packageId === 'string' ? route.params.packageId : ''))
@@ -63,6 +66,18 @@ const compareOpen = ref(false)
 const comparePicks = ref<string[]>([])
 const confirmDiscard = ref(false)
 const activeFlags = ref<string[]>([])
+
+/**
+ * 「录完跳下一未录行」（默认开）。
+ *
+ * ⚠️ 真机反馈：「任务包录音里【录完跳下一未录行】取消勾选后也会跳到没有录制的」。
+ * 两个原因叠在一起：
+ *   1. 模板把 `:auto-next="true"` **写死**了、也没有接 `@update:auto-next` ——
+ *      勾选框能看到、能点、DOM 会变成未勾选，但组件拿到的永远是 true，事件没人收；
+ *   2. 停止后无条件 `currentIndex += 1`，**压根没看这个开关**。
+ * 现在：开关是本地状态并双向绑定；停止后只在 `autoNext` 打开时前进。
+ */
+const autoNext = ref(true)
 
 const actor = computed<VoiceActor | null>(() => session.actor)
 const characterNames = computed(() => new Map(characters.value.map(character => [character.id, character.name])))
@@ -133,6 +148,34 @@ watch(currentLine, (line) => {
   void takes.loadByLine(line.id)
 })
 
+/** 下一章（按书内顺序）；还没加载章节表时先加载 */
+async function goNextChapter(): Promise<void> {
+  if (recording.isRecording || recording.isPaused) {
+    pageNotice.value = '录音中不能切章：请先停止本次录音。'
+    return
+  }
+  if (session.bookId && !chapters.rows.length) await chapters.load(session.bookId)
+  const list = chapters.rows
+  const index = list.findIndex(chapter => chapter.id === session.chapterId)
+  const next = index >= 0 ? list[index + 1] ?? null : null
+  if (!next) {
+    pageNotice.value = index < 0 ? '章节表里找不到当前章，无法定位下一章。' : '已经是本书最后一章了。'
+    return
+  }
+  session.selectChapter(next)
+}
+
+/**
+ * 切章后必须**重新加载画本行与 take**：本视图没有画本/章节 watcher，
+ * 不重载的话界面还停在上一章的行上（切换看起来「没反应」）。
+ */
+watch(() => session.chapterId, async () => {
+  currentIndex.value = 0
+  pageNotice.value = ''
+  await loadAll()
+  if (currentLine.value) recording.setLine(currentLine.value.id)
+})
+
 /** 修剪参数取设置（docs/04 §8.2） */
 function trimOptions() {
   const audio = settings.audio
@@ -189,8 +232,17 @@ async function stopRecording(): Promise<void> {
   recording.setStopResult(result)
   if (result.take) takes.addTake(result.take)
   if (lineId) await takes.loadByLine(lineId)
-  // 自动跳下一行（任务包里跳过已录行，避免在已录区域来回，docs/12 §3.3）
-  if (nextLine.value) currentIndex.value += 1
+  /**
+   * 自动跳下一行（任务包里按顺序前进，避免在已录区域来回，docs/12 §3.3）。
+   *
+   * ★ 必须**尊重开关**：没勾「录完跳下一未录行」时停在当前行，
+   *   并明说一句 —— 否则用户看到的界面是「勾选框没勾、行却自己跑了」。
+   */
+  if (autoNext.value) {
+    if (nextLine.value) currentIndex.value += 1
+  } else {
+    pageNotice.value = '已停在当前行（未勾选「录完跳下一未录行」）。'
+  }
 }
 async function redoRecording(): Promise<void> {
   const projectId = session.projectId
@@ -316,6 +368,14 @@ onBeforeUnmount(() => {
         </p>
       </div>
       <div class="ns-task__row">
+        <button
+          type="button"
+          class="ns-task__btn"
+          title="切到本书的下一章继续录（录音中不可用）"
+          @click="goNextChapter"
+        >
+          下一章 →
+        </button>
         <button type="button" class="ns-task__btn" @click="router.push('/recording/diagnostics')">设备诊断</button>
         <button type="button" class="ns-task__btn" :disabled="!recording.sessionId" @click="confirmDiscard = true">
           丢弃本次录音
@@ -367,13 +427,14 @@ onBeforeUnmount(() => {
       </section>
 
       <section class="ns-task__col">
-        <TransportBar :state="recording.state" :mode="mode" :auto-next="true" :can-punch-in="false"
+        <TransportBar :state="recording.state" :mode="mode" :auto-next="autoNext" :can-punch-in="false"
           :has-punch-range="false" :duration-ms="recording.durationMs" :disk-low="recording.diskLow"
           :line-progress="currentLinePosition()" :take-count="currentTakes.length" :shortcuts="shortcutHints"
           :has-selected-take="selectedTake !== null" :countdown-ms="settings.audio?.countdownMs ?? 0"
           @record="toggleRecord" @stop="stopRecording" @pause="recorder.pause" @resume="recorder.resume"
           @prev="moveLine(-1)" @next="moveLine(1)" @skip="skipLine" @redo="redoRecording" @mark="markRecording"
-          @punch-in="onPunchRange" @update:countdown-ms="onCountdownChange" />
+          @punch-in="onPunchRange" @update:countdown-ms="onCountdownChange"
+          @update:auto-next="autoNext = $event" />
         <TakeList :takes="visibleTakes" :selected-id="selectedTake?.id ?? null" show-source
           :project-id="session.projectId ?? ''" :loading="takes.loading" :active-flags="activeFlags"
           :punch-in-ms="0" :punch-out-ms="0" @select="onSelectTake" @remove="onRemoveTake" @flag="onFlagTake"

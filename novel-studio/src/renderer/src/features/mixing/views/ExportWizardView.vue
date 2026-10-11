@@ -144,6 +144,55 @@ const nextDisabledReason = computed(() => {
   return store.stepIssues[0] ?? ''
 })
 
+/**
+ * Step 6 的「还差什么才能开始导出」。
+ *
+ * ★ 真机反馈（docs/91 §5.2.76）：「预检报告里 全部已知悉这个点的位置没有」+
+ *   「点击开始导出没有反应」。原因是页脚只显示一句泛泛的「请先完成预检，并处理全部阻断项、
+ *   确认全部警告」，按钮又是 disabled —— 点击毫无反馈；而「全部已知悉」只长在报告里
+ *   警告块的表头，用户站在「开始导出」这个动作点上，看不到任何可操作的东西。
+ *
+ * 这里把**真实状态**摊到页脚，并把能立刻做的事（全部已知悉 / 跑预检）放在旁边。
+ */
+const exportGate = computed<{ text: string; action: 'ackAll' | 'run' | null } | null>(() => {
+  if (!ffmpegReady.value) return { text: 'ffmpeg 不可用：请先在设置里配置 ffmpeg 路径', action: null }
+  if (!qc.hasResult) {
+    return {
+      text: hadPreCheck.value ? '参数已变更：上次预检结果已作废，请重跑预检' : '还没有预检结果：先跑一次预检',
+      action: 'run',
+    }
+  }
+  if (qc.blockers.length > 0) {
+    return { text: '还有 ' + formatInt(qc.blockers.length) + ' 个阻断项未处理（在报告里点「去处理」）', action: null }
+  }
+  if (qc.pendingWarnings.length > 0) {
+    return { text: '还有 ' + formatInt(qc.pendingWarnings.length) + ' 项警告未确认', action: 'ackAll' }
+  }
+  return null
+})
+/** 这次会话里是否出过预检结果（用于区分「从没跑过」与「参数变了被作废」） */
+const hadPreCheck = ref(false)
+watch(() => qc.hasResult, (has) => { if (has) hadPreCheck.value = true }, { immediate: true })
+/** 点了「开始导出」但被门槛挡住时的明确反馈（不能点了没反应） */
+const startBlockedNotice = ref('')
+
+/** 跑一次预检（页脚的快捷入口，与报告里的按钮同一动作） */
+function runPreCheck(): void {
+  const request = store.preCheckRequest
+  if (!request) {
+    startBlockedNotice.value = '还不能预检：请确认已在第 1 步选定书籍与章节。'
+    return
+  }
+  startBlockedNotice.value = ''
+  void qc.run(request, store.rangeLabel)
+}
+
+/** 页脚的「全部已知悉」（与报告里的按钮同一动作） */
+function onAcknowledgeAll(): void {
+  qc.acknowledgeAll()
+  startBlockedNotice.value = ''
+}
+
 /** 输出目录 + 相对路径 = 实际写盘位置（Step 2 的「写到哪儿」） */
 function fullPath(relative: string): string {
   const dir = store.params.outputDir.replace(/[\\/]+$/, '')
@@ -176,15 +225,22 @@ function onRangeChange(value: unknown): void {
   if (value === 'current' || value === 'selected' || value === 'book') store.setRangeMode(value)
 }
 
+/**
+ * 章节勾选：`el-checkbox` 的载荷是 string | number | boolean，这里只认 `true`。
+ *
+ * ⚠️ 模板里必须写成**内联箭头**：`(value) => onToggleChapter(row.id, value)`。
+ * 原来写的是 `@update:model-value="onToggleChapterInput(row.id)"`（把 chapterId 柯里化进处理器），
+ * 但 Vue 只把「裸标识符/成员表达式」当处理器，**带调用的表达式一律编译成内联语句**，
+ * 那个「返回处理器」的函数被调用后返回值被丢掉 —— 于是**勾选框点了没有任何反应**。
+ * 真机反馈「导出向导模块里无法单选某一章」就是它。
+ */
 function onToggleChapter(chapterId: string, value: unknown): void {
   store.toggleChapter(chapterId, value === true)
 }
 
-/** 章节勾选：el-checkbox 的载荷是 string | number | boolean，按行把 chapterId 固定进处理器 */
-function onToggleChapterInput(chapterId: string): (value: boolean | string | number) => void {
-  return (value: boolean | string | number): void => {
-    onToggleChapter(chapterId, value)
-  }
+/** 只选这一章（清掉其它选择）——一次点击完成「单选某一章」 */
+function onSelectOnly(row: unknown): void {
+  store.selectOnlyChapter(asChapterRow(row).id)
 }
 
 function onFormatChange(value: unknown): void {
@@ -370,7 +426,25 @@ function onJumpIssue(target: ExportJumpTarget, payload: { chapterId: string | nu
 }
 
 function onStartExport(): void {
-  void flow.start()
+  /**
+   * 被门槛挡住时必须**说清楚**（真机：「点击开始导出没有反应」）：
+   * 原来按钮是 disabled，点了什么都不会发生；现在按钮可点，拦下来也告诉用户差什么。
+   */
+  const gate = exportGate.value
+  if (gate) {
+    startBlockedNotice.value = '还不能开始导出：' + gate.text
+    return
+  }
+  startBlockedNotice.value = ''
+  /**
+   * ★ 最后一道兜底：编排层若因为别的原因（任务还在跑 / 没选到章节）没启动任务，
+   * 也必须把原因显示出来 —— 「点了没反应」是最难被用户容忍的一种失败（docs/91 §5.2.77）。
+   */
+  void flow.start().then((created) => {
+    if (!created) {
+      startBlockedNotice.value = '导出没有开始：' + (flow.startBlockedReason.value ?? '请重试，或把日志里的最后一条错误发我')
+    }
+  })
 }
 
 function onCancelTask(): void {
@@ -512,7 +586,9 @@ function onRestart(): void {
             <el-button size="small" @click="store.selectAllChapters()">全选</el-button>
             <el-button size="small" @click="store.invertSelection()">反选</el-button>
             <el-button size="small" @click="store.clearSelection()">清空</el-button>
-            <span class="ns-wiz__hint">已选 {{ formatInt(store.targetChapterCount) }} 章</span>
+            <span class="ns-wiz__hint">
+              已选 {{ formatInt(store.targetChapterCount) }} 章（每行「仅此」= 只导这一章）
+            </span>
           </div>
 
           <div v-if="store.volumeGroups.length > 1" class="ns-wiz__volumes">
@@ -527,12 +603,14 @@ function onRestart(): void {
           </div>
 
           <el-table :data="store.chapters" size="small" border height="320">
-            <el-table-column width="56" label="选">
+            <el-table-column width="104" label="选">
               <template #default="{ row }">
+                <!-- 内联箭头：把 row.id 固定进处理器（用「返回处理器的工厂」那种写法会点不动，见脚本注释） -->
                 <el-checkbox
                   :model-value="isSelected(row.id)"
-                  @update:model-value="onToggleChapterInput(row.id)"
+                  @update:model-value="(value) => onToggleChapter(row.id, value)"
                 />
+                <el-button size="small" link type="primary" @click.stop="onSelectOnly(row)">仅此</el-button>
               </template>
             </el-table-column>
             <el-table-column prop="seq" label="#" width="60" />
@@ -1117,14 +1195,46 @@ function onRestart(): void {
     <!-- 步骤门槛提示 + 导航（切步骤不清数据 → 后退不丢数据） -->
     <footer v-if="store.ready && store.bookId" class="ns-wiz__foot">
       <div class="ns-wiz__foot-issues">
-        <span v-if="store.stepIssues.length && store.step !== 7 && store.step !== 8" class="ns-wiz__foot-issue">
+        <!--
+          Step 6：把预检的**真实状态**摊在这里，并把能立刻执行的动作放在旁边。
+          真机反馈（docs/91 §5.2.76）：「全部已知悉这个点的位置没有」+「点击开始导出没有反应」——
+          原来的页脚只有一句泛泛的提示，而「全部已知悉」只长在报告里警告块的表头。
+        -->
+        <template v-if="store.step === 6 && exportGate">
+          <span class="ns-wiz__foot-issue" :class="{ 'is-clicked': !!startBlockedNotice }">
+            {{ startBlockedNotice || exportGate.text }}
+          </span>
+          <el-button
+            v-if="exportGate.action === 'ackAll'"
+            size="small"
+            link
+            type="primary"
+            @click="onAcknowledgeAll"
+          >
+            全部已知悉
+          </el-button>
+          <el-button v-else-if="exportGate.action === 'run'" size="small" link type="primary" @click="runPreCheck">
+            开始预检
+          </el-button>
+        </template>
+        <span v-else-if="store.stepIssues.length && store.step !== 7 && store.step !== 8" class="ns-wiz__foot-issue">
           {{ nextDisabledReason }}
         </span>
         <span v-else class="ns-wiz__hint">第 {{ store.step }} 步 · {{ store.stepTitle }}</span>
       </div>
       <div class="ns-wiz__foot-actions">
         <el-button :disabled="store.step <= 1" @click="store.prevStep()">上一步</el-button>
-        <el-button v-if="store.step === 6" type="primary" :disabled="!canGoNext" @click="onStartExport">
+        <!--
+          保持可点：被门槛挡住时由 onStartExport 明确说明差什么。
+          点了没反应比「点了但告诉你为什么」糟糕得多（ffmpeg 缺失除外，那是环境问题）。
+        -->
+        <el-button
+          v-if="store.step === 6"
+          type="primary"
+          :disabled="!ffmpegReady"
+          :title="exportGate ? '还不能开始导出：' + exportGate.text : '开始导出'"
+          @click="onStartExport"
+        >
           开始导出
         </el-button>
         <el-button v-else-if="store.step === 7" type="primary" :disabled="!store.report" @click="onViewReport">
@@ -1346,6 +1456,11 @@ function onRestart(): void {
 .ns-wiz__foot-issue {
   color: var(--ns-warning, #e6a23c);
   font-size: 12px;
+}
+/* 点了「开始导出」被门槛挡住时：这句话必须显眼（否则用户只感觉「没反应」） */
+.ns-wiz__foot-issue.is-clicked {
+  color: var(--ns-danger, #f56c6c);
+  font-weight: 600;
 }
 .ns-wiz__foot-actions {
   display: flex;

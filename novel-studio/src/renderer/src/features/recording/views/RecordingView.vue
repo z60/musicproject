@@ -50,6 +50,7 @@ import { useContinuousStore } from '../stores/continuous.store.ts'
 import { useDeviceStore } from '../stores/device.store.ts'
 import { useRecordingStore } from '../stores/recording.store.ts'
 import { useTakesStore } from '../stores/takes.store.ts'
+import { useChaptersStore } from '@/features/book/stores/chapters.store.ts'
 import { useSessionStore } from '@/app/store/session.store.ts'
 import { useSettingsStore } from '@/app/store/settings.store.ts'
 import { useUiStore } from '@/app/store/ui.store.ts'
@@ -61,6 +62,8 @@ const settings = useSettingsStore()
 const ui = useUiStore()
 const recording = useRecordingStore()
 const takes = useTakesStore()
+/** 书内章节顺序（「下一章」按钮要用；与对轨页同一个 store） */
+const chapters = useChaptersStore()
 const devices = useDeviceStore()
 const continuous = useContinuousStore()
 const recorder = useRecorder()
@@ -233,6 +236,45 @@ watch(currentLine, (line) => {
   recording.setLine(line.id)
   void takes.loadByLine(line.id)
 })
+
+/** 下一章（按书内顺序）；章节表没加载时先加载 */
+async function goNextChapter(): Promise<void> {
+  if (recording.isRecording || recording.isPaused) {
+    pageNotice.value = '录音中不能切章：请先停止本次录音。'
+    return
+  }
+  if (session.bookId && !chapters.rows.length) await chapters.load(session.bookId)
+  const list = chapters.rows
+  const index = list.findIndex(chapter => chapter.id === session.chapterId)
+  const next = index >= 0 ? list[index + 1] ?? null : null
+  if (!next) {
+    pageNotice.value = index < 0 ? '章节表里找不到当前章，无法定位下一章。' : '已经是本书最后一章了。'
+    return
+  }
+  pageNotice.value = ''
+  session.selectChapter(next)
+}
+
+/**
+ * ★ 切章后必须重新加载：本视图原来**没有章节 watcher**（只在 onMounted 里 loadAll 一次），
+ * 于是「下一章」按下去，行还是上一章的 —— 看起来像没反应。
+ */
+watch(() => session.chapterId, async (id, previous) => {
+  if (!id || id === previous) return
+  releasePinnedTake()
+  currentIndex.value = 0
+  timelineResetForChapter()
+  await loadAll()
+  if (currentLine.value) {
+    recording.setLine(currentLine.value.id)
+    await takes.loadByLine(currentLine.value.id)
+  }
+})
+
+/** 切章时清掉与「上一章音频/波形」相关的本地状态（波形、试听元素） */
+function timelineResetForChapter(): void {
+  waveformRef.value?.clearTake()
+}
 
 // ── take 预览波形（docs/91 §5.2.46 / §5.2.47）────────────────────────────────
 // 未录音时，波形区显示 take（试录版本）的整段波形；没有 take 时为空。
@@ -641,6 +683,14 @@ onBeforeUnmount(() => {
         >
           按说话人导入
         </button>
+        <button
+          type="button"
+          class="ns-rec__mode"
+          title="切到本书的下一章继续录（录音中不可用；已录进度按章独立）"
+          @click="goNextChapter"
+        >
+          下一章 →
+        </button>
       </div>
       <!-- 按角色录制：只走/只录该角色的行（docs/12 §5 的轻量版，不改画本）；连续模式不适用 -->
       <div v-if="mode === 'line_by_line'" class="ns-rec__row">
@@ -749,8 +799,15 @@ onBeforeUnmount(() => {
       </section>
     </div>
 
-    <!-- 底部走带（逐行模式） -->
-    <TransportBar v-if="mode === 'line_by_line'" :state="recording.state" :mode="mode" :auto-next="autoNext"
+    <!--
+      底部走带（逐行模式）。
+      ★ 包一层 sticky 容器：真机反馈「最下面的录制框架会根据文本多少上下移动」——
+      走带原本是流内元素，上方行文本一变长就把它顶下去。
+      注意滚动祖先是外层 .ns-shell__main（本视图自己**不能**开滚动容器，
+      见下面 .ns-rec 的注释：它的高度是内容高，开了也永远不滚，sticky 会失效）。
+    -->
+    <div v-if="mode === 'line_by_line'" class="ns-rec__transport">
+    <TransportBar :state="recording.state" :mode="mode" :auto-next="autoNext"
       :duration-ms="recording.durationMs" :line-progress="lineProgressText" :disk-low="!diskOk"
       :take-count="currentTakes.length" :has-selected-take="selectedTake !== null" :shortcuts="shortcutHints"
       :countdown-ms="settings.audio?.countdownMs ?? 0" :can-punch-in="selectedTake !== null"
@@ -758,6 +815,7 @@ onBeforeUnmount(() => {
       @pause="recorder.pause" @resume="recorder.resume" @prev="moveLine(-1)" @next="nextUnrecordedByUser"
       @redo="redoRecording" @mark="markRecording" @punch-in="openPunchIn" @help="showShortcuts = true"
       @update:countdown-ms="patchAudio({ countdownMs: $event })" @update:auto-next="autoNext = $event" />
+    </div>
 
     <!-- 预卷与试听共用 TakeList 的播放元素（已挂监听图），因此这里不需要额外 <audio> -->
     <TakeCompareDialog v-model="compareOpen" :project-id="session.projectId ?? ''" @select="onSelectTake"
@@ -794,7 +852,31 @@ onBeforeUnmount(() => {
 
 <style scoped>
 /* 紧凑写法：每条规则一行，避免样式表喧宾夺主 */
-.ns-rec { display: flex; flex-direction: column; gap: 10px; padding: 14px; overflow-y: auto; }
+/*
+ * ★ 这里**故意不要** overflow-y: auto。
+ * 本视图的高度是内容高（没有 height/flex 约束），开了滚动容器也**永远不会滚**，
+ * 只会让 position: sticky 的「滚动祖先」变成它自己 —— 于是走带的 sticky 完全失效
+ * （外层 .ns-shell__main 才是真正会滚的那个，见 AppShell.vue）。
+ * 把滚动交给外层，sticky 才有意义。
+ */
+.ns-rec { display: flex; flex-direction: column; gap: 10px; padding: 14px; }
+/**
+ * 底部走带：**吸在可视内容区底部**。
+ * 走带原本是流内元素，上方上下文行一变长就把它顶下去（真机反馈）。
+ * 用 sticky 钉住；滚动祖先是外层 .ns-shell__main（那里才有滚动条），
+ * 所以 bottom 取 0 —— 贴住可视内容区的下沿，滚动内容从它后面穿过。
+ */
+.ns-rec__transport {
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  /* 通栏：抵消父容器的水平 padding，滚动内容不会从走带两侧露出来 */
+  margin: 0 -14px;
+  padding: 8px 14px 14px;
+  background: var(--ns-bg, #fff);
+  /* 一条很淡的上沿阴影，让「内容从后面穿过」看得出来 */
+  box-shadow: 0 -6px 12px -10px rgb(0 0 0 / 25%);
+}
 .ns-rec__head { display: flex; flex-wrap: wrap; gap: 10px 20px; align-items: flex-start; justify-content: space-between; }
 .ns-rec__row, .ns-rec__field { display: flex; gap: 6px 10px; align-items: center; }
 .ns-rec__field { flex-direction: column; gap: 2px; align-items: stretch; font-size: 12px; color: var(--ns-text-secondary, #909399); }

@@ -74,7 +74,8 @@ const durationMs = computed(() => (item.value ? arrangement.durationOf(item.valu
 const endMs = computed(() => startMs.value + durationMs.value)
 
 const source = computed(() => (item.value ? arrangement.resolveSource(item.value, true) : null))
-const sourceDurationMs = computed(() => source.value?.durationMs ?? null)
+/** 源内可用终点（源文件坐标）：srcIn/srcOut 的输入上界 —— 见 SegmentSource.sourceEndMs */
+const sourceEndMs = computed(() => source.value?.sourceEndMs ?? null)
 
 /** 重叠对象：item.overlapWith 是主进程给的配对 id（可能是双向的，取对端即可） */
 const overlapItem = computed(() => {
@@ -173,7 +174,7 @@ function clampPatch(field: NumericField, value: number): number {
     }
     case 'srcOutMs': {
       const lower = current.srcInMs + 10
-      const upper = sourceDurationMs.value ?? Number.POSITIVE_INFINITY
+      const upper = sourceEndMs.value ?? Number.POSITIVE_INFINITY
       return Math.min(upper, Math.max(lower, rounded))
     }
     case 'fadeInMs':
@@ -217,12 +218,13 @@ function onFieldInput(field: NumericField, value: number | undefined): void {
   flush()
 }
 
-/** 数值输入（el-input-number）：载荷为 number，输入框被清空时为 undefined */
-function onNumberFieldInput(field: NumericField): (value: number | undefined) => void {
-  return (value: number | undefined): void => {
-    onFieldInput(field, value)
-  }
-}
+/**
+ * 数值输入（el-input-number）：载荷为 number，输入框被清空时为 undefined。
+ *
+ * ⚠️ 模板里必须写成**内联箭头**：`(value) => onFieldInput('srcInMs', value)`。
+ * 原来用的是「工厂函数返回处理器」那种写法（`onNumberFieldInput('srcInMs')`）——
+ * Vue 把带调用的绑定当**内联语句**编译，返回的处理器被丢掉，**输入框改了不生效**。
+ * （同一个坑在导出向导表现为「无法单选某一章」，见 tests/renderer/export-single-chapter.test.ts 的全仓扫描。）
 
 /** 微调按钮：±10 ms（与键盘方向键同一档，docs/13 §4.7） */
 function nudge(field: 'timelineStartMs', deltaMs: number): void {
@@ -353,7 +355,7 @@ const fadeWarning = computed(() => {
         </div>
         <div class="ns-inspector__fact">
           <dt>源内</dt>
-          <dd>{{ sourceRangeText }}<span v-if="sourceDurationMs !== null" class="ns-inspector__muted"> / 源长 {{ formatDuration(sourceDurationMs) }}</span></dd>
+          <dd>{{ sourceRangeText }}<span v-if="sourceEndMs !== null" class="ns-inspector__muted"> / 源可用至 {{ formatDuration(sourceEndMs) }}</span></dd>
         </div>
         <div class="ns-inspector__fact">
           <dt>相邻间隙</dt>
@@ -386,7 +388,7 @@ const fadeWarning = computed(() => {
             :step="10"
             size="small"
             controls-position="right"
-            @update:model-value="onNumberFieldInput('timelineStartMs')"
+            @update:model-value="(value) => onFieldInput('timelineStartMs', value)"
             @change="flushNow"
           />
           <span class="ns-inspector__unit">ms</span>
@@ -409,7 +411,7 @@ const fadeWarning = computed(() => {
             :step="10"
             size="small"
             controls-position="right"
-            @update:model-value="onNumberFieldInput('srcInMs')"
+            @update:model-value="(value) => onFieldInput('srcInMs', value)"
             @change="flushNow"
           />
           <label class="ns-inspector__label">出点</label>
@@ -419,7 +421,7 @@ const fadeWarning = computed(() => {
             :step="10"
             size="small"
             controls-position="right"
-            @update:model-value="onNumberFieldInput('srcOutMs')"
+            @update:model-value="(value) => onFieldInput('srcOutMs', value)"
             @change="flushNow"
           />
         </div>
@@ -441,7 +443,7 @@ const fadeWarning = computed(() => {
             :step="5"
             size="small"
             controls-position="right"
-            @update:model-value="onNumberFieldInput('fadeInMs')"
+            @update:model-value="(value) => onFieldInput('fadeInMs', value)"
             @change="flushNow"
           />
           <label class="ns-inspector__label">淡出</label>
@@ -451,7 +453,7 @@ const fadeWarning = computed(() => {
             :step="5"
             size="small"
             controls-position="right"
-            @update:model-value="onNumberFieldInput('fadeOutMs')"
+            @update:model-value="(value) => onFieldInput('fadeOutMs', value)"
             @change="flushNow"
           />
         </div>

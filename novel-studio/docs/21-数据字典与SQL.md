@@ -486,6 +486,16 @@ CREATE TABLE IF NOT EXISTS arrangement_items (
   locked            INTEGER NOT NULL DEFAULT 0,
   order_in_track    INTEGER NOT NULL DEFAULT 0,
   overlap_with      TEXT,
+  -- ★ 由 **006 迁移**追加（不属于 001 的建库 SQL：001/002 已发布、hash 被钉住）
+  --
+  -- 生成这条 item 时，segment_id 那段音频的**时长**。录音侧「设为成品」换 take 会
+  -- **复用同一个 voice_segments.id**、只把 segments/{id}.wav 换成新音频（docs/12 §8.1），
+  -- 于是按旧音频定的 src_in_ms/src_out_ms 不再指向用户选中的那段音频 —— 而它与
+  -- 「用户手工拖过的裁剪」在库里完全同形，无法用「长度是否相等」区分。有了这一列：
+  --   相等 → 裁剪仍属于当前音频，重排保留（手工微调不丢）；
+  --   不等 / 0（历史数据 = 不知道）→ 按当前选中的音频整段重排。
+  -- 只有 insert 写它：手工拖裁剪（updateItem）不改这列，否则等于把音频变更伪装成没发生。
+  src_duration_ms   INTEGER NOT NULL DEFAULT 0,
   created_at        INTEGER NOT NULL,
   updated_at        INTEGER NOT NULL
 );

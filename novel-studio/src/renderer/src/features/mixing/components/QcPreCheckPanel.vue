@@ -143,12 +143,10 @@ function onJump(issue: QcIssue): void {
   emit('jump', targetOf(issue.kind), { chapterId: issue.chapterId, lineId: issue.lineId })
 }
 
-/** el-checkbox 的 update:model-value 只给布尔值，这里补上「是哪一条」 */
-function onAcknowledgeOf(issue: QcIssue): (checked: boolean) => void {
-  return (checked: boolean) => {
-    if (checked) qc.acknowledge(issue)
-    else qc.revokeAcknowledge(issue)
-  }
+/** el-checkbox 只给布尔值，这里补上「是哪一条」；模板用内联箭头绑定 */
+function setAcknowledged(issue: QcIssue, checked: unknown): void {
+  if (checked === true) qc.acknowledge(issue)
+  else qc.revokeAcknowledge(issue)
 }
 </script>
 
@@ -275,7 +273,7 @@ function onAcknowledgeOf(issue: QcIssue): (checked: boolean) => void {
             <li v-for="(issue, index) in group.items.slice(0, 20)" :key="`${group.kind}-w-${index}`" class="ns-qc__item">
               <el-checkbox
                 :model-value="qc.isAcknowledged(issue)"
-                @update:model-value="onAcknowledgeOf(issue)"
+                @update:model-value="(checked) => setAcknowledged(issue, checked)"
               >
                 <span class="ns-qc__item-subject">{{ subjectOf(issue) }}</span>
                 <span class="ns-qc__item-message">{{ issue.message }}</span>

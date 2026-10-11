@@ -276,9 +276,10 @@ export const useExportStore = defineStore('mixing/export', () => {
       metadata: {
         // docs/15 §5.1 的元数据模板：title={chapterTitle} album={bookTitle} artist={author}
         title: '{chapterTitle}',
-        artist: book?.author ?? '',
-        album: book?.title ?? '',
-        narrator: book?.narrator ?? '',
+        // 书籍没有作者/旁白时**留空（不写键）**，不要写 ''：见 patchMetadata 的注释
+        ...(nonEmptyText(book?.author) ? { artist: nonEmptyText(book?.author) } : {}),
+        ...(nonEmptyText(book?.title) ? { album: nonEmptyText(book?.title) } : {}),
+        ...(nonEmptyText(book?.narrator) ? { narrator: nonEmptyText(book?.narrator) } : {}),
         genre: 'Audiobook',
         date: String(new Date().getFullYear()),
         coverPath: ex?.coverPath ?? book?.coverPath ?? null,
@@ -712,6 +713,17 @@ export const useExportStore = defineStore('mixing/export', () => {
     if (!want && has) selectedChapterIds.value = selectedChapterIds.value.filter(x => x !== id)
   }
 
+  /**
+   * **只选这一章**（清掉其它选择）。
+   *
+   * 为什么值得单独一个动作：切到「选定章」时默认**全选**（用户通常是「去掉几章」），
+   * 于是「只想导一章」就得先取消 119 个勾 —— 真机反馈「无法单选某一章」。
+   * 有了它，单选 = 一次点击。
+   */
+  function selectOnlyChapter(id: Id): void {
+    selectedChapterIds.value = chapters.value.some(c => c.id === id) ? [id] : []
+  }
+
   function selectAllChapters(): void {
     selectedChapterIds.value = chapters.value.map(c => c.id)
   }
@@ -772,8 +784,32 @@ export const useExportStore = defineStore('mixing/export', () => {
     params.value.format = format
   }
 
+  /**
+   * 元数据的最小空值规范化：**文本字段的空串 = 未设置**（删掉这个键，而不是留一个 `''`）。
+   *
+   * 主进程把 `''` 与缺失都当「未设置」（metadataPairs 的 add 会跳过空串），
+   * 但让状态里少一种形状，契约与日志都更干净；`coverPath` 的 `null` 是**有意义的**
+   * （「明确不要封面」），原样保留。
+   * 真机事故：书籍没有作者时 artist 一直是 `''`，【元数据与封面】点「下一步」报
+   * INVALID_PAYLOAD（见 docs/91 §5.2.75）。
+   */
+  /** 去掉首尾空白后仍非空才返回；否则 undefined（= 「未设置」） */
+  function nonEmptyText(value: string | null | undefined): string | undefined {
+    if (typeof value !== 'string') return undefined
+    const trimmed = value.trim()
+    return trimmed === '' ? undefined : trimmed
+  }
+
   function patchMetadata(patch: Partial<ExportMetadata>): void {
-    params.value.metadata = { ...params.value.metadata, ...patch }
+    const next: Record<string, unknown> = { ...params.value.metadata }
+    for (const [key, value] of Object.entries(patch)) {
+      if (value === undefined || (key !== 'coverPath' && typeof value === 'string' && value.trim() === '')) {
+        delete next[key]
+        continue
+      }
+      next[key] = value
+    }
+    params.value.metadata = next as ExportMetadata
   }
 
   function setWriteMetadata(value: boolean): void {
@@ -832,10 +868,11 @@ export const useExportStore = defineStore('mixing/export', () => {
 
   /** 用书籍信息回填元数据（Step 5 的「从书籍信息回填」按钮） */
   function fillMetadataFromBook(book: { title: string; author: string | null; narrator: string } | null): void {
+    // 空串交给 patchMetadata 归一到「未设置」；这里显式传 undefined 更直白
     patchMetadata({
-      album: book?.title ?? '',
-      artist: book?.author ?? '',
-      narrator: book?.narrator ?? '',
+      album: nonEmptyText(book?.title) ?? undefined,
+      artist: nonEmptyText(book?.author) ?? undefined,
+      narrator: nonEmptyText(book?.narrator) ?? undefined,
     })
   }
 
@@ -1125,7 +1162,7 @@ export const useExportStore = defineStore('mixing/export', () => {
     // Step 1
     rangeMode, selectedChapterIds, targetChapterIds, targetChapterRows, targetChapterCount,
     volumeGroups, isBookScope, currentChapterMissing, rangeLabel,
-    setRangeMode, toggleChapter, selectAllChapters, invertSelection, clearSelection,
+    setRangeMode, toggleChapter, selectOnlyChapter, selectAllChapters, invertSelection, clearSelection,
     selectByVolume, selectedCountOfVolume,
     // Step 2/4/5 参数
     params, writeMetadata, vbrPresets, vbrLoading,
